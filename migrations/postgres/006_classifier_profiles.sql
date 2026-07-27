@@ -1,0 +1,8 @@
+ALTER TABLE organizations
+    ADD COLUMN IF NOT EXISTS classifier_configured BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS classifier_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS classifier_provider_id TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS classifier_endpoint TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS classifier_model TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS classifier_credential_id TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS classifier_config_version TEXT NOT NULL DEFAULT 'disabled';

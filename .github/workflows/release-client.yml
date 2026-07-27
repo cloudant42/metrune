@@ -1,0 +1,57 @@
+name: Release client
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: metrune-linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            source: target/x86_64-unknown-linux-gnu/release/metrune
+          - os: windows-latest
+            artifact: metrune-windows-x86_64.exe
+            target: x86_64-pc-windows-msvc
+            source: target/x86_64-pc-windows-msvc/release/metrune.exe
+          - os: macos-13
+            artifact: metrune-macos-x86_64
+            target: x86_64-apple-darwin
+            source: target/x86_64-apple-darwin/release/metrune
+          - os: macos-14
+            artifact: metrune-macos-arm64
+            target: aarch64-apple-darwin
+            source: target/aarch64-apple-darwin/release/metrune
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release -p metrune --target "${{ matrix.target }}"
+      - name: Name release artifact
+        shell: bash
+        run: cp "${{ matrix.source }}" "${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

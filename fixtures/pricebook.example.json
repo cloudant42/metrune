@@ -1,0 +1,13 @@
+{
+  "version": "example-2026-07",
+  "currency": "USD",
+  "models": {
+    "openai/gpt-5": {
+      "inputPerMillion": 0,
+      "outputPerMillion": 0,
+      "cacheReadPerMillion": 0,
+      "cacheWritePerMillion": 0,
+      "reasoningPerMillion": 0
+    }
+  }
+}

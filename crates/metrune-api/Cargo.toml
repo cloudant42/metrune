@@ -1,0 +1,26 @@
+[package]
+name = "metrune-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aes-gcm.workspace = true
+argon2.workspace = true
+axum.workspace = true
+chrono.workspace = true
+base64.workspace = true
+clickhouse.workspace = true
+hex.workspace = true
+metrune-core = { path = "../metrune-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "metrune"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "metrune"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dialoguer.workspace = true
+flate2.workspace = true
+hex.workspace = true
+keyring.workspace = true
+metrune-core = { path = "../metrune-core" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true

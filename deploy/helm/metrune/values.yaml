@@ -1,0 +1,17 @@
+api:
+  image: metrune/api:0.1.0
+  replicas: 2
+web:
+  image: metrune/web:0.1.0
+  replicas: 2
+
+config:
+  databaseUrlSecret: metrune-postgres
+  clickhouseSecret: metrune-clickhouse
+  dashboardTokenSecret: metrune-dashboard
+
+ingress:
+  enabled: false
+  className: nginx
+  host: metrune.example.com
+  tlsSecret: metrune-tls

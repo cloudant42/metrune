@@ -1,0 +1,14 @@
+.git
+.agents
+.codex
+.env
+.env.*
+!.env.example
+.playwright-mcp
+target
+web/.next
+web/node_modules
+design
+design-system
+*.db
+*.log

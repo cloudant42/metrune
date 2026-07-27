@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "1",
+  "catalogVersion": "company-2026-07-22",
+  "generatedAt": "2026-07-22T00:00:00Z",
+  "currency": "USD",
+  "entries": [
+    {
+      "providerId": "openrouter",
+      "modelId": "moonshotai/kimi-k3",
+      "price": {
+        "inputPerMillion": 0.0,
+        "outputPerMillion": 0.0,
+        "cacheReadPerMillion": 0.0,
+        "cacheWritePerMillion": 0.0,
+        "reasoningPerMillion": 0.0,
+        "requestPerRequest": 0.0,
+        "imagePerImage": 0.0
+      },
+      "currency": "USD",
+      "authority": "organization_override",
+      "notes": "Replace with the approved contracted rate. This wins over the imported OpenRouter rate."
+    },
+    {
+      "providerId": "vllm",
+      "modelId": "qwen3-coder",
+      "price": {
+        "inputPerMillion": 0.0,
+        "outputPerMillion": 0.0,
+        "cacheReadPerMillion": 0.0,
+        "cacheWritePerMillion": 0.0,
+        "reasoningPerMillion": 0.0,
+        "requestPerRequest": 0.0,
+        "imagePerImage": 0.0
+      },
+      "currency": "USD",
+      "authority": "self_hosted",
+      "notes": "Optional internal chargeback rate for a self-hosted endpoint."
+    }
+  ]
+}

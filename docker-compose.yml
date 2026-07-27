@@ -1,0 +1,113 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: metrune
+      POSTGRES_USER: metrune
+      POSTGRES_PASSWORD: metrune-dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metrune"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations/postgres:/docker-entrypoint-initdb.d:ro
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_DB: metrune
+      CLICKHOUSE_USER: metrune
+      CLICKHOUSE_PASSWORD: metrune-dev
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "metrune", "--password", "metrune-dev", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./migrations/clickhouse:/docker-entrypoint-initdb.d:ro
+
+  api:
+    build:
+      context: .
+      dockerfile: crates/metrune-api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://metrune:metrune-dev@postgres:5432/metrune
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: metrune
+      CLICKHOUSE_USER: metrune
+      CLICKHOUSE_PASSWORD: metrune-dev
+      # Optional client-side semantic classifier provisioning. The API never
+      # receives classifier text; it only provisions this configuration once.
+      METRUNE_CLASSIFIER_PROVIDER_ID: ${METRUNE_CLASSIFIER_PROVIDER_ID:-openrouter}
+      METRUNE_CLASSIFIER_CREDENTIAL_ID: ${METRUNE_CLASSIFIER_CREDENTIAL_ID:-openrouter}
+      METRUNE_CLASSIFIER_ENDPOINT: ${METRUNE_CLASSIFIER_ENDPOINT:-}
+      METRUNE_CLASSIFIER_MODEL: ${METRUNE_CLASSIFIER_MODEL:-}
+      METRUNE_CLASSIFIER_API_KEY: ${METRUNE_CLASSIFIER_API_KEY:-}
+      METRUNE_CLASSIFIER_CONFIG_VERSION: ${METRUNE_CLASSIFIER_CONFIG_VERSION:-dev-1}
+      METRUNE_CLASSIFIER_RESPONSE_MODE: ${METRUNE_CLASSIFIER_RESPONSE_MODE:-auto}
+      METRUNE_DEFAULT_PRICE_CATALOG: /usr/share/metrune/pricing/openrouter.catalog.json
+      METRUNE_BOOTSTRAP_EMAIL: ${METRUNE_BOOTSTRAP_EMAIL:-admin@test.com}
+      METRUNE_BOOTSTRAP_PASSWORD: ${METRUNE_BOOTSTRAP_PASSWORD:-admin}
+      METRUNE_LINUX_CLIENT_PATH: /tmp/metrune-downloads/metrune-linux-x86_64
+      METRUNE_SECRETS_KEY_FILE: /var/lib/metrune/secrets/master.key
+      RUST_LOG: metrune_api=info,tower_http=info
+    ports:
+      - "8080:8080"
+    volumes:
+      - metrune-secrets:/var/lib/metrune/secrets
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      METRUNE_API_URL: http://api:8080
+      METRUNE_DASHBOARD_TOKEN: met_dashboard_dev
+      METRUNE_PUBLIC_API_URL: http://localhost:8080
+      METRUNE_CLIENT_RELEASE_BASE_URL: http://localhost:8080/v1/downloads
+    ports:
+      - "3001:3000"
+    depends_on:
+      - api
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.130.1
+    profiles: ["observability"]
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./deploy/otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8889:8889"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["observability"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: metrune-dev
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3001:3000"
+
+volumes:
+  postgres-data:
+  clickhouse-data:
+  metrune-secrets:

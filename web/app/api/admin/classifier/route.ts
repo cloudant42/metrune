@@ -1,0 +1,9 @@
+import { adminMutation } from "@/lib/api";
+import { NextResponse } from "next/server";
+
+export async function PATCH(request: Request) {
+  const body = await request.json().catch(() => null);
+  const result = await adminMutation("/v1/org/classifier", "PATCH", body);
+  if (!result.ok) return NextResponse.json({ error: result.error }, { status: result.status });
+  return NextResponse.json({ ok: true });
+}
