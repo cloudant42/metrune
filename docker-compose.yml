@@ -40,6 +40,8 @@ services:
       CLICKHOUSE_DATABASE: metrune
       CLICKHOUSE_USER: metrune
       CLICKHOUSE_PASSWORD: metrune-dev
+      METRUNE_ENV: development
+      METRUNE_PUBLIC_API_URL: http://localhost:8080
       # Optional client-side semantic classifier provisioning. The API never
       # receives classifier text; it only provisions this configuration once.
       METRUNE_CLASSIFIER_PROVIDER_ID: ${METRUNE_CLASSIFIER_PROVIDER_ID:-openrouter}
@@ -68,6 +70,7 @@ services:
       context: .
       dockerfile: web/Dockerfile
     environment:
+      METRUNE_ENV: development
       METRUNE_API_URL: http://api:8080
       METRUNE_DASHBOARD_TOKEN: met_dashboard_dev
       METRUNE_PUBLIC_API_URL: http://localhost:8080

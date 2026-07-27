@@ -10,10 +10,10 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{
         header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE},
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, Request, StatusCode,
     },
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
@@ -32,13 +32,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::{
+    collections::HashMap,
     env,
     fs::{self, OpenOptions},
     io::Write as _,
     net::SocketAddr,
     path::Path as StdPath,
+    sync::{Arc, Mutex},
+    time::{Duration as StdDuration, Instant},
 };
-use tower_http::{decompression::RequestDecompressionLayer, trace::TraceLayer};
+use tower_http::{
+    decompression::RequestDecompressionLayer,
+    limit::RequestBodyLimitLayer,
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -48,6 +57,186 @@ struct AppState {
     clickhouse: clickhouse::Client,
     classifier: Option<ServerClassifierConfig>,
     vault: SecretVault,
+    login_limiter: LoginAttemptLimiter,
+    rate_limiter: RateLimiter,
+    rate_limits: RateLimits,
+    trust_proxy_headers: bool,
+}
+
+const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+const MAX_BATCH_SNAPSHOTS: usize = 1_000;
+const DEFAULT_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+const LONG_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(300);
+const LOGIN_WINDOW: StdDuration = StdDuration::from_secs(60);
+const MAX_LOGIN_FAILURES_PER_WINDOW: u32 = 5;
+/// Upper bound on tracked rate-limit windows so that a flood of unique keys
+/// cannot grow the limiter without bound.
+const MAX_RATE_LIMIT_KEYS: usize = 100_000;
+const DEVELOPMENT_ORGANIZATION_ID: &str = "00000000-0000-0000-0000-000000000001";
+const DEVELOPMENT_DASHBOARD_TOKEN_HASH: &str =
+    "78e35941c163d606f0a3f1820de4eae3a43381b5603df86772bdd11168d2e434";
+const DEVELOPMENT_ENROLLMENT_TOKEN_HASH: &str =
+    "18daf9c40bec25b9eadfaad2a5b487d38c61716c60000ff4f61e981ba1462c26";
+const DEVELOPMENT_BOOTSTRAP_EMAIL: &str = "admin@test.com";
+
+#[derive(Clone, Default)]
+struct LoginAttemptLimiter {
+    attempts: Arc<Mutex<HashMap<String, LoginAttemptWindow>>>,
+}
+
+struct LoginAttemptWindow {
+    started_at: Instant,
+    failures: u32,
+}
+
+impl LoginAttemptLimiter {
+    fn is_limited(&self, key: &str) -> bool {
+        let mut attempts = self.attempts.lock().expect("login limiter mutex poisoned");
+        let now = Instant::now();
+        attempts.retain(|_, window| now.duration_since(window.started_at) < LOGIN_WINDOW);
+        attempts
+            .get(key)
+            .is_some_and(|window| window.failures >= MAX_LOGIN_FAILURES_PER_WINDOW)
+    }
+
+    fn record_failure(&self, key: &str) {
+        let mut attempts = self.attempts.lock().expect("login limiter mutex poisoned");
+        let now = Instant::now();
+        let window = attempts
+            .entry(key.to_owned())
+            .or_insert(LoginAttemptWindow {
+                started_at: now,
+                failures: 0,
+            });
+        if now.duration_since(window.started_at) >= LOGIN_WINDOW {
+            window.started_at = now;
+            window.failures = 0;
+        }
+        window.failures = window.failures.saturating_add(1);
+    }
+
+    fn reset(&self, key: &str) {
+        self.attempts
+            .lock()
+            .expect("login limiter mutex poisoned")
+            .remove(key);
+    }
+}
+
+/// A fixed-window request budget for one scope.
+#[derive(Clone, Copy)]
+struct RateLimit {
+    window: StdDuration,
+    max_requests: u32,
+}
+
+impl RateLimit {
+    const fn new(window_secs: u64, max_requests: u32) -> Self {
+        Self {
+            window: StdDuration::from_secs(window_secs),
+            max_requests,
+        }
+    }
+
+    /// Reads `METRUNE_RATE_LIMIT_<name>` as a per-window request budget.
+    /// `0` disables the limit for the scope.
+    fn with_env_override(self, name: &str) -> Self {
+        match env::var(format!("METRUNE_RATE_LIMIT_{name}"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        {
+            Some(max_requests) => Self {
+                max_requests,
+                ..self
+            },
+            None => self,
+        }
+    }
+}
+
+/// Per-scope request budgets. Every limit is keyed by the authenticated
+/// identity where one exists, and by client address otherwise.
+#[derive(Clone, Copy)]
+struct RateLimits {
+    enroll: RateLimit,
+    login: RateLimit,
+    provision: RateLimit,
+    ingest: RateLimit,
+    analytics: RateLimit,
+    enrollment_code: RateLimit,
+}
+
+impl RateLimits {
+    fn from_env() -> Self {
+        Self {
+            enroll: RateLimit::new(60, 10).with_env_override("ENROLL_PER_MINUTE"),
+            login: RateLimit::new(60, 30).with_env_override("LOGIN_PER_MINUTE"),
+            provision: RateLimit::new(60, 20).with_env_override("PROVISION_PER_MINUTE"),
+            ingest: RateLimit::new(60, 60).with_env_override("INGEST_PER_MINUTE"),
+            analytics: RateLimit::new(60, 120).with_env_override("ANALYTICS_PER_MINUTE"),
+            enrollment_code: RateLimit::new(3600, 20)
+                .with_env_override("ENROLLMENT_CODES_PER_HOUR"),
+        }
+    }
+}
+
+struct RateWindow {
+    expires_at: Instant,
+    hits: u32,
+}
+
+#[derive(Clone, Default)]
+struct RateLimiter {
+    windows: Arc<Mutex<HashMap<String, RateWindow>>>,
+}
+
+impl RateLimiter {
+    /// Counts one request against `scope`/`key` and rejects it once the window
+    /// budget is exhausted.
+    fn check(&self, scope: &str, key: &str, limit: RateLimit) -> Result<(), ApiError> {
+        if limit.max_requests == 0 {
+            return Ok(());
+        }
+        let mut windows = self.windows.lock().expect("rate limiter mutex poisoned");
+        let now = Instant::now();
+        windows.retain(|_, window| window.expires_at > now);
+        let entry = format!("{scope}:{key}");
+        if windows.len() >= MAX_RATE_LIMIT_KEYS && !windows.contains_key(&entry) {
+            tracing::warn!(scope, "rate limiter key table is full; shedding request");
+            return Err(ApiError::too_many_requests("the server is shedding load"));
+        }
+        let window = windows.entry(entry).or_insert(RateWindow {
+            expires_at: now + limit.window,
+            hits: 0,
+        });
+        if window.hits >= limit.max_requests {
+            return Err(ApiError::too_many_requests(format!(
+                "rate limit exceeded for {scope}; retry later"
+            )));
+        }
+        window.hits = window.hits.saturating_add(1);
+        Ok(())
+    }
+}
+
+/// Resolves the address a request should be rate-limited by.
+///
+/// `X-Forwarded-For` is only honoured when the deployment declares that it
+/// runs behind a trusted reverse proxy, because clients can otherwise forge
+/// the header and bypass every address-keyed limit.
+fn client_address(headers: &HeaderMap, peer: SocketAddr, trust_proxy_headers: bool) -> String {
+    if trust_proxy_headers {
+        if let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return forwarded.to_owned();
+        }
+    }
+    peer.ip().to_string()
 }
 
 #[derive(Clone)]
@@ -176,20 +365,43 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
-    let postgres = PgPool::connect(&env::var("DATABASE_URL")?).await?;
+    let environment = env::var("METRUNE_ENV").unwrap_or_else(|_| "development".into());
+    let bootstrap_email = env::var("METRUNE_BOOTSTRAP_EMAIL").ok();
+    let bootstrap_password = env::var("METRUNE_BOOTSTRAP_PASSWORD").ok();
+    let database_url = env::var("DATABASE_URL")?;
+    let clickhouse_password = env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
+    validate_production_configuration(
+        &environment,
+        env::var("METRUNE_PUBLIC_API_URL").ok().as_deref(),
+        &database_url,
+        &clickhouse_password,
+        bootstrap_email.as_deref(),
+        bootstrap_password.as_deref(),
+    )?;
+    let postgres = PgPool::connect(&database_url).await?;
     sqlx::migrate!("../../migrations/postgres")
         .run(&postgres)
         .await?;
+    if environment == "production" {
+        ensure_production_database_is_clean(&postgres).await?;
+    } else {
+        ensure_development_seed_data(&postgres).await?;
+    }
     let clickhouse = clickhouse::Client::default()
         .with_url(env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://clickhouse:8123".into()))
         .with_database(env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "metrune".into()))
         .with_user(env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()))
-        .with_password(env::var("CLICKHOUSE_PASSWORD").unwrap_or_default());
+        .with_password(clickhouse_password);
     let state = AppState {
         postgres,
         clickhouse,
         classifier: ServerClassifierConfig::from_env(),
         vault: SecretVault::load_or_create()?,
+        login_limiter: LoginAttemptLimiter::default(),
+        rate_limiter: RateLimiter::default(),
+        rate_limits: RateLimits::from_env(),
+        trust_proxy_headers: env::var("METRUNE_TRUST_PROXY_HEADERS")
+            .is_ok_and(|value| value.trim().eq_ignore_ascii_case("true")),
     };
     let credentials_exist: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM provider_credentials)")
@@ -219,6 +431,24 @@ async fn main() -> anyhow::Result<()> {
     import_default_price_catalog(&state).await?;
     reprice_unknown_history(&state).await?;
 
+    let long_running_routes = Router::new()
+        .route("/v1/ingest/sessions", post(ingest_sessions))
+        .route("/v1/analytics/overview", get(analytics_overview))
+        .route("/v1/analytics/timeseries", get(analytics_timeseries))
+        .route("/v1/analytics/breakdowns", get(analytics_breakdowns))
+        .route(
+            "/v1/analytics/category-model",
+            get(analytics_category_model),
+        )
+        .route("/v1/analytics/sessions", get(analytics_sessions))
+        .route("/v1/analytics/facets", get(analytics_facets))
+        .route("/v1/me/usage", get(my_usage))
+        .route("/v1/me/sessions", get(my_sessions))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            LONG_REQUEST_TIMEOUT,
+        ));
+
     let app = Router::new()
         .route("/v1/healthz", get(health))
         .route("/v1/readyz", get(ready))
@@ -231,16 +461,6 @@ async fn main() -> anyhow::Result<()> {
             "/v1/installation/classifier/provision",
             post(provision_classifier),
         )
-        .route("/v1/ingest/sessions", post(ingest_sessions))
-        .route("/v1/analytics/overview", get(analytics_overview))
-        .route("/v1/analytics/timeseries", get(analytics_timeseries))
-        .route("/v1/analytics/breakdowns", get(analytics_breakdowns))
-        .route(
-            "/v1/analytics/category-model",
-            get(analytics_category_model),
-        )
-        .route("/v1/analytics/sessions", get(analytics_sessions))
-        .route("/v1/analytics/facets", get(analytics_facets))
         .route("/v1/org/teams", get(list_teams).post(create_team))
         .route("/v1/org/teams/{id}", patch(update_team).delete(delete_team))
         .route("/v1/org/installations", get(list_installations))
@@ -265,13 +485,33 @@ async fn main() -> anyhow::Result<()> {
             "/v1/org/prices/{id}",
             patch(update_price).delete(delete_price),
         )
-        .route("/v1/me/usage", get(my_usage))
-        .route("/v1/me/sessions", get(my_sessions))
         .route("/v1/me/installations", get(my_installations))
         .route("/v1/me/installations/{id}", delete(revoke_my_installation))
         .route("/v1/me/enrollment-codes", post(create_enrollment_code))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            DEFAULT_REQUEST_TIMEOUT,
+        ))
+        .merge(long_running_routes)
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(RequestDecompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                let request_id = request
+                    .extensions()
+                    .get::<RequestId>()
+                    .and_then(|request_id| request_id.header_value().to_str().ok())
+                    .unwrap_or("missing");
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    uri = %request.uri(),
+                    request_id = %request_id,
+                )
+            }),
+        )
+        .layer(PropagateRequestIdLayer::x_request_id())
         .with_state(state.clone());
 
     tokio::spawn(expired_session_reaper(state.postgres.clone()));
@@ -281,7 +521,11 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
     tracing::info!(%address, "Metrune API listening");
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -386,6 +630,114 @@ async fn download_client(Path(artifact): Path<String>) -> Result<Response, ApiEr
         binary,
     )
         .into_response())
+}
+
+fn validate_production_configuration(
+    environment: &str,
+    public_api_url: Option<&str>,
+    database_url: &str,
+    clickhouse_password: &str,
+    bootstrap_email: Option<&str>,
+    bootstrap_password: Option<&str>,
+) -> anyhow::Result<()> {
+    if environment != "production" {
+        return Ok(());
+    }
+    let public_api_url = public_api_url
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("METRUNE_PUBLIC_API_URL is required in production"))?;
+    if !public_api_url.starts_with("https://") {
+        anyhow::bail!("METRUNE_PUBLIC_API_URL must use HTTPS in production");
+    }
+    if database_url.contains(":metrune-dev@") || clickhouse_password == "metrune-dev" {
+        anyhow::bail!("development database credentials are not allowed in production");
+    }
+    if bootstrap_email.is_some_and(|email| {
+        email
+            .trim()
+            .eq_ignore_ascii_case(DEVELOPMENT_BOOTSTRAP_EMAIL)
+    }) {
+        anyhow::bail!("the development bootstrap email is not allowed in production");
+    }
+    if bootstrap_password.is_some_and(|password| {
+        matches!(
+            password,
+            "admin" | "password" | "metrune-dev" | "change-me" | "changeme"
+        )
+    }) {
+        anyhow::bail!("a development bootstrap password is not allowed in production");
+    }
+    Ok(())
+}
+
+async fn ensure_development_seed_data(postgres: &PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO organizations(id, name)
+         VALUES ($1, 'Acme Engineering')
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(Uuid::parse_str(DEVELOPMENT_ORGANIZATION_ID)?)
+    .execute(postgres)
+    .await?;
+
+    let team_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO teams(organization_id, name)
+         VALUES ($1, 'engineering')
+         ON CONFLICT (organization_id, name) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .bind(Uuid::parse_str(DEVELOPMENT_ORGANIZATION_ID)?)
+    .fetch_one(postgres)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO dashboard_tokens(id, organization_id, token_hash, name, role)
+         VALUES ('00000000-0000-0000-0000-000000000003', $1, $2, 'Local dashboard', 'admin')
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(Uuid::parse_str(DEVELOPMENT_ORGANIZATION_ID)?)
+    .bind(DEVELOPMENT_DASHBOARD_TOKEN_HASH)
+    .execute(postgres)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO enrollment_tokens(id, organization_id, token_hash, name, team_key, team_id)
+         VALUES ('00000000-0000-0000-0000-000000000002', $1, $2, 'Local development', 'engineering', $3)
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(Uuid::parse_str(DEVELOPMENT_ORGANIZATION_ID)?)
+    .bind(DEVELOPMENT_ENROLLMENT_TOKEN_HASH)
+    .bind(team_id)
+    .execute(postgres)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_production_database_is_clean(postgres: &PgPool) -> anyhow::Result<()> {
+    let development_tokens: i64 = sqlx::query_scalar(
+        "SELECT
+             (SELECT COUNT(*) FROM dashboard_tokens WHERE token_hash = $1)
+           + (SELECT COUNT(*) FROM enrollment_tokens WHERE token_hash = $2)",
+    )
+    .bind(DEVELOPMENT_DASHBOARD_TOKEN_HASH)
+    .bind(DEVELOPMENT_ENROLLMENT_TOKEN_HASH)
+    .fetch_one(postgres)
+    .await?;
+    if development_tokens > 0 {
+        anyhow::bail!(
+            "development dashboard or enrollment tokens are present in the production database"
+        );
+    }
+
+    let development_users: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE LOWER(email) = $1")
+            .bind(DEVELOPMENT_BOOTSTRAP_EMAIL)
+            .fetch_one(postgres)
+            .await?;
+    if development_users > 0 {
+        anyhow::bail!("the development bootstrap identity is present in the production database");
+    }
+    Ok(())
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
@@ -595,10 +947,24 @@ struct CurrentUserResponse {
     role: String,
 }
 
+fn failed_login(state: &AppState, email: &str) -> ApiError {
+    if state.login_limiter.is_limited(email) {
+        return ApiError::too_many_requests("too many login attempts; try again later");
+    }
+    state.login_limiter.record_failure(email);
+    ApiError::unauthorized("invalid email or password")
+}
+
 async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
+    let address = client_address(&headers, peer, state.trust_proxy_headers);
+    state
+        .rate_limiter
+        .check("login", &address, state.rate_limits.login)?;
     let email = request.email.trim().to_ascii_lowercase();
     let rows = sqlx::query_as::<
         _,
@@ -621,16 +987,25 @@ async fn login(
     .fetch_all(&state.postgres)
     .await?;
     if rows.len() != 1 {
-        return Err(ApiError::unauthorized("invalid email or password"));
+        return Err(failed_login(&state, &email));
     }
     let row = &rows[0];
-    let parsed = PasswordHash::new(row.6.as_deref().ok_or(ApiError::unauthorized(
+    let password_hash = row.6.clone().ok_or(ApiError::unauthorized(
         "local password login is unavailable",
-    ))?)
-    .map_err(|_| ApiError::unauthorized("invalid email or password"))?;
-    Argon2::default()
-        .verify_password(request.password.as_bytes(), &parsed)
-        .map_err(|_| ApiError::unauthorized("invalid email or password"))?;
+    ))?;
+    let password = request.password.clone();
+    let password_valid = tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&password_hash).is_ok_and(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        })
+    })
+    .await?;
+    if !password_valid {
+        return Err(failed_login(&state, &email));
+    }
+    state.login_limiter.reset(&email);
     let session_token = format!("mts_{}", Uuid::new_v4().simple());
     let expires_at = Utc::now() + Duration::days(30);
     sqlx::query(
@@ -730,8 +1105,14 @@ struct ClassifierProvisionResponse {
 
 async fn enroll(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<EnrollRequest>,
 ) -> Result<Json<EnrollResponse>, ApiError> {
+    let address = client_address(&headers, peer, state.trust_proxy_headers);
+    state
+        .rate_limiter
+        .check("enroll", &address, state.rate_limits.enroll)?;
     let hash = token_hash(&request.enrollment_token);
     let mut transaction = state.postgres.begin().await?;
     let personal = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, Option<String>, String, Uuid)>(
@@ -804,6 +1185,11 @@ async fn provision_classifier(
     headers: HeaderMap,
 ) -> Result<(HeaderMap, Json<ClassifierProvisionResponse>), ApiError> {
     let auth = installation_auth(&state, &headers).await?;
+    state.rate_limiter.check(
+        "classifier-provision",
+        &auth.installation_id.to_string(),
+        state.rate_limits.provision,
+    )?;
     let mut response_headers = HeaderMap::new();
     response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     let organization = sqlx::query_as::<_, (
@@ -902,7 +1288,22 @@ async fn ingest_sessions(
     Json(batch): Json<BatchEnvelope>,
 ) -> Result<Json<IngestAck>, ApiError> {
     let auth = installation_auth(&state, &headers).await?;
+    state.rate_limiter.check(
+        "ingest",
+        &auth.installation_id.to_string(),
+        state.rate_limits.ingest,
+    )?;
     let snapshot_count = batch.snapshots.len();
+    if batch.batch_id.trim().is_empty() || batch.batch_id.len() > 128 {
+        return Err(ApiError::bad_request(
+            "batch_id must be between 1 and 128 bytes",
+        ));
+    }
+    if snapshot_count > MAX_BATCH_SNAPSHOTS {
+        return Err(ApiError::payload_too_large(format!(
+            "a batch cannot contain more than {MAX_BATCH_SNAPSHOTS} snapshots"
+        )));
+    }
     let completed = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM ingest_batches WHERE installation_id = $1 AND batch_id = $2)",
     )
@@ -1093,7 +1494,7 @@ async fn analytics_overview(
     headers: HeaderMap,
     Query(query): Query<AnalyticsQuery>,
 ) -> Result<Json<OverviewRow>, ApiError> {
-    let auth = dashboard_auth(&state, &headers).await?;
+    let auth = analytics_auth(&state, &headers).await?;
     let (sql, params) = filtered_query(
         "SELECT toUInt64(sum(total_tokens)) total_tokens, sum(total_cost) total_cost, toUInt64(count()) sessions, toUInt64(uniqExact(user_key)) active_users FROM session_snapshots_dedup FINAL",
         &query, &auth.organization_id,
@@ -1120,7 +1521,7 @@ async fn analytics_timeseries(
     headers: HeaderMap,
     Query(query): Query<AnalyticsQuery>,
 ) -> Result<Json<Vec<TimeseriesRow>>, ApiError> {
-    let auth = dashboard_auth(&state, &headers).await?;
+    let auth = analytics_auth(&state, &headers).await?;
     let base = "SELECT formatDateTime(toDateTime(ended_at_ms/1000), '%Y-%m-%d') bucket, toUInt64(sum(total_tokens)) tokens, sum(total_cost) cost, toUInt64(count()) sessions FROM session_snapshots_dedup FINAL";
     let (mut sql, params) = filtered_query(base, &query, &auth.organization_id);
     sql.push_str(" GROUP BY bucket ORDER BY bucket");
@@ -1146,7 +1547,7 @@ async fn analytics_category_model(
     headers: HeaderMap,
     Query(query): Query<AnalyticsQuery>,
 ) -> Result<Json<Vec<CategoryModelRow>>, ApiError> {
-    let auth = dashboard_auth(&state, &headers).await?;
+    let auth = analytics_auth(&state, &headers).await?;
     let base = "SELECT category_id category, concat(JSONExtractString(usage_slice, 'providerId'), '/', JSONExtractString(usage_slice, 'modelId')) model, toUInt64(sum(JSONExtractUInt(usage_slice, 'tokens', 'input') + JSONExtractUInt(usage_slice, 'tokens', 'output') + JSONExtractUInt(usage_slice, 'tokens', 'cacheRead') + JSONExtractUInt(usage_slice, 'tokens', 'cacheWrite') + JSONExtractUInt(usage_slice, 'tokens', 'reasoning'))) tokens, sum(JSONExtractFloat(usage_slice, 'cost', 'amount')) cost, toUInt64(uniqExact(session_key)) sessions FROM session_snapshots_dedup FINAL ARRAY JOIN JSONExtractArrayRaw(snapshot_json, 'usageByModel') AS usage_slice";
     let (mut sql, params) = filtered_query(base, &query, &auth.organization_id);
     sql.push_str(" AND classification_status = 'classified'");
@@ -1184,7 +1585,7 @@ async fn analytics_breakdowns(
     headers: HeaderMap,
     Query(query): Query<BreakdownQuery>,
 ) -> Result<Json<Vec<BreakdownRow>>, ApiError> {
-    let auth = dashboard_auth(&state, &headers).await?;
+    let auth = analytics_auth(&state, &headers).await?;
     let (dimension, tokens, cost, array_join) = match query.dimension.as_deref().unwrap_or("category") {
         "category" => ("category_id", "total_tokens", "total_cost", ""),
         "client" => ("client_id", "total_tokens", "total_cost", ""),
@@ -1261,7 +1662,7 @@ async fn analytics_sessions(
     headers: HeaderMap,
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<Vec<SessionRow>>, ApiError> {
-    let auth = dashboard_auth(&state, &headers).await?;
+    let auth = analytics_auth(&state, &headers).await?;
     if auth.user_id.is_some() {
         return Err(ApiError::forbidden(
             "organization session drilldown is not available to user sessions",
@@ -1314,7 +1715,7 @@ async fn analytics_facets(
     headers: HeaderMap,
     Query(query): Query<AnalyticsQuery>,
 ) -> Result<Json<FacetsResponse>, ApiError> {
-    let auth = dashboard_auth(&state, &headers).await?;
+    let auth = analytics_auth(&state, &headers).await?;
     let organization_id: Uuid = auth
         .organization_id
         .parse()
@@ -1408,6 +1809,9 @@ struct DashboardAuth {
     role: String,
     name: String,
     user_id: Option<Uuid>,
+    /// Stable rate-limiting identity: the user id for a web session, or the
+    /// stored digest for a service dashboard token.
+    subject: String,
 }
 
 impl DashboardAuth {
@@ -1439,6 +1843,7 @@ async fn dashboard_auth(state: &AppState, headers: &HeaderMap) -> Result<Dashboa
             role: row.1,
             name: row.2,
             user_id: None,
+            subject: format!("token:{digest}"),
         });
     }
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, String)>(
@@ -1457,7 +1862,18 @@ async fn dashboard_auth(state: &AppState, headers: &HeaderMap) -> Result<Dashboa
         user_id: Some(row.1),
         role: row.2,
         name: row.3,
+        subject: format!("user:{}", row.1),
     })
+}
+
+/// Authenticates a dashboard caller for an expensive analytics query and
+/// charges it against the caller's analytics budget.
+async fn analytics_auth(state: &AppState, headers: &HeaderMap) -> Result<DashboardAuth, ApiError> {
+    let auth = dashboard_auth(state, headers).await?;
+    state
+        .rate_limiter
+        .check("analytics", &auth.subject, state.rate_limits.analytics)?;
+    Ok(auth)
 }
 
 async fn audit(
@@ -1674,6 +2090,7 @@ async fn list_installations(
     headers: HeaderMap,
 ) -> Result<Json<Vec<InstallationResponse>>, ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
     let rows = sqlx::query_as::<
         _,
         (
@@ -1857,6 +2274,7 @@ async fn get_classifier_settings(
     headers: HeaderMap,
 ) -> Result<Json<ClassifierSettingsResponse>, ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
     let row = sqlx::query_as::<_, (
         bool,
         bool,
@@ -2148,7 +2566,7 @@ async fn test_classifier_settings(
             "A coding agent investigated a failing test, identified the defect, and corrected the implementation.",
         )
         .await
-        .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+        .map_err(|_| ApiError::bad_gateway("classifier request failed"))?;
     Ok(Json(ClassifierTestResponse {
         category: diagnostic.assignment.category_id.as_str().into(),
         confidence: diagnostic.assignment.confidence,
@@ -2204,6 +2622,7 @@ async fn list_credentials(
     headers: HeaderMap,
 ) -> Result<Json<Vec<CredentialResponse>>, ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
     let rows = sqlx::query_as::<_, (String, String, i32, chrono::DateTime<Utc>, i64)>(
         "SELECT c.credential_id, c.provider_id, c.version, c.created_at,
                 COUNT(i.id)::BIGINT
@@ -2769,6 +3188,7 @@ async fn create_price(
     Json(request): Json<PriceRequest>,
 ) -> Result<(StatusCode, Json<PriceResponse>), ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
     Ok((
         StatusCode::CREATED,
         Json(insert_org_price(&state, &auth, &request).await?),
@@ -2782,6 +3202,7 @@ async fn update_price(
     Json(request): Json<PriceRequest>,
 ) -> Result<Json<PriceResponse>, ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
     let organization_id = auth.organization_uuid()?;
     let owned = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM model_prices WHERE id = $1 AND organization_id = $2)",
@@ -2810,6 +3231,7 @@ async fn delete_price(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
     let user_id = auth
         .user_id
         .ok_or(ApiError::forbidden("user session required to edit pricing"))?;
@@ -2910,7 +3332,7 @@ async fn my_sessions(
     headers: HeaderMap,
     Query(query): Query<MySessionsQuery>,
 ) -> Result<Json<Vec<SessionRow>>, ApiError> {
-    let auth = dashboard_auth(&state, &headers).await?;
+    let auth = analytics_auth(&state, &headers).await?;
     let user_id = auth
         .user_id
         .ok_or(ApiError::unauthorized("user session required"))?;
@@ -2978,7 +3400,7 @@ async fn my_usage(
     headers: HeaderMap,
     Query(query): Query<MyUsageQuery>,
 ) -> Result<Json<MyUsageResponse>, ApiError> {
-    let auth = dashboard_auth(&state, &headers).await?;
+    let auth = analytics_auth(&state, &headers).await?;
     let user_id = auth
         .user_id
         .ok_or(ApiError::unauthorized("user session required"))?;
@@ -3098,9 +3520,11 @@ async fn my_installations(
         "SELECT i.id, i.name, i.platform, t.name, i.created_at, i.last_seen_at,
                 i.revoked_at IS NOT NULL
          FROM installations i LEFT JOIN teams t ON t.id = i.team_id
-         WHERE i.owner_user_id = $1 ORDER BY i.created_at DESC",
+         WHERE i.owner_user_id = $1 AND i.organization_id = $2::uuid
+         ORDER BY i.created_at DESC",
     )
     .bind(user_id)
+    .bind(&auth.organization_id)
     .fetch_all(&state.postgres)
     .await?;
     Ok(Json(
@@ -3129,10 +3553,12 @@ async fn revoke_my_installation(
         .ok_or(ApiError::unauthorized("user session required"))?;
     let updated = sqlx::query(
         "UPDATE installations SET revoked_at = NOW()
-         WHERE id = $1 AND owner_user_id = $2 AND revoked_at IS NULL",
+         WHERE id = $1 AND owner_user_id = $2 AND organization_id = $3::uuid
+           AND revoked_at IS NULL",
     )
     .bind(id)
     .bind(user_id)
+    .bind(&auth.organization_id)
     .execute(&state.postgres)
     .await?;
     if updated.rows_affected() == 0 {
@@ -3167,6 +3593,11 @@ async fn create_enrollment_code(
     let user_id = auth
         .user_id
         .ok_or(ApiError::unauthorized("user session required"))?;
+    state.rate_limiter.check(
+        "enrollment-code",
+        &auth.subject,
+        state.rate_limits.enrollment_code,
+    )?;
     let organization_id = auth.organization_uuid()?;
     let installation_name = request.installation_name.trim();
     if installation_name.is_empty() || installation_name.chars().count() > 120 {
@@ -3277,13 +3708,30 @@ impl ApiError {
             message: message.into(),
         }
     }
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+        }
+    }
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
 }
 
 impl<E: std::fmt::Display> From<E> for ApiError {
     fn from(error: E) -> Self {
+        tracing::error!(
+            error = %format!("{:#}", error),
+            error_type = std::any::type_name::<E>(),
+            "request failed with an internal error"
+        );
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.to_string(),
+            message: "internal server error".into(),
         }
     }
 }
@@ -3321,6 +3769,50 @@ mod tests {
         assert!(vault
             .decrypt(&ciphertext, &nonce, b"other-org:credential:1")
             .is_err());
+    }
+
+    #[test]
+    fn rate_limiter_rejects_once_the_window_budget_is_spent() {
+        let limiter = RateLimiter::default();
+        let limit = RateLimit::new(60, 2);
+        assert!(limiter.check("ingest", "installation-a", limit).is_ok());
+        assert!(limiter.check("ingest", "installation-a", limit).is_ok());
+        let error = limiter
+            .check("ingest", "installation-a", limit)
+            .expect_err("third request must be rejected");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn rate_limiter_keys_scopes_and_identities_separately() {
+        let limiter = RateLimiter::default();
+        let limit = RateLimit::new(60, 1);
+        assert!(limiter.check("ingest", "installation-a", limit).is_ok());
+        assert!(limiter.check("ingest", "installation-b", limit).is_ok());
+        assert!(limiter.check("enroll", "installation-a", limit).is_ok());
+        assert!(limiter.check("ingest", "installation-a", limit).is_err());
+    }
+
+    #[test]
+    fn a_zero_budget_disables_the_limit() {
+        let limiter = RateLimiter::default();
+        let limit = RateLimit::new(60, 0);
+        for _ in 0..1_000 {
+            assert!(limiter.check("analytics", "user:1", limit).is_ok());
+        }
+    }
+
+    #[test]
+    fn forwarded_addresses_are_only_trusted_behind_a_declared_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.7, 10.0.0.1"),
+        );
+        let peer: SocketAddr = "10.0.0.1:5555".parse().expect("peer address");
+        assert_eq!(client_address(&headers, peer, true), "203.0.113.7");
+        assert_eq!(client_address(&headers, peer, false), "10.0.0.1");
+        assert_eq!(client_address(&HeaderMap::new(), peer, true), "10.0.0.1");
     }
     use metrune_core::{CategoryAssignment, Cost, TokenBreakdown, UsageSlice};
 
@@ -3455,5 +3947,79 @@ mod tests {
         })
         .expect("custom localhost provider");
         assert_eq!(custom.response_mode, ResponseMode::PromptJson);
+    }
+
+    #[test]
+    fn production_configuration_rejects_insecure_defaults() {
+        assert!(validate_production_configuration(
+            "production",
+            Some("http://metrune.example.com"),
+            "postgres://metrune:strong@example/postgres",
+            "strong",
+            Some("admin@example.com"),
+            Some("strong-bootstrap")
+        )
+        .is_err());
+        assert!(validate_production_configuration(
+            "production",
+            Some("https://metrune.example.com"),
+            "postgres://metrune:metrune-dev@example/postgres",
+            "strong",
+            Some("admin@example.com"),
+            Some("strong-bootstrap")
+        )
+        .is_err());
+        assert!(validate_production_configuration(
+            "production",
+            Some("https://metrune.example.com"),
+            "postgres://metrune:strong@example/postgres",
+            "strong",
+            Some("admin@example.com"),
+            Some("admin")
+        )
+        .is_err());
+        assert!(validate_production_configuration(
+            "production",
+            Some("https://metrune.example.com"),
+            "postgres://metrune:strong@example/postgres",
+            "strong",
+            Some(DEVELOPMENT_BOOTSTRAP_EMAIL),
+            Some("a-long-random-password")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn production_configuration_accepts_explicit_secure_values() {
+        assert!(validate_production_configuration(
+            "production",
+            Some("https://metrune.example.com"),
+            "postgres://metrune:strong@example/postgres",
+            "another-strong-password",
+            Some("admin@example.com"),
+            Some("a-long-random-bootstrap-password")
+        )
+        .is_ok());
+        assert!(validate_production_configuration(
+            "development",
+            None,
+            "postgres://metrune:metrune-dev@postgres/metrune",
+            "metrune-dev",
+            Some(DEVELOPMENT_BOOTSTRAP_EMAIL),
+            Some("admin")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn login_limiter_throttles_failures_without_locking_out_valid_passwords() {
+        let limiter = LoginAttemptLimiter::default();
+        for _ in 0..MAX_LOGIN_FAILURES_PER_WINDOW {
+            assert!(!limiter.is_limited("admin@example.com"));
+            limiter.record_failure("admin@example.com");
+        }
+        assert!(limiter.is_limited("admin@example.com"));
+        limiter.reset("admin@example.com");
+        assert!(!limiter.is_limited("admin@example.com"));
     }
 }

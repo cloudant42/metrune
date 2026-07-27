@@ -10,15 +10,32 @@ spec:
     metadata:
       labels: { app: metrune-web }
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: web
           image: {{ .Values.web.image | quote }}
           ports: [{ name: http, containerPort: 3000 }]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+{{ toYaml .Values.web.resources | indent 12 }}
           env:
             - name: METRUNE_API_URL
               value: http://{{ .Release.Name }}-api:8080
             - name: METRUNE_DASHBOARD_TOKEN
               valueFrom: { secretKeyRef: { name: {{ .Values.config.dashboardTokenSecret }}, key: token } }
+            - name: METRUNE_ENV
+              value: {{ .Values.config.environment | quote }}
+            - name: METRUNE_PUBLIC_API_URL
+              value: {{ .Values.config.publicApiUrl | quote }}
+            - name: METRUNE_CLIENT_RELEASE_BASE_URL
+              value: {{ .Values.config.clientReleaseBaseUrl | quote }}
           readinessProbe: { httpGet: { path: /, port: http }, initialDelaySeconds: 5 }
 ---
 apiVersion: v1

@@ -1,0 +1,107 @@
+name: Security scans
+
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  rust-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=high --omit=dev
+
+  # Trivy's misconfiguration scanner does not understand GitHub Actions
+  # workflows, so they are audited separately.
+  github-actions-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Lint workflow syntax and expressions
+        run: |
+          curl -fsSL -o actionlint.bash \
+            https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash
+          bash actionlint.bash
+          ./actionlint -color
+      - name: Audit workflows for supply-chain weaknesses
+        uses: zizmorcore/zizmor-action@5ca5fc7a4779c5263a3ffa0e1f693009994446d1 # v0.1.2
+        with:
+          advanced-security: false
+          persona: regular
+          # Fail the build on real weaknesses; informational style findings
+          # (for example "use `gh release` instead of an action") do not block.
+          min-severity: low
+
+  filesystem-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Scan dependencies, Dockerfiles, and repository configuration
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+  container-images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build API image
+        run: docker build -f crates/metrune-api/Dockerfile -t metrune-api:security .
+      - name: Build web image
+        run: docker build -f web/Dockerfile -t metrune-web:security .
+      - name: Scan API image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: metrune-api:security
+          scanners: vuln,secret,misconfig
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: 1
+      - name: Scan web image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: metrune-web:security
+          scanners: vuln,secret,misconfig
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: 1

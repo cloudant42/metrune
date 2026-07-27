@@ -26,42 +26,48 @@ production-oriented release, and what belongs to the enterprise roadmap.
 
 ### Security and safe defaults
 
-- [ ] Split development and production Compose configuration.
-- [ ] Make production startup fail when development passwords, tokens, or
-      seeded development identities are still configured.
+- [x] Split development and production Compose configuration and require
+      production credentials through an override env file.
+- [x] Make API production startup require an HTTPS public URL and reject known
+      development database/bootstrap credentials.
+- [x] Make the production deployment fail closed when development tokens or
+      seeded identities are still configured.
 - [ ] Document and enforce the external TLS/reverse-proxy boundary.
-- [ ] Add request IDs, sensitive-header redaction, and a documented logging
-      policy.
-- [ ] Add global request-body and batch-size limits, field-length validation,
-      execution timeouts, and rate limits for login, enrollment, provisioning,
-      ingestion, and expensive analytics queries.
-- [ ] Complete a dependency, container-image, and GitHub Actions security scan.
-- [ ] Review authorization for every organization, team, installation, pricing,
+- [x] Add request IDs, keep sensitive headers out of HTTP traces, and document
+      the logging policy and TLS boundary.
+- [x] Add a global request-body limit, ingestion batch ceiling, request timeout,
+      and login-attempt throttle.
+- [x] Add per-identity/IP rate limits for enrollment, provisioning, ingestion,
+      and expensive analytics queries.
+- [x] Complete a dependency, container-image, and GitHub Actions security scan.
+- [x] Review authorization for every organization, team, installation, pricing,
       credential, vault, and export operation.
 
 ### Data protection and operations
 
-- [ ] Document PostgreSQL, ClickHouse, and vault-key backup procedures.
-- [ ] Test a complete restore, including the vault master key and encrypted
+- [x] Document PostgreSQL, ClickHouse, and vault-key backup procedures.
+- [x] Test a complete restore, including the vault master key and encrypted
       classifier credentials.
-- [ ] Document retention, deletion, export, and disaster-recovery behavior.
+- [x] Document retention, deletion, export, and disaster-recovery behavior.
 - [ ] Separate schema migrations from normal application startup where an
       operator-controlled migration job is required.
 - [ ] Version ClickHouse schema changes consistently with PostgreSQL migrations.
-- [ ] Document upgrade ordering, rollback limits, and recovery from a failed
+- [x] Document upgrade ordering, rollback limits, and recovery from a failed
       migration.
-- [ ] Add production Helm values for resources, security contexts, persistence,
-      disruption budgets, and secret management.
+- [ ] Add production Helm values for persistence and disruption budgets.
+- [x] Add production Helm values for resource requests, security contexts, and
+      explicit vault-key Secret management.
 - [ ] Add operational alerts for readiness failures, ingestion failures, stale
       installations, outbox growth, ClickHouse lag, and vault-key errors.
 
 ### Release and supply chain
 
-- [ ] Publish versioned API and web container images.
+- [x] Publish versioned API and web container images.
 - [ ] Publish client checksums and signed release artifacts.
-- [ ] Generate SBOMs and build provenance for binaries and images.
+- [ ] Generate SBOMs and build provenance for binaries and images. Images carry
+      both; client binaries still have provenance only.
 - [ ] Pin production container images by immutable digest.
-- [ ] Add a release manifest containing supported platforms and client versions.
+- [x] Add a release manifest containing supported platforms and client versions.
 - [ ] Add a clean-install test from a fresh checkout.
 - [ ] Test upgrades from at least the previous schema and client protocol
       versions.
@@ -69,11 +75,11 @@ production-oriented release, and what belongs to the enterprise roadmap.
 
 ### Community and legal readiness
 
-- [ ] Add `CONTRIBUTING.md` with development setup, checks, and pull-request
+- [x] Add `CONTRIBUTING.md` with development setup, checks, and pull-request
       expectations.
-- [ ] Add `SECURITY.md` with a private vulnerability-reporting path and response
+- [x] Add `SECURITY.md` with a private vulnerability-reporting path and response
       expectations.
-- [ ] Add a code of conduct and issue templates.
+- [x] Add a code of conduct, pull-request template, and issue templates.
 - [ ] Document third-party licenses and release-artifact notices.
 - [ ] Document the privacy model, employee-monitoring implications, retention,
       and the organization operator's responsibilities.
@@ -143,8 +149,19 @@ clean checkout:
 make check
 git diff --check
 docker compose config --quiet
+./scripts/restore-drill.sh
 ```
 
+The `Security scans` workflow must also be green: it covers Rust and npm
+dependencies, the built API and web images, repository configuration, and the
+GitHub Actions workflows themselves.
+
 Then verify a clean Compose startup, enrollment, scan, upload, dashboard login,
-retention behavior, client download, backup/restore, and an upgrade from the
-previous release candidate.
+retention behavior, client download, and an upgrade from the previous release
+candidate. `scripts/restore-drill.sh` covers the backup/restore path,
+including the vault master key and encrypted classifier credentials; see
+[OPERATIONS.md](OPERATIONS.md#recovery-drill) for what it does not cover.
+
+The reviewed per-endpoint authorization rules are recorded in
+[AUTHORIZATION.md](AUTHORIZATION.md), which also lists the accepted limits of
+the current model.

@@ -74,7 +74,7 @@ The development stack exposes:
 - Postgres and ClickHouse inside the Compose network
 - Optional operator stack: `docker compose --profile observability up`
 
-Development-only credentials are seeded by the migrations:
+The development API recreates these local-only credentials after migrations:
 
 - Enrollment token: `met_enroll_dev`
 - Dashboard token: `met_dashboard_dev`
@@ -85,6 +85,42 @@ Never reuse these values outside local development.
 The bootstrap profile is created from `METRUNE_BOOTSTRAP_EMAIL` and
 `METRUNE_BOOTSTRAP_PASSWORD`. Set deployment-specific values before first
 startup and remove the password from the environment after the account exists.
+Set `METRUNE_ENV=production` and provide an HTTPS `METRUNE_PUBLIC_API_URL` for
+production deployments. The API rejects known development database and
+bootstrap credentials in that mode.
+See [the security and logging boundary](docs/SECURITY_AND_LOGGING.md) before
+exposing a deployment beyond localhost.
+The role required by every endpoint, and the rate limits applied on top of
+those rules, are documented in [`docs/AUTHORIZATION.md`](docs/AUTHORIZATION.md).
+The backup, restore, retention, and upgrade procedure is documented in
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md); `./scripts/restore-drill.sh` runs
+that procedure end to end and verifies it.
+The current client release workflow and its remaining production gates are in
+[`docs/RELEASING.md`](docs/RELEASING.md).
+
+For a production-oriented Compose deployment, copy
+`deploy/compose/production.env.example` to a private env file, replace every
+placeholder, and validate the merged configuration:
+
+```bash
+docker compose \
+  --env-file .env.production \
+  -f docker-compose.yml \
+  -f docker-compose.production.yml \
+  config --quiet
+docker compose \
+  --env-file .env.production \
+  -f docker-compose.yml \
+  -f docker-compose.production.yml \
+  up --build
+```
+
+The production override does not publish PostgreSQL or ClickHouse and binds
+the API and dashboard to localhost by default so an HTTPS reverse proxy can be
+the public boundary. The dashboard token is optional when users sign in with
+the web login; if supplied, it must be a separately managed non-development
+token. Existing databases containing the known development tokens or
+`admin@test.com` are rejected by the production API startup checks.
 
 ## Client workflow
 
@@ -251,3 +287,7 @@ docker compose config --quiet
 ```
 
 Metrune is licensed under Apache-2.0.
+
+Contributions, vulnerability reports, and project conduct are covered by
+[`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
