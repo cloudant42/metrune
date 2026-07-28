@@ -42,8 +42,9 @@ services:
       CLICKHOUSE_PASSWORD: metrune-dev
       METRUNE_ENV: development
       METRUNE_PUBLIC_API_URL: http://localhost:8080
-      # Optional client-side semantic classifier provisioning. The API never
-      # receives classifier text; it only provisions this configuration once.
+      # `local` provisions client-side inference. `managed` proxies bounded
+      # semantic text through this API without returning the provider key.
+      METRUNE_CLASSIFIER_EXECUTION_MODE: ${METRUNE_CLASSIFIER_EXECUTION_MODE:-local}
       METRUNE_CLASSIFIER_PROVIDER_ID: ${METRUNE_CLASSIFIER_PROVIDER_ID:-openrouter}
       METRUNE_CLASSIFIER_CREDENTIAL_ID: ${METRUNE_CLASSIFIER_CREDENTIAL_ID:-openrouter}
       METRUNE_CLASSIFIER_ENDPOINT: ${METRUNE_CLASSIFIER_ENDPOINT:-}

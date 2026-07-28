@@ -1,6 +1,11 @@
 # Metrune
 
-Metrune is a local-first AI usage intelligence platform for engineering organizations. It tracks token usage and cost across coding agents, classifies sessions by purpose on the developer machine, and sends only sanitized session metadata to a self-hosted analytics service.
+Metrune is a multi-tenant AI usage intelligence platform for individuals,
+teams, and engineering organizations. It tracks token usage and cost across
+coding agents and sends sanitized session metadata to a self-hosted or managed
+analytics service. Semantic classification can run privately on the developer
+machine or through a managed server endpoint that keeps the provider key out
+of clients.
 
 The first release supports OpenCode, Claude Code, and Codex CLI on Linux,
 Windows, and macOS. Its scanner/parser/normalization boundaries are informed
@@ -9,7 +14,13 @@ independent implementation.
 
 ## Privacy boundary
 
-Metrune never includes prompts, source code, outputs, raw session IDs, or filesystem paths in its upload schema. The local model sees session text only on the configured local or company-approved endpoint. The central service receives HMAC-pseudonymous identities, token/cost totals, source/model dimensions, timestamps, and a category assignment.
+Metrune never includes prompts, source code, outputs, raw session IDs, or
+filesystem paths in its normal upload schema. In local classifier mode,
+semantic text stays on the client and is sent only to the explicitly
+configured model endpoint. In managed mode, bounded semantic text is sent to
+Metrune for classification while the provider key remains in the server vault.
+The analytics service receives HMAC-pseudonymous identities, token/cost
+totals, source/model dimensions, timestamps, and a category assignment.
 
 The upload also records a semantic status so valid `unknown` classifications
 are distinct from `not_configured`, `unavailable`, `failed`, and `no_input`.
@@ -23,7 +34,7 @@ OpenCode / Claude Code / Codex session stores
                     │ read-only adapters
                     ▼
        Rust client + local SQLite outbox
-                    │ local classification
+                    │ local model OR managed classifier
                     ▼
        sanitized, revisioned session snapshots
                     │ HTTPS JSON
@@ -35,8 +46,8 @@ OpenCode / Claude Code / Codex session stores
 
 - `crates/metrune-core`: adapters, normalized contracts, pseudonymization, classifier interface, and outbox.
 - `crates/metrune-cli`: enrollment, scanning, export, upload, status, and watch commands.
-- `crates/metrune-api`: organization-scoped ingestion, analytics, and administration API.
-- `web`: responsive dashboard with overview, usage explorer, session drilldown, model matrix, and an admin area for teams, retention, and identity.
+- `crates/metrune-api`: membership-scoped multi-tenant ingestion, analytics, administration, and managed-classifier API.
+- `web`: responsive dashboard with workspace selection, overview, usage explorer, session drilldown, model matrix, and administration.
 - `migrations`: Postgres control-plane and ClickHouse analytics schemas.
 - `deploy`: OpenTelemetry and optional operator observability configuration.
 
@@ -45,9 +56,11 @@ OpenCode / Claude Code / Codex session stores
 The dashboard admin area (`/admin`) covers:
 
 - **Teams**: create, rename, and delete teams, and assign enrolled installations. New uploads are stamped with the installation's current team, so re-grouping applies without touching clients.
+- **Workspaces and members**: one account can belong to multiple isolated workspaces with a separate viewer, analyst, or admin role in each. Single-workspace accounts enter directly; multi-workspace accounts choose or switch globally.
 - **Pricing**: the server imports the default model catalog and lets signed-in members create versioned organization, official-provider, custom-provider, and self-hosted rates. Reported provider cost remains authoritative.
 - **Retention**: per-organization retention in days, enforced by a ClickHouse TTL on the per-row stamped retention. Changing the value restamps stored snapshots in the background.
-- **Identity and profiles**: local password sign-in uses hashed, revocable web sessions. Every personal enrollment is bound to its owner, and `/profile` filters usage using the owner stamped by the server rather than a client-provided alias. OIDC remains the next identity milestone.
+- **Identity and profiles**: local password sign-in uses hashed, revocable web sessions with one active workspace. Every personal enrollment is bound to its owner, and `/profile` filters usage using the owner stamped by the server rather than a client-provided alias. OIDC and invitations remain the next identity milestones.
+- **Classifier and vault**: choose local/private or managed/SaaS execution per workspace. Managed mode never provisions the provider key to a client.
 
 ## Development status
 
@@ -180,15 +193,26 @@ platform artifacts can be served by configuring their corresponding
 `METRUNE_*_CLIENT_PATH` values or by pointing the web app at a release asset
 base URL.
 
-The server can provision the semantic classifier configuration and credential
-once the client is enrolled. The admin UI offers presets for OpenRouter,
-OpenAI, and Ollama/local plus a custom OpenAI-compatible endpoint. Provider
-presets own their endpoint and protocol defaults, so an administrator normally
-chooses only a provider, model, and encrypted credential.
+The server provisions a workspace's semantic classifier profile after the
+client is enrolled. The admin chooses the execution mode first:
+
+- `local`: classification text stays on the client. Hosted-provider
+  credentials are stored locally; Ollama or another localhost endpoint can run
+  without a key.
+- `managed`: bounded classification text is sent to Metrune using the
+  installation token. The API calls the provider with the encrypted vault
+  credential and returns only the category assignment. Provisioning never
+  returns that provider credential.
+
+The admin UI offers presets for OpenRouter, OpenAI, and Ollama/local plus a
+custom OpenAI-compatible endpoint. See
+[`docs/MULTI_TENANCY.md`](docs/MULTI_TENANCY.md) for the tenant isolation model
+and the unavoidable local-versus-managed privacy trade-off.
 
 Environment configuration remains available for unattended deployments:
 
 ```bash
+METRUNE_CLASSIFIER_EXECUTION_MODE=managed \
 METRUNE_CLASSIFIER_PROVIDER_ID=openrouter \
 METRUNE_CLASSIFIER_CREDENTIAL_ID=openrouter \
 METRUNE_CLASSIFIER_ENDPOINT=https://openrouter.ai/api/v1/chat/completions \
@@ -201,9 +225,9 @@ Provider credentials can also be managed from `/admin`. Metrune generates an
 AES-256-GCM vault key automatically on first startup and stores it with mode
 `0600` in the persistent `metrune-secrets` Docker volume. PostgreSQL contains
 only authenticated ciphertext and credential version metadata. Replacing a
-credential creates a new version and a client receives it on its next
-classifier provisioning refresh. The admin can export the vault recovery key
-once after confirming their password.
+credential creates a new version. Local-mode clients receive it on their next
+classifier provisioning refresh; managed-mode clients never receive it. The
+admin can export the vault recovery key once after confirming their password.
 
 Classifier response handling is automatic. Known hosted providers first use a
 strict JSON schema and fall back when a model rejects structured output.

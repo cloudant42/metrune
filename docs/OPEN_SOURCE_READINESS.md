@@ -11,11 +11,14 @@ production-oriented release, and what belongs to the enterprise roadmap.
       source code, outputs, raw session IDs, or full filesystem paths.
 - [x] Local classification can use a local or company-approved endpoint without
       routing classification text through the Metrune API.
+- [x] Managed classification keeps the provider key in the server vault and
+      exposes the semantic-text transfer as an explicit workspace choice.
 - [x] Installation, enrollment, and dashboard tokens are stored hashed at rest.
 - [x] Provider credentials use an authenticated encrypted vault and protected
       client-side storage.
-- [x] Organization-scoped analytics, owner-scoped profile analytics, retention,
-      installation revocation, and basic audit events exist.
+- [x] Membership-selected multi-tenant analytics, owner-scoped profile
+      analytics, retention, installation revocation, and basic audit events
+      exist.
 - [x] Rust tests, web typechecking/build, Compose configuration validation, and
       GitHub CI are available.
 - [x] Docker Compose and a Helm deployment baseline are included.
@@ -95,8 +98,8 @@ should be completed before presenting Metrune as enterprise-ready:
 - [ ] OIDC/SSO with Entra ID, Okta, Keycloak, and Google Workspace.
 - [ ] Group-claim role and team mapping.
 - [ ] SCIM provisioning for joiner, mover, and leaver workflows.
-- [ ] User invitations, role management, password reset, and session/device
-      revocation.
+- [x] Per-workspace role management for existing accounts.
+- [ ] Email invitations, password reset, and session/device revocation.
 - [ ] Team-level authorization rather than organization-wide aggregate access
       for every signed-in member.
 - [ ] Audit-log browsing and export with durable actor user IDs.

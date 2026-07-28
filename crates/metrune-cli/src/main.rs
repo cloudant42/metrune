@@ -1,6 +1,7 @@
 mod credentials;
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use credentials::{set_private_permissions, CredentialStore};
@@ -155,6 +156,8 @@ struct ClientConfig {
 #[serde(rename_all = "camelCase")]
 struct ClassifierProfile {
     enabled: bool,
+    #[serde(default)]
+    execution_mode: ClassifierExecutionMode,
     provider_id: String,
     endpoint: String,
     model: String,
@@ -169,7 +172,7 @@ struct ClassifierProfile {
 // Bump this when the emitted session identity changes. This forces an updated
 // client to revisit unchanged source files and replace snapshots created with
 // the previous identity scheme.
-const ADAPTER_PARSER_VERSION: &str = "6";
+const ADAPTER_PARSER_VERSION: &str = "7";
 const CLASSIFIER_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(serde::Serialize)]
@@ -193,6 +196,8 @@ struct EnrollResponse {
 #[serde(rename_all = "camelCase")]
 struct ClassifierProvisionResponse {
     enabled: bool,
+    #[serde(default)]
+    execution_mode: ClassifierExecutionMode,
     config_version: String,
     provider_id: String,
     endpoint: String,
@@ -204,12 +209,70 @@ struct ClassifierProvisionResponse {
     response_mode: ResponseMode,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ClassifierExecutionMode {
+    #[default]
+    Local,
+    Managed,
+}
+
+impl std::fmt::Display for ClassifierExecutionMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Local => "local",
+            Self::Managed => "managed",
+        })
+    }
+}
+
 struct ResolvedClassifier {
+    execution_mode: ClassifierExecutionMode,
     endpoint: String,
     model: String,
     api_key: Option<String>,
+    installation_token: Option<String>,
     config_version: String,
     response_mode: ResponseMode,
+}
+
+struct ManagedClassifier {
+    endpoint: String,
+    installation_token: String,
+    config_version: String,
+    client: reqwest::Client,
+}
+
+#[derive(serde::Serialize)]
+struct ManagedClassifyRequest<'a> {
+    text: &'a str,
+}
+
+#[async_trait]
+impl ClassifierBackend for ManagedClassifier {
+    async fn classify(&self, local_text: &str) -> Result<CategoryAssignment> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .bearer_auth(&self.installation_token)
+            .header(reqwest::header::CACHE_CONTROL, "no-store")
+            .json(&ManagedClassifyRequest { text: local_text })
+            .send()
+            .await
+            .context("send managed classifier request")?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("managed classifier returned HTTP {status}");
+        }
+        response
+            .json()
+            .await
+            .context("read managed classifier response")
+    }
+
+    fn id(&self) -> String {
+        format!("managed:{}", self.config_version)
+    }
 }
 
 #[tokio::main]
@@ -443,9 +506,10 @@ async fn classifier_command(config_path: &Path, command: ClassifierCommand) -> R
                 println!("Classifier: not provisioned");
                 return Ok(());
             };
-            let credential_stored = CredentialStore::default()
-                .get(&profile.credential_id)?
-                .is_some();
+            let credential_stored = !profile.credential_id.is_empty()
+                && CredentialStore::default()
+                    .get(&profile.credential_id)?
+                    .is_some();
             println!(
                 "Classifier: {}",
                 if profile.enabled {
@@ -454,13 +518,23 @@ async fn classifier_command(config_path: &Path, command: ClassifierCommand) -> R
                     "disabled"
                 }
             );
+            println!("Execution: {}", profile.execution_mode);
             println!("Provider: {}", profile.provider_id);
-            println!("Endpoint: {}", profile.endpoint);
+            println!(
+                "Endpoint: {}",
+                if profile.execution_mode == ClassifierExecutionMode::Managed {
+                    "Metrune managed classifier"
+                } else {
+                    &profile.endpoint
+                }
+            );
             println!("Model: {}", profile.model);
             println!("Configuration: {}", profile.config_version);
             println!(
                 "Credential: {}",
-                if credential_stored {
+                if profile.execution_mode == ClassifierExecutionMode::Managed {
+                    "held by the Metrune server"
+                } else if credential_stored {
                     "stored locally"
                 } else {
                     "not stored"
@@ -471,7 +545,9 @@ async fn classifier_command(config_path: &Path, command: ClassifierCommand) -> R
         ClassifierCommand::Logout => {
             let mut config = load_config(config_path)?;
             if let Some(profile) = config.classifier.take() {
-                CredentialStore::default().delete(&profile.credential_id)?;
+                if !profile.credential_id.is_empty() {
+                    CredentialStore::default().delete(&profile.credential_id)?;
+                }
                 save_config(config_path, &config)?;
                 println!("Removed local classifier profile and credential.");
             } else {
@@ -486,7 +562,11 @@ async fn provision_classifier(config_path: &Path, quiet: bool) -> Result<()> {
     let response = fetch_server_classifier(config_path).await?;
     if !response.enabled {
         let mut config = load_config(config_path)?;
-        config.classifier = None;
+        if let Some(profile) = config.classifier.take() {
+            if !profile.credential_id.is_empty() {
+                CredentialStore::default().delete(&profile.credential_id)?;
+            }
+        }
         save_config(config_path, &config)?;
         if !quiet {
             println!("Classification is disabled; it can be configured later.");
@@ -519,34 +599,54 @@ fn apply_server_classifier(
     quiet: bool,
 ) -> Result<()> {
     let mut config = load_config(config_path)?;
-    if response.credential_id.trim().is_empty() {
-        bail!("server returned an empty classifier credential id");
-    }
     let credential_store = CredentialStore::default();
-    let storage = if let Some(credential) = response
+    let previous_credential_id = config
+        .classifier
+        .as_ref()
+        .map(|profile| profile.credential_id.clone())
+        .filter(|credential_id| !credential_id.is_empty());
+    let storage = if response.execution_mode == ClassifierExecutionMode::Managed {
+        if response.credential.is_some() {
+            bail!("managed classifier provisioning must not return a provider credential");
+        }
+        if let Some(credential_id) = previous_credential_id.as_deref() {
+            credential_store.delete(credential_id)?;
+        }
+        None
+    } else if let Some(credential) = response
         .credential
         .as_deref()
         .filter(|credential| !credential.trim().is_empty())
     {
+        if response.credential_id.trim().is_empty() {
+            bail!("server returned a classifier credential without an id");
+        }
         Some(credential_store.set(&response.credential_id, credential)?)
-    } else if credential_store.get(&response.credential_id)?.is_some() {
+    } else if !response.credential_id.is_empty()
+        && credential_store.get(&response.credential_id)?.is_some()
+    {
         Some("already stored locally")
     } else {
         None
     };
-    if storage.is_none()
-        && response
-            .endpoint
-            .to_ascii_lowercase()
-            .contains("openrouter.ai")
-    {
-        bail!(
-            "server did not provide a credential for OpenRouter; configure METRUNE_CLASSIFIER_API_KEY on the server"
-        );
+    let normalized_endpoint = response.endpoint.to_ascii_lowercase();
+    let endpoint_requires_credential = response.execution_mode == ClassifierExecutionMode::Local
+        && (normalized_endpoint.contains("api.openai.com")
+            || normalized_endpoint.contains("openrouter.ai"));
+    if endpoint_requires_credential && storage.is_none() {
+        bail!("server did not provide the provider credential required for local classification");
+    }
+    if response.execution_mode == ClassifierExecutionMode::Local {
+        if let Some(previous) = previous_credential_id.as_deref() {
+            if previous != response.credential_id {
+                credential_store.delete(previous)?;
+            }
+        }
     }
 
     config.classifier = Some(ClassifierProfile {
         enabled: true,
+        execution_mode: response.execution_mode,
         provider_id: response.provider_id.clone(),
         endpoint: response.endpoint,
         model: response.model,
@@ -557,11 +657,18 @@ fn apply_server_classifier(
     });
     save_config(config_path, &config)?;
     if !quiet {
-        println!(
-            "Classifier provisioned ({}); credential {}.",
-            response.config_version,
-            storage.unwrap_or("not required")
-        );
+        if response.execution_mode == ClassifierExecutionMode::Managed {
+            println!(
+                "Managed classifier provisioned ({}); provider credential remains on the Metrune server.",
+                response.config_version
+            );
+        } else {
+            println!(
+                "Local classifier provisioned ({}); credential {}.",
+                response.config_version,
+                storage.unwrap_or("not required")
+            );
+        }
     }
     Ok(())
 }
@@ -602,7 +709,11 @@ async fn configure_classifier_after_enrollment(
         }
         ClassifierSelection::None => {
             let mut config = load_config(config_path)?;
-            config.classifier = None;
+            if let Some(profile) = config.classifier.take() {
+                if !profile.credential_id.is_empty() {
+                    CredentialStore::default().delete(&profile.credential_id)?;
+                }
+            }
             save_config(config_path, &config)?;
             println!("Semantic classification disabled. Usage and cost tracking still work.");
             Ok(())
@@ -617,8 +728,14 @@ fn choose_classifier_interactively(
     println!("Semantic classifier");
     if server_profile.enabled {
         println!("Your Metrune server provides:");
+        println!("  Execution: {}", server_profile.execution_mode);
         println!("  Provider: {}", server_profile.provider_id);
         println!("  Model:    {}", server_profile.model);
+        if server_profile.execution_mode == ClassifierExecutionMode::Managed {
+            println!("  Privacy:  selected semantic text is sent to Metrune; the provider key stays on the server");
+        } else {
+            println!("  Privacy:  semantic text stays on this client");
+        }
         let choices = [
             "Use organization classifier (recommended)",
             "Configure a local model",
@@ -689,6 +806,7 @@ fn configure_local_classifier(
     let mut config = load_config(config_path)?;
     config.classifier = Some(ClassifierProfile {
         enabled: true,
+        execution_mode: ClassifierExecutionMode::Local,
         provider_id: provider_id.into(),
         endpoint,
         model,
@@ -763,9 +881,11 @@ fn resolve_classifier(config: &ClientConfig) -> Result<Option<ResolvedClassifier
             (None, None) => None,
         };
         return Ok(Some(ResolvedClassifier {
+            execution_mode: ClassifierExecutionMode::Local,
             endpoint,
             model,
             api_key,
+            installation_token: None,
             config_version: env::var("METRUNE_CLASSIFIER_CONFIG_VERSION")
                 .ok()
                 .or_else(|| profile.map(|profile| profile.config_version.clone()))
@@ -779,10 +899,26 @@ fn resolve_classifier(config: &ClientConfig) -> Result<Option<ResolvedClassifier
     let Some(profile) = profile.filter(|profile| profile.enabled) else {
         return Ok(None);
     };
+    if profile.execution_mode == ClassifierExecutionMode::Managed {
+        return Ok(Some(ResolvedClassifier {
+            execution_mode: ClassifierExecutionMode::Managed,
+            endpoint: format!(
+                "{}/v1/installation/classifier/classify",
+                config.server_url.trim_end_matches('/')
+            ),
+            model: profile.model.clone(),
+            api_key: None,
+            installation_token: Some(config.installation_token.clone()),
+            config_version: profile.config_version.clone(),
+            response_mode: profile.response_mode,
+        }));
+    }
     Ok(Some(ResolvedClassifier {
+        execution_mode: ClassifierExecutionMode::Local,
         endpoint: profile.endpoint.clone(),
         model: profile.model.clone(),
         api_key: CredentialStore::default().get(&profile.credential_id)?,
+        installation_token: None,
         config_version: profile.config_version.clone(),
         response_mode: profile.response_mode,
     }))
@@ -887,7 +1023,7 @@ async fn scan(
                 .await
                 .unwrap_or_else(|error| {
                     eprintln!(
-                        "local classification failed; keeping semantic status failed: {error:#}"
+                        "semantic classification failed; keeping semantic status failed: {error:#}"
                     );
                     CategoryAssignment::failed(classifier.id())
                 })
@@ -919,6 +1055,20 @@ fn classifier(
     let Some(settings) = settings else {
         return Ok(Box::new(UnknownClassifier));
     };
+    if settings.execution_mode == ClassifierExecutionMode::Managed {
+        let installation_token = settings
+            .installation_token
+            .clone()
+            .context("managed classifier is missing the installation credential")?;
+        return Ok(Box::new(ManagedClassifier {
+            endpoint: settings.endpoint.clone(),
+            installation_token,
+            config_version: settings.config_version.clone(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(45))
+                .build()?,
+        }));
+    }
     if settings.endpoint.contains("openrouter.ai") && settings.api_key.is_none() {
         // Keep collecting tokens and costs when the semantic credential is
         // unavailable. The snapshot records this as `unavailable`.
@@ -934,18 +1084,20 @@ fn classifier(
 
 fn classifier_fingerprint(disabled: bool, settings: Option<&ResolvedClassifier>) -> String {
     let mut digest = Sha256::new();
-    let (endpoint, model, api_key, config_version) = settings
+    let (execution_mode, endpoint, model, api_key, config_version) = settings
         .map(|settings| {
             (
+                settings.execution_mode.to_string(),
                 settings.endpoint.as_str(),
                 settings.model.as_str(),
                 settings.api_key.as_deref().unwrap_or_default(),
                 settings.config_version.as_str(),
             )
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| (String::new(), "", "", "", ""));
     for value in [
         disabled.to_string(),
+        execution_mode,
         endpoint.to_string(),
         model.to_string(),
         api_key.to_string(),
@@ -1099,5 +1251,39 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn managed_profile_uses_metrune_without_a_local_provider_key() {
+        let config = ClientConfig {
+            server_url: "https://metrune.example/".into(),
+            installation_id: "installation".into(),
+            installation_token: "mti_secret".into(),
+            pseudonym_key: "pseudonym".into(),
+            user_alias: "user".into(),
+            team_key: None,
+            project_aliases: BTreeMap::new(),
+            classifier: Some(ClassifierProfile {
+                enabled: true,
+                execution_mode: ClassifierExecutionMode::Managed,
+                provider_id: "openrouter".into(),
+                endpoint: String::new(),
+                model: "provider/model".into(),
+                credential_id: String::new(),
+                config_version: "org-7".into(),
+                credential_version: None,
+                response_mode: ResponseMode::Auto,
+            }),
+        };
+        let resolved = resolve_classifier(&config)
+            .expect("managed profile should resolve")
+            .expect("managed classifier");
+        assert_eq!(resolved.execution_mode, ClassifierExecutionMode::Managed);
+        assert_eq!(
+            resolved.endpoint,
+            "https://metrune.example/v1/installation/classifier/classify"
+        );
+        assert_eq!(resolved.installation_token.as_deref(), Some("mti_secret"));
+        assert!(resolved.api_key.is_none());
     }
 }

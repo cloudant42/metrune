@@ -14,13 +14,13 @@ export default async function ModelsPage({ searchParams }: PageProps) {
       <FilterBar params={params} facets={facets.data} />
       <section className="panel" aria-labelledby="heatmap-title">
         <div className="panel-header">
-          <div><p className="eyebrow">Model × category</p><h2 id="heatmap-title">Which models power each category?</h2></div>
+          <div><p className="eyebrow">Token share of each category, per model</p><h2 id="heatmap-title">Which models power each category?</h2></div>
         </div>
         <ModelHeatmap values={data.categoryModels} />
       </section>
       <section className="panel" aria-labelledby="providers-title">
         <div className="panel-header">
-          <div><p className="eyebrow">Provider mix</p><h2 id="providers-title">Spend by provider</h2></div>
+          <div><p className="eyebrow">Cost split across model providers</p><h2 id="providers-title">Spend by provider</h2></div>
         </div>
         <BreakdownBars values={data.providers} limit={10} />
       </section>

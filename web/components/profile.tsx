@@ -108,7 +108,7 @@ export function ClientEnrollment({
     <>
       <section className="panel" aria-labelledby="enroll-title">
         <div className="panel-header">
-          <div><p className="eyebrow">Owner-bound setup</p><h2 id="enroll-title">Enroll a client</h2></div>
+          <div><p className="eyebrow">One-time code, bound to your account</p><h2 id="enroll-title">Enroll a client</h2></div>
         </div>
         <div className="panel-body">
           <div className="platform-tabs" role="tablist" aria-label="Client platform">
@@ -141,7 +141,7 @@ export function ClientEnrollment({
       </section>
       <section className="panel" aria-labelledby="clients-title">
         <div className="panel-header">
-          <div><p className="eyebrow">Private ownership</p><h2 id="clients-title">My clients</h2></div>
+          <div><p className="eyebrow">Clients enrolled to you, visible only to you</p><h2 id="clients-title">My clients</h2></div>
           {revokedCount > 0 && (
             <label className="check-field">
               <input type="checkbox" checked={showRevoked} onChange={event => setShowRevoked(event.target.checked)} />

@@ -10,12 +10,12 @@ credential, vault, and export operation".
 
 | Principal | Credential | Obtained by | Scope |
 | --- | --- | --- | --- |
-| Web session | `mts_…` bearer, hashed at rest in `web_sessions` | `POST /v1/auth/login` | One user in one organization, carries that user's role |
+| Web session | `mts_…` bearer, hashed at rest in `web_sessions` | `POST /v1/auth/login` | One account with a nullable active organization; role comes from its active membership |
 | Dashboard service token | opaque bearer, hashed at rest in `dashboard_tokens` | Provisioned by an operator | One organization, carries a stored role, has no user identity |
 | Installation | `mti_…` bearer, hashed at rest in `installations` | `POST /v1/enroll` | One installation in one organization |
 | Enrollment credential | organization enrollment token or a personal `mec_…` code | Operator-issued, or `POST /v1/me/enrollment-codes` | Creates exactly one installation |
 
-Roles are `admin`, `analyst`, and `member`. Only `admin` passes
+Roles are `admin`, `analyst`, and `viewer`. Only `admin` passes
 `DashboardAuth::require_admin`.
 
 ## Invariants
@@ -33,9 +33,12 @@ Roles are `admin`, `analyst`, and `member`. Only `admin` passes
    is written from installation authentication at ingest time; the
    client-supplied `user_key` is pseudonymous metadata and is never used to
    authorize a query.
-5. **Secrets are never returned to a dashboard caller.** Provider secrets leave
-   the vault only through `POST /v1/installation/classifier/provision`, to the
-   installation that will use them.
+5. **Membership selects browser scope.** A web session is organization-scoped
+   only when `active_organization_id` joins to an active membership for the
+   same user. Roles come from that membership, not the legacy user columns.
+6. **Classifier secrets follow execution mode.** Local mode may return the
+   organization's provider secret only to its installation. Managed mode never
+   returns that secret and uses it only inside the API.
 
 ## Operation matrix
 
@@ -47,13 +50,23 @@ Roles are `admin`, `analyst`, and `member`. Only `admin` passes
 | `GET /v1/downloads/{artifact}` | Unauthenticated client binary download |
 | `POST /v1/auth/login` | Unauthenticated; per-address rate limit plus a per-email failure throttle |
 
+### Account session
+
+| Operation | Rule |
+| --- | --- |
+| `GET /v1/auth/me` | Valid user session; returns active organization plus all active memberships |
+| `POST /v1/auth/organization` | Valid user session; requested organization must have an active membership for that session's user |
+| `POST /v1/organizations` | Valid user session; creates the organization and its initial admin membership atomically |
+| `POST /v1/auth/logout` | Revokes the presented user session |
+
 ### Installation credentials
 
 | Operation | Rule |
 | --- | --- |
 | `POST /v1/enroll` | Valid unredeemed enrollment token or personal code; per-address rate limit. A personal code is single-use, expires in 10 minutes, and binds the new installation to the issuing user and organization |
 | `POST /v1/ingest/sessions` | Installation token; organization and owner are taken from the token, never from the payload; per-installation rate limit |
-| `POST /v1/installation/classifier/provision` | Installation token; returns the organization's classifier credential only; per-installation rate limit; `Cache-Control: no-store` |
+| `POST /v1/installation/classifier/provision` | Installation token; local mode can return the organization's classifier credential, while managed mode returns no credential; per-installation rate limit; `Cache-Control: no-store` |
+| `POST /v1/installation/classifier/classify` | Installation token; managed mode only; resolves the provider credential server-side, accepts at most 64 KiB of semantic text, and returns only a category assignment; per-installation rate limit; `Cache-Control: no-store` |
 
 ### Organization administration
 
@@ -62,6 +75,8 @@ Every operation below resolves the organization from the caller's credential.
 | Operation | Rule |
 | --- | --- |
 | `GET /v1/org/teams` | Any member. Team names are needed by the self-service enrollment flow on the profile page |
+| `GET /v1/org/members`, `POST /v1/org/members` | Admin. Adding requires an existing account and creates only an organization membership |
+| `PATCH`/`DELETE /v1/org/members/{user_id}` | Admin. The final active admin cannot be demoted or removed; removal clears affected active sessions |
 | `POST /v1/org/teams`, `PATCH`/`DELETE /v1/org/teams/{id}` | Admin |
 | `GET /v1/org/installations` | Admin. The fleet inventory is an administrative view |
 | `PATCH /v1/org/installations/{id}` | Admin |
@@ -95,6 +110,9 @@ roadmap in [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md):
   rather than a durable user ID, so a renamed user weakens attribution.
 - **No delegated administration.** `admin` is a single, organization-wide role;
   there is no separate pricing, credential, or billing administrator.
+- **No email invitation delivery.** Membership administration can add an
+  existing account. Invitations and SSO just-in-time membership remain future
+  account-acquisition paths.
 - **Dashboard service tokens cannot be attributed to a person.** They are
   rejected from owner-scoped and pricing-write operations for that reason.
 
@@ -109,6 +127,7 @@ authenticated identity where one exists.
 | Enrollment | Client address | 10/minute | `METRUNE_RATE_LIMIT_ENROLL_PER_MINUTE` |
 | Login | Client address | 30/minute | `METRUNE_RATE_LIMIT_LOGIN_PER_MINUTE` |
 | Classifier provisioning | Installation | 20/minute | `METRUNE_RATE_LIMIT_PROVISION_PER_MINUTE` |
+| Managed classification | Installation | 60/minute | `METRUNE_RATE_LIMIT_CLASSIFY_PER_MINUTE` |
 | Ingestion | Installation | 60/minute | `METRUNE_RATE_LIMIT_INGEST_PER_MINUTE` |
 | Analytics | User or dashboard token | 120/minute | `METRUNE_RATE_LIMIT_ANALYTICS_PER_MINUTE` |
 | Enrollment codes | User | 20/hour | `METRUNE_RATE_LIMIT_ENROLLMENT_CODES_PER_HOUR` |

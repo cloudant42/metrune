@@ -1,16 +1,25 @@
-# UX Spec: Metrune identity, pricing, and client enrollment
+# UX Spec: Metrune multi-tenant identity, pricing, and classification
 
 ## Overview
 
-Metrune keeps organization analytics aggregated while giving each signed-in
-person a private profile for their own client usage. The server becomes the
-authoritative pricing registry and enrollment binds every client installation
-to its owner.
+Metrune keeps each organization's data isolated while allowing one signed-in
+person to belong to multiple organizations. The product calls these
+organizations **workspaces** in the interface. A web session has one active
+workspace at a time, and every organization-scoped request derives its scope
+from the authenticated membership rather than a client-supplied identifier.
+
+The classifier supports two deployment modes. Local mode keeps semantic text
+on the client and uses a client-held or keyless localhost model. Managed mode
+sends bounded classification text to Metrune's server, where a vault-held
+provider credential is used without ever being returned to the client.
 
 ## Information architecture
 
 ```text
 Metrune
+├── Workspace chooser
+│   ├── Switch workspace
+│   └── Create workspace
 ├── Overview
 ├── Usage explorer
 ├── Models
@@ -19,17 +28,55 @@ Metrune
 │   ├── My clients
 │   └── Enroll a client
 └── Teams & settings
+    ├── Members
     ├── Teams
     ├── Pricing
     ├── Installations
-    └── Identity
+    ├── Identity
+    └── Classifier & vault
 ```
 
 The shared overview and usage explorer expose organization/team aggregates.
 They do not link to an individual person's usage. Personal usage is available
 only from `/profile` after user authentication.
 
+Workspace context is global, not a page filter. It appears in the account menu
+and changing it refreshes all organization-scoped pages. Team and date filters
+remain subordinate to the active workspace.
+
 ## User flows
+
+### Sign in and choose a workspace
+
+1. User signs in once with their account credentials.
+2. The server creates an HttpOnly web session and returns active organization
+   memberships with each workspace's name and role.
+3. If exactly one active membership exists, the server selects it and the UI
+   opens the overview directly.
+4. If multiple memberships exist, no workspace is selected implicitly. The UI
+   opens `/organizations` and asks the user to choose.
+5. The selected organization is stored on the server-side web session. The
+   browser never sends an organization ID as analytics authorization.
+6. The account menu shows the active workspace and lets the user switch later.
+
+Error states: no active memberships, membership removed since login, disabled
+account, expired session, and failed switch. A removed membership clears the
+active organization and returns the user to the chooser.
+
+### Create and administer a workspace
+
+1. A signed-in user opens the workspace chooser and selects **Create
+   workspace**.
+2. The server creates the organization and an admin membership in one
+   transaction, then makes it active for the current web session.
+3. An admin opens **Administration → Members** to add an existing Metrune
+   account, change its workspace role, or remove it.
+4. The server prevents removal or demotion of the final active admin and clears
+   affected active workspace selections when membership is removed.
+
+The first implementation adds existing accounts by email. Email invitations
+and domain/SSO just-in-time membership are later acquisition paths into the
+same membership table.
 
 ### Sign in and view personal usage
 
@@ -73,6 +120,30 @@ edit organization price entries. Changes are shared, versioned, and audited;
 the permission can be tightened to admins later without changing the data
 model.
 
+### Configure semantic classification
+
+1. An organization admin opens **Classifier & vault**.
+2. The admin chooses an execution mode before choosing provider and model:
+   - **Local / private:** classification text stays on each client. A provider
+     credential may be stored on that client, or a localhost model such as
+     Ollama can run without a key.
+   - **Managed / SaaS:** bounded classification text is sent to Metrune's API.
+     The provider key remains encrypted in the server vault and is never
+     returned by enrollment or classifier provisioning.
+3. The UI explains the selected privacy boundary next to the control and
+   requires an explicit save.
+4. The CLI refreshes the profile. Local mode calls the configured provider
+   directly; managed mode calls Metrune's installation-authenticated classify
+   endpoint.
+5. Both modes upload the same metadata-only session snapshot. Managed
+   classification requests are not persisted or included in normal request
+   traces.
+
+There is no architecture that simultaneously uses a remote hosted model,
+hides its key from the client, and keeps inference text off every remote
+server. The keyless private option is client-side local inference; the hosted
+key-safe option is the managed proxy with explicit text transfer.
+
 ## Screens
 
 ### Login
@@ -82,8 +153,28 @@ model.
 Purpose: establish a user session. Fields are email and password, with clear
 errors and a link to the organization's future SSO entry point when enabled.
 
-States: loading, invalid credentials, disabled account, SSO-required, and
-success redirect. Do not render dashboard data on this screen.
+States: loading, invalid credentials, disabled account, SSO-required, direct
+single-workspace redirect, and multi-workspace chooser redirect. Do not render
+dashboard data on this screen.
+
+### Workspace chooser
+
+**Route:** `/organizations`
+
+Purpose: select the active workspace when none is selected and provide
+self-service workspace creation.
+
+Components:
+
+- Signed-in identity and sign-out action.
+- Workspace cards with workspace name, role, and **Open workspace** action.
+- Create-workspace form with a required name.
+- Empty state explaining that an administrator must add the account, plus the
+  create-workspace action when self-service creation is enabled.
+
+The chooser is a focused screen without organization navigation. Loading,
+switch failure, create failure, and membership-removed states keep the user on
+this screen.
 
 ### My profile
 
@@ -132,6 +223,20 @@ Components:
 - Explicit note that existing historical totals are unchanged unless a
   deliberate reprice operation is run.
 
+### Classifier & vault
+
+**Route:** `/admin?tab=classifier`
+
+The execution-mode control appears before provider configuration. Managed mode
+shows **Text sent to Metrune; provider key stays on this server**. Local mode
+shows **Text stays on the client; a provider key may be stored on that
+client**. Selecting Ollama/local compatible inference adds **No provider key
+required**.
+
+The credential selector always refers to vault credentials. In managed mode a
+selected credential is used only on the server. In local mode provisioning may
+deliver the credential to enrolled clients, so the UI must say so before save.
+
 ### Enrollment handoff
 
 **Route:** `/profile/enroll`
@@ -150,8 +255,20 @@ shown again by the server.
 
 ## Server/data contract
 
-- Make `users` and `web_sessions` the browser identity source; retain
-  `dashboard_tokens` as service/API credentials.
+- Keep `users` as account identity and add `organization_memberships` with a
+  role per organization. Existing `users.organization_id` and `users.role`
+  values are migration inputs, not authorization sources after rollout.
+- Add nullable `web_sessions.active_organization_id`. Login sets it only for a
+  single membership; the switch endpoint updates it only after validating an
+  active membership.
+- Make `users`, `organization_memberships`, and `web_sessions` the browser
+  identity source; retain organization-bound `dashboard_tokens` as service/API
+  credentials.
+- Every organization endpoint and analytics query must scope through the
+  session's active membership. Request bodies and query strings cannot
+  override that scope.
+- Add organization creation and membership list/add/role/remove endpoints.
+  Prevent removal or demotion of the final active admin.
 - Add an owner binding to installations, preferably a user foreign key for the
   v1 one-owner-per-installation case, with a join table reserved for future
   shared ownership.
@@ -169,9 +286,25 @@ shown again by the server.
 - Add local login/session endpoints, logout, current-user, one-time enrollment
   code creation/redeem, and pricing CRUD endpoints. Audit all ownership,
   pricing, enrollment, and revocation changes.
+- Add `classifier_execution_mode` with `local` and `managed` values. Managed
+  provisioning returns no provider credential to the client.
+- Add an installation-authenticated managed classification endpoint with
+  bounded input, per-installation rate limiting, no-store responses, generic
+  upstream errors, and no semantic text persistence.
 
 ## Acceptance criteria
 
+- A user with one membership signs in directly; a user with multiple
+  memberships must choose and can later switch from the account menu.
+- A user cannot select an organization without an active membership, and
+  switching cannot leak settings, teams, installations, analytics, prices,
+  credentials, or classifier configuration from the previous workspace.
+- Role checks use the role from the active membership, so the same account may
+  be a viewer in one workspace and an admin in another.
+- Existing single-organization users and sessions are backfilled without
+  losing access.
+- A workspace can be created transactionally and the final active admin cannot
+  be removed or demoted.
 - User A cannot read User B's profile usage, even when both users share a team.
 - A team overview cannot be used to infer a one-person member's usage; small
   groups are suppressed or combined.
@@ -185,17 +318,25 @@ shown again by the server.
 - Linux/WSL and Windows installation paths produce a working authenticated
   client config without exposing installation or provider secrets in the web
   page, normal config, or upload payload.
+- Managed mode never returns the provider credential to a client and classifies
+  through the installation-authenticated server endpoint. Local mode preserves
+  the existing metadata-only upload boundary.
+- Managed classification rejects oversized text, disabled/local-mode
+  organizations, revoked installations, and missing credentials without
+  exposing provider error bodies or secrets.
 - Rust tests, web typecheck/build, migration checks, and Playwright MCP checks
-  cover the authenticated profile, cross-user denial, pricing edit, and
+  cover tenant selection/switching, cross-tenant denial, role changes,
+  managed-key non-disclosure, authenticated profile, pricing edit, and
   enrollment happy path.
 
 ## Rollout order
 
-1. Canonical browser auth, installation ownership, and server-side authorization.
-2. Personal profile API/UI and aggregate-only organization views.
-3. Server pricing registry, default catalog import, ingest-time price resolver,
-   and pricing UI.
-4. One-time enrollment codes, client artifact manifest, Linux/WSL and Windows
-   installers, and profile handoff.
-5. Historical reprice job, SSO/OIDC login, shared installation ownership, and
-   stricter pricing permissions as follow-up work.
+1. Organization memberships, session workspace selection, migration backfill,
+   and server-side authorization.
+2. Workspace chooser/switcher, creation, and membership administration.
+3. Managed classifier endpoint and client execution-mode support while
+   preserving local classification.
+4. Personal profile API/UI, aggregate-only organization views, pricing, and
+   enrollment regression verification.
+5. Email invitations, SSO/OIDC just-in-time membership, organization billing,
+   and shared installation ownership as follow-up work.

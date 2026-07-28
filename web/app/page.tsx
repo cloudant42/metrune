@@ -1,5 +1,6 @@
 import { BreakdownBars, TrendChart } from "@/components/charts";
 import { FilterBar } from "@/components/filters";
+import { ArrowRightIcon } from "@/components/icons";
 import { getFacets, getOverviewData, type PageParams } from "@/lib/api";
 import { formatCompact, formatMoney, shortModel } from "@/lib/format";
 
@@ -33,21 +34,21 @@ export default async function Home({ searchParams }: PageProps) {
       </section>
       <section className="panel" aria-labelledby="trend-title">
         <div className="panel-header">
-          <div><p className="eyebrow">Cost and activity</p><h2 id="trend-title">Usage trend</h2></div>
+          <div><p className="eyebrow">Daily cost across the selected range</p><h2 id="trend-title">Usage trend</h2></div>
         </div>
         <TrendChart points={data.timeseries} />
       </section>
       <div className="three-column">
         <section className="panel" aria-labelledby="top-categories">
-          <div className="panel-header"><div><p className="eyebrow">Semantic categories</p><h2 id="top-categories">What AI is used for</h2></div><a className="panel-link" href="/usage?dimension=category">Explore</a></div>
+          <div className="panel-header"><div><p className="eyebrow">Locally classified session purpose</p><h2 id="top-categories">What AI is used for</h2></div><a className="panel-link" href="/usage?dimension=category">Explore<ArrowRightIcon /></a></div>
           <BreakdownBars values={data.categories} />
         </section>
         <section className="panel" aria-labelledby="top-models">
-          <div className="panel-header"><div><p className="eyebrow">Model mix</p><h2 id="top-models">Spend by model</h2></div><a className="panel-link" href="/models">Explore</a></div>
+          <div className="panel-header"><div><p className="eyebrow">Top models by cost</p><h2 id="top-models">Spend by model</h2></div><a className="panel-link" href="/models">Explore<ArrowRightIcon /></a></div>
           <BreakdownBars values={data.models} format={shortModel} />
         </section>
         <section className="panel" aria-labelledby="top-clients">
-          <div className="panel-header"><div><p className="eyebrow">Client coverage</p><h2 id="top-clients">By coding agent</h2></div><a className="panel-link" href="/usage?dimension=client">Explore</a></div>
+          <div className="panel-header"><div><p className="eyebrow">Coverage per coding agent</p><h2 id="top-clients">By coding agent</h2></div><a className="panel-link" href="/usage?dimension=client">Explore<ArrowRightIcon /></a></div>
           <BreakdownBars values={data.clients} />
         </section>
       </div>

@@ -65,6 +65,7 @@ struct AppState {
 
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BATCH_SNAPSHOTS: usize = 1_000;
+const MAX_CLASSIFICATION_TEXT_BYTES: usize = 64 * 1024;
 const DEFAULT_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(60);
 const LONG_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(300);
 const LOGIN_WINDOW: StdDuration = StdDuration::from_secs(60);
@@ -161,6 +162,7 @@ struct RateLimits {
     enroll: RateLimit,
     login: RateLimit,
     provision: RateLimit,
+    classify: RateLimit,
     ingest: RateLimit,
     analytics: RateLimit,
     enrollment_code: RateLimit,
@@ -172,6 +174,7 @@ impl RateLimits {
             enroll: RateLimit::new(60, 10).with_env_override("ENROLL_PER_MINUTE"),
             login: RateLimit::new(60, 30).with_env_override("LOGIN_PER_MINUTE"),
             provision: RateLimit::new(60, 20).with_env_override("PROVISION_PER_MINUTE"),
+            classify: RateLimit::new(60, 60).with_env_override("CLASSIFY_PER_MINUTE"),
             ingest: RateLimit::new(60, 60).with_env_override("INGEST_PER_MINUTE"),
             analytics: RateLimit::new(60, 120).with_env_override("ANALYTICS_PER_MINUTE"),
             enrollment_code: RateLimit::new(3600, 20)
@@ -318,6 +321,7 @@ impl SecretVault {
 
 #[derive(Clone)]
 struct ServerClassifierConfig {
+    execution_mode: ClassifierExecutionMode,
     provider_id: String,
     endpoint: String,
     model: String,
@@ -336,6 +340,11 @@ impl ServerClassifierConfig {
             .ok()
             .filter(|value| !value.trim().is_empty())?;
         Some(Self {
+            execution_mode: env::var("METRUNE_CLASSIFIER_EXECUTION_MODE")
+                .ok()
+                .as_deref()
+                .map(parse_classifier_execution_mode)
+                .unwrap_or_default(),
             provider_id: env::var("METRUNE_CLASSIFIER_PROVIDER_ID")
                 .unwrap_or_else(|_| "openai-compatible".into()),
             endpoint,
@@ -456,10 +465,21 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/auth/me", get(current_user))
+        .route("/v1/auth/organization", post(switch_organization))
+        .route("/v1/organizations", post(create_organization))
         .route("/v1/enroll", post(enroll))
         .route(
             "/v1/installation/classifier/provision",
             post(provision_classifier),
+        )
+        .route(
+            "/v1/installation/classifier/classify",
+            post(managed_classify),
+        )
+        .route("/v1/org/members", get(list_members).post(add_member))
+        .route(
+            "/v1/org/members/{user_id}",
+            patch(update_member).delete(remove_member),
         )
         .route("/v1/org/teams", get(list_teams).post(create_team))
         .route("/v1/org/teams/{id}", patch(update_team).delete(delete_team))
@@ -786,14 +806,25 @@ async fn bootstrap_local_user(state: &AppState) -> anyhow::Result<()> {
         .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
         .map_err(|error| anyhow::anyhow!("hash bootstrap password: {error}"))?
         .to_string();
-    sqlx::query(
+    let user_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO users(organization_id, email, display_name, password_hash, role)
          VALUES ($1,$2,'Metrune Admin',$3,'admin')
-         ON CONFLICT (organization_id, email) DO NOTHING",
+         ON CONFLICT (organization_id, email)
+         DO UPDATE SET email = EXCLUDED.email
+         RETURNING id",
     )
     .bind(organization_id)
     .bind(email.trim().to_ascii_lowercase())
     .bind(password_hash)
+    .fetch_one(&state.postgres)
+    .await?;
+    sqlx::query(
+        "INSERT INTO organization_memberships(organization_id, user_id, role)
+         VALUES ($1,$2,'admin')
+         ON CONFLICT (organization_id, user_id) DO NOTHING",
+    )
+    .bind(organization_id)
+    .bind(user_id)
     .execute(&state.postgres)
     .await?;
     Ok(())
@@ -938,13 +969,22 @@ struct LoginResponse {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct OrganizationMembershipResponse {
+    id: Uuid,
+    name: String,
+    role: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CurrentUserResponse {
     id: Uuid,
-    organization_id: Uuid,
-    organization_name: String,
+    organization_id: Option<Uuid>,
+    organization_name: Option<String>,
     email: String,
     display_name: Option<String>,
-    role: String,
+    role: Option<String>,
+    organizations: Vec<OrganizationMembershipResponse>,
 }
 
 fn failed_login(state: &AppState, email: &str) -> ApiError {
@@ -953,6 +993,90 @@ fn failed_login(state: &AppState, email: &str) -> ApiError {
     }
     state.login_limiter.record_failure(email);
     ApiError::unauthorized("invalid email or password")
+}
+
+async fn organization_memberships(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<Vec<OrganizationMembershipResponse>, ApiError> {
+    let rows = sqlx::query_as::<_, (Uuid, String, String)>(
+        "SELECT o.id, o.name, m.role
+         FROM organization_memberships m
+         JOIN organizations o ON o.id = m.organization_id
+         WHERE m.user_id = $1 AND m.disabled_at IS NULL
+         ORDER BY LOWER(o.name), o.id",
+    )
+    .bind(user_id)
+    .fetch_all(&state.postgres)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| OrganizationMembershipResponse {
+            id: row.0,
+            name: row.1,
+            role: row.2,
+        })
+        .collect())
+}
+
+async fn current_user_response(
+    state: &AppState,
+    user_id: Uuid,
+    active_organization_id: Option<Uuid>,
+) -> Result<CurrentUserResponse, ApiError> {
+    let identity = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT email, display_name
+         FROM users
+         WHERE id = $1 AND disabled_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.postgres)
+    .await?
+    .ok_or(ApiError::unauthorized("account is disabled or unavailable"))?;
+    let organizations = organization_memberships(state, user_id).await?;
+    let active = active_organization_id.and_then(|organization_id| {
+        organizations
+            .iter()
+            .find(|organization| organization.id == organization_id)
+    });
+    Ok(CurrentUserResponse {
+        id: user_id,
+        organization_id: active.map(|organization| organization.id),
+        organization_name: active.map(|organization| organization.name.clone()),
+        email: identity.0,
+        display_name: identity.1,
+        role: active.map(|organization| organization.role.clone()),
+        organizations,
+    })
+}
+
+struct UserSessionAuth {
+    session_id: Uuid,
+    user_id: Uuid,
+    active_organization_id: Option<Uuid>,
+}
+
+async fn user_session_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<UserSessionAuth, ApiError> {
+    let digest = token_hash(bearer(headers)?);
+    let row = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>)>(
+        "SELECT s.id, s.user_id, s.active_organization_id
+         FROM web_sessions s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.token_hash = $1 AND s.revoked_at IS NULL
+           AND s.expires_at > NOW() AND u.disabled_at IS NULL",
+    )
+    .bind(digest)
+    .fetch_optional(&state.postgres)
+    .await?
+    .ok_or(ApiError::unauthorized("invalid or expired session"))?;
+    Ok(UserSessionAuth {
+        session_id: row.0,
+        user_id: row.1,
+        active_organization_id: row.2,
+    })
 }
 
 async fn login(
@@ -966,20 +1090,9 @@ async fn login(
         .rate_limiter
         .check("login", &address, state.rate_limits.login)?;
     let email = request.email.trim().to_ascii_lowercase();
-    let rows = sqlx::query_as::<
-        _,
-        (
-            Uuid,
-            Uuid,
-            String,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-        ),
-    >(
-        "SELECT u.id, u.organization_id, o.name, u.email, u.display_name, u.role, u.password_hash
-         FROM users u JOIN organizations o ON o.id = u.organization_id
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>)>(
+        "SELECT u.id, u.email, u.display_name, u.password_hash
+         FROM users u
          WHERE LOWER(u.email) = $1 AND u.disabled_at IS NULL
          ORDER BY u.created_at LIMIT 2",
     )
@@ -990,7 +1103,7 @@ async fn login(
         return Err(failed_login(&state, &email));
     }
     let row = &rows[0];
-    let password_hash = row.6.clone().ok_or(ApiError::unauthorized(
+    let password_hash = row.3.clone().ok_or(ApiError::unauthorized(
         "local password login is unavailable",
     ))?;
     let password = request.password.clone();
@@ -1006,14 +1119,23 @@ async fn login(
         return Err(failed_login(&state, &email));
     }
     state.login_limiter.reset(&email);
+    let organizations = organization_memberships(&state, row.0).await?;
+    if organizations.is_empty() {
+        return Err(ApiError::forbidden(
+            "this account does not belong to an active organization",
+        ));
+    }
+    let active_organization_id = (organizations.len() == 1).then_some(organizations[0].id);
     let session_token = format!("mts_{}", Uuid::new_v4().simple());
     let expires_at = Utc::now() + Duration::days(30);
     sqlx::query(
-        "INSERT INTO web_sessions(user_id, token_hash, created_at, expires_at)
-         VALUES ($1,$2,NOW(),$3)",
+        "INSERT INTO web_sessions(
+             user_id, token_hash, active_organization_id, created_at, expires_at
+         ) VALUES ($1,$2,$3,NOW(),$4)",
     )
     .bind(row.0)
     .bind(token_hash(&session_token))
+    .bind(active_organization_id)
     .bind(expires_at)
     .execute(&state.postgres)
     .await?;
@@ -1026,11 +1148,12 @@ async fn login(
         expires_at,
         user: CurrentUserResponse {
             id: row.0,
-            organization_id: row.1,
-            organization_name: row.2.clone(),
-            email: row.3.clone(),
-            display_name: row.4.clone(),
-            role: row.5.clone(),
+            organization_id: active_organization_id,
+            organization_name: active_organization_id.map(|_| organizations[0].name.clone()),
+            email: row.1.clone(),
+            display_name: row.2.clone(),
+            role: active_organization_id.map(|_| organizations[0].role.clone()),
+            organizations,
         },
     }))
 }
@@ -1048,26 +1171,89 @@ async fn current_user(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<CurrentUserResponse>, ApiError> {
-    let auth = dashboard_auth(&state, &headers).await?;
-    let user_id = auth
-        .user_id
-        .ok_or(ApiError::unauthorized("user session required"))?;
-    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<String>, String)>(
-        "SELECT u.id, u.organization_id, o.name, u.email, u.display_name, u.role
-         FROM users u JOIN organizations o ON o.id = u.organization_id
-         WHERE u.id = $1 AND u.disabled_at IS NULL",
+    let session = user_session_auth(&state, &headers).await?;
+    Ok(Json(
+        current_user_response(&state, session.user_id, session.active_organization_id).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwitchOrganizationRequest {
+    organization_id: Uuid,
+}
+
+async fn switch_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SwitchOrganizationRequest>,
+) -> Result<Json<CurrentUserResponse>, ApiError> {
+    let session = user_session_auth(&state, &headers).await?;
+    let updated = sqlx::query(
+        "UPDATE web_sessions
+         SET active_organization_id = $2
+         WHERE id = $1 AND EXISTS (
+           SELECT 1 FROM organization_memberships
+           WHERE user_id = $3 AND organization_id = $2
+             AND disabled_at IS NULL
+         )",
     )
-    .bind(user_id)
-    .fetch_one(&state.postgres)
+    .bind(session.session_id)
+    .bind(request.organization_id)
+    .bind(session.user_id)
+    .execute(&state.postgres)
     .await?;
-    Ok(Json(CurrentUserResponse {
-        id: row.0,
-        organization_id: row.1,
-        organization_name: row.2,
-        email: row.3,
-        display_name: row.4,
-        role: row.5,
-    }))
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::forbidden(
+            "you are not an active member of that organization",
+        ));
+    }
+    Ok(Json(
+        current_user_response(&state, session.user_id, Some(request.organization_id)).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct CreateOrganizationRequest {
+    name: String,
+}
+
+async fn create_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateOrganizationRequest>,
+) -> Result<(StatusCode, Json<CurrentUserResponse>), ApiError> {
+    let session = user_session_auth(&state, &headers).await?;
+    let name = request.name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err(ApiError::bad_request(
+            "organization name must be between 1 and 120 characters",
+        ));
+    }
+    let mut transaction = state.postgres.begin().await?;
+    let organization_id =
+        sqlx::query_scalar::<_, Uuid>("INSERT INTO organizations(name) VALUES ($1) RETURNING id")
+            .bind(name)
+            .fetch_one(&mut *transaction)
+            .await?;
+    sqlx::query(
+        "INSERT INTO organization_memberships(organization_id, user_id, role)
+         VALUES ($1,$2,'admin')",
+    )
+    .bind(organization_id)
+    .bind(session.user_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("UPDATE web_sessions SET active_organization_id = $2 WHERE id = $1")
+        .bind(session.session_id)
+        .bind(organization_id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(current_user_response(&state, session.user_id, Some(organization_id)).await?),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1093,6 +1279,7 @@ struct EnrollResponse {
 #[serde(rename_all = "camelCase")]
 struct ClassifierProvisionResponse {
     enabled: bool,
+    execution_mode: ClassifierExecutionMode,
     config_version: String,
     provider_id: String,
     endpoint: String,
@@ -1101,6 +1288,43 @@ struct ClassifierProvisionResponse {
     credential: Option<String>,
     credential_version: Option<i32>,
     response_mode: ResponseMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ClassifierExecutionMode {
+    #[default]
+    Local,
+    Managed,
+}
+
+impl ClassifierExecutionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Managed => "managed",
+        }
+    }
+}
+
+fn parse_classifier_execution_mode(value: &str) -> ClassifierExecutionMode {
+    match value {
+        "managed" => ClassifierExecutionMode::Managed,
+        _ => ClassifierExecutionMode::Local,
+    }
+}
+
+fn provisioned_classifier_material(
+    execution_mode: ClassifierExecutionMode,
+    endpoint: String,
+    credential_id: String,
+    credential: Option<String>,
+    credential_version: Option<i32>,
+) -> (String, String, Option<String>, Option<i32>) {
+    match execution_mode {
+        ClassifierExecutionMode::Local => (endpoint, credential_id, credential, credential_version),
+        ClassifierExecutionMode::Managed => (String::new(), String::new(), None, None),
+    }
 }
 
 async fn enroll(
@@ -1202,10 +1426,11 @@ async fn provision_classifier(
         String,
         String,
         String,
+        String,
     )>(
         "SELECT classifier_configured, classifier_enabled, classifier_provider_id, classifier_endpoint,
                 classifier_model, classifier_credential_id, classifier_config_version,
-                classifier_protocol, classifier_response_mode
+                classifier_protocol, classifier_response_mode, classifier_execution_mode
          FROM organizations WHERE id = $1",
     )
     .bind(auth.organization_id)
@@ -1218,6 +1443,7 @@ async fn provision_classifier(
             response_headers,
             Json(ClassifierProvisionResponse {
                 enabled: false,
+                execution_mode: ClassifierExecutionMode::Local,
                 config_version: "disabled".into(),
                 provider_id: String::new(),
                 endpoint: String::new(),
@@ -1229,9 +1455,17 @@ async fn provision_classifier(
             }),
         ));
     }
-    let (provider_id, endpoint, model, credential_id, config_version, response_mode) = if configured
-    {
+    let (
+        execution_mode,
+        provider_id,
+        endpoint,
+        model,
+        credential_id,
+        config_version,
+        response_mode,
+    ) = if configured {
         (
+            parse_classifier_execution_mode(&organization.9),
             organization.2,
             organization.3,
             organization.4,
@@ -1242,6 +1476,7 @@ async fn provision_classifier(
     } else {
         let config = fallback.expect("checked above");
         (
+            config.execution_mode,
             config.provider_id.clone(),
             config.endpoint.clone(),
             config.model.clone(),
@@ -1250,26 +1485,41 @@ async fn provision_classifier(
             config.response_mode,
         )
     };
-    let (credential, credential_version) =
-        active_classifier_credential(&state, auth.organization_id, &credential_id).await?;
-    let credential = credential.or_else(|| {
-        fallback
-            .filter(|config| config.credential_id == credential_id)
-            .and_then(|config| config.api_key.clone())
-    });
+    let (credential, credential_version) = if execution_mode == ClassifierExecutionMode::Managed {
+        (None, None)
+    } else {
+        let (stored, version) =
+            active_classifier_credential(&state, auth.organization_id, &credential_id).await?;
+        (
+            stored.or_else(|| {
+                fallback
+                    .filter(|config| config.credential_id == credential_id)
+                    .and_then(|config| config.api_key.clone())
+            }),
+            version,
+        )
+    };
     sqlx::query(
         "UPDATE installations SET classifier_credential_id = $2,
              classifier_credential_version = $3 WHERE id = $1",
     )
     .bind(auth.installation_id)
-    .bind(&credential_id)
+    .bind((execution_mode == ClassifierExecutionMode::Local).then_some(credential_id.as_str()))
     .bind(credential_version)
     .execute(&state.postgres)
     .await?;
+    let (endpoint, credential_id, credential, credential_version) = provisioned_classifier_material(
+        execution_mode,
+        endpoint,
+        credential_id,
+        credential,
+        credential_version,
+    );
     Ok((
         response_headers,
         Json(ClassifierProvisionResponse {
             enabled: true,
+            execution_mode,
             config_version,
             provider_id,
             endpoint,
@@ -1280,6 +1530,112 @@ async fn provision_classifier(
             response_mode,
         }),
     ))
+}
+
+#[derive(Deserialize)]
+struct ManagedClassifyRequest {
+    text: String,
+}
+
+fn validate_managed_classification_text(text: &str) -> Result<&str, ApiError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("classification text is required"));
+    }
+    if text.len() > MAX_CLASSIFICATION_TEXT_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "classification text cannot exceed {MAX_CLASSIFICATION_TEXT_BYTES} bytes"
+        )));
+    }
+    Ok(text)
+}
+
+async fn managed_classify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ManagedClassifyRequest>,
+) -> Result<(HeaderMap, Json<metrune_core::CategoryAssignment>), ApiError> {
+    let auth = installation_auth(&state, &headers).await?;
+    state.rate_limiter.check(
+        "classifier-managed",
+        &auth.installation_id.to_string(),
+        state.rate_limits.classify,
+    )?;
+    let text = validate_managed_classification_text(&request.text)?;
+    let organization =
+        sqlx::query_as::<_, (bool, bool, String, String, String, String, String, String)>(
+            "SELECT classifier_configured, classifier_enabled, classifier_execution_mode,
+                classifier_provider_id, classifier_endpoint, classifier_model,
+                classifier_credential_id, classifier_response_mode
+         FROM organizations WHERE id = $1",
+        )
+        .bind(auth.organization_id)
+        .fetch_one(&state.postgres)
+        .await?;
+    let (execution_mode, provider_id, endpoint, model, credential_id, response_mode) =
+        if organization.0 {
+            if !organization.1 {
+                return Err(ApiError::conflict(
+                    "managed classification is not enabled for this organization",
+                ));
+            }
+            (
+                parse_classifier_execution_mode(&organization.2),
+                organization.3,
+                organization.4,
+                organization.5,
+                organization.6,
+                parse_response_mode(&organization.7),
+            )
+        } else if let Some(fallback) = &state.classifier {
+            (
+                fallback.execution_mode,
+                fallback.provider_id.clone(),
+                fallback.endpoint.clone(),
+                fallback.model.clone(),
+                fallback.credential_id.clone(),
+                fallback.response_mode,
+            )
+        } else {
+            return Err(ApiError::conflict(
+                "managed classification is not enabled for this organization",
+            ));
+        };
+    if execution_mode != ClassifierExecutionMode::Managed {
+        return Err(ApiError::conflict(
+            "this organization uses local client-side classification",
+        ));
+    }
+    let (stored_credential, _) =
+        active_classifier_credential(&state, auth.organization_id, &credential_id).await?;
+    let credential = stored_credential.or_else(|| {
+        state
+            .classifier
+            .as_ref()
+            .filter(|fallback| fallback.credential_id == credential_id)
+            .and_then(|fallback| fallback.api_key.clone())
+    });
+    if matches!(provider_id.as_str(), "openrouter" | "openai") && credential.is_none() {
+        return Err(ApiError::conflict(
+            "the managed classifier credential is unavailable",
+        ));
+    }
+    let classifier = OpenAiCompatibleClassifier::new(endpoint, model, credential, response_mode)
+        .map_err(|_| ApiError::bad_gateway("managed classifier is unavailable"))?;
+    let diagnostic = classifier
+        .classify_with_diagnostics(text)
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                organization_id = %auth.organization_id,
+                installation_id = %auth.installation_id,
+                "managed classifier request failed"
+            );
+            ApiError::bad_gateway("managed classifier request failed")
+        })?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((response_headers, Json(diagnostic.assignment)))
 }
 
 async fn ingest_sessions(
@@ -1847,16 +2203,21 @@ async fn dashboard_auth(state: &AppState, headers: &HeaderMap) -> Result<Dashboa
         });
     }
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, String)>(
-        "SELECT u.organization_id, u.id, u.role, COALESCE(u.display_name, u.email)
+        "SELECT m.organization_id, u.id, m.role, COALESCE(u.display_name, u.email)
          FROM web_sessions s
          JOIN users u ON u.id = s.user_id
+         JOIN organization_memberships m
+           ON m.user_id = s.user_id
+          AND m.organization_id = s.active_organization_id
          WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > NOW()
-           AND u.disabled_at IS NULL",
+           AND u.disabled_at IS NULL AND m.disabled_at IS NULL",
     )
     .bind(&digest)
     .fetch_optional(&state.postgres)
     .await?
-    .ok_or(ApiError::unauthorized("invalid or expired session"))?;
+    .ok_or(ApiError::unauthorized(
+        "invalid session or organization selection required",
+    ))?;
     Ok(DashboardAuth {
         organization_id: row.0.to_string(),
         user_id: Some(row.1),
@@ -1914,6 +2275,252 @@ async fn expired_session_reaper(pool: PgPool) {
             tracing::warn!(%error, "expired session reaper failed");
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberResponse {
+    user_id: Uuid,
+    email: String,
+    display_name: Option<String>,
+    role: String,
+    created_at: chrono::DateTime<Utc>,
+}
+
+fn validate_member_role(role: &str) -> Result<&str, ApiError> {
+    match role {
+        "viewer" | "analyst" | "admin" => Ok(role),
+        _ => Err(ApiError::bad_request(
+            "role must be viewer, analyst, or admin",
+        )),
+    }
+}
+
+async fn list_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<MemberResponse>>, ApiError> {
+    let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, chrono::DateTime<Utc>)>(
+        "SELECT u.id, u.email, u.display_name, m.role, m.created_at
+         FROM organization_memberships m
+         JOIN users u ON u.id = m.user_id
+         WHERE m.organization_id = $1 AND m.disabled_at IS NULL
+           AND u.disabled_at IS NULL
+         ORDER BY LOWER(COALESCE(u.display_name, u.email)), u.id",
+    )
+    .bind(auth.organization_uuid()?)
+    .fetch_all(&state.postgres)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| MemberResponse {
+                user_id: row.0,
+                email: row.1,
+                display_name: row.2,
+                role: row.3,
+                created_at: row.4,
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AddMemberRequest {
+    email: String,
+    role: String,
+}
+
+async fn add_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AddMemberRequest>,
+) -> Result<(StatusCode, Json<MemberResponse>), ApiError> {
+    let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
+    let role = validate_member_role(request.role.trim())?;
+    let email = request.email.trim().to_ascii_lowercase();
+    if email.is_empty() || email.len() > 320 {
+        return Err(ApiError::bad_request("a valid account email is required"));
+    }
+    let users = sqlx::query_as::<_, (Uuid, String, Option<String>)>(
+        "SELECT id, email, display_name
+         FROM users
+         WHERE LOWER(email) = $1 AND disabled_at IS NULL
+         ORDER BY created_at LIMIT 2",
+    )
+    .bind(&email)
+    .fetch_all(&state.postgres)
+    .await?;
+    if users.is_empty() {
+        return Err(ApiError::not_found(
+            "no Metrune account exists for that email",
+        ));
+    }
+    if users.len() > 1 {
+        return Err(ApiError::conflict(
+            "multiple legacy accounts use that email; consolidate them before adding a membership",
+        ));
+    }
+    let user = &users[0];
+    let organization_id = auth.organization_uuid()?;
+    let created_at = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        "INSERT INTO organization_memberships(
+             organization_id, user_id, role, disabled_at, updated_at
+         ) VALUES ($1,$2,$3,NULL,NOW())
+         ON CONFLICT (organization_id, user_id)
+         DO UPDATE SET role = EXCLUDED.role, disabled_at = NULL, updated_at = NOW()
+         RETURNING created_at",
+    )
+    .bind(organization_id)
+    .bind(user.0)
+    .bind(role)
+    .fetch_one(&state.postgres)
+    .await?;
+    audit(
+        &state,
+        organization_id,
+        &auth.name,
+        "member.add",
+        "user",
+        user.0.to_string(),
+        serde_json::json!({"email": user.1, "role": role}),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(MemberResponse {
+            user_id: user.0,
+            email: user.1.clone(),
+            display_name: user.2.clone(),
+            role: role.into(),
+            created_at,
+        }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct UpdateMemberRequest {
+    role: String,
+}
+
+async fn ensure_another_admin(
+    state: &AppState,
+    organization_id: Uuid,
+    target_user_id: Uuid,
+) -> Result<(), ApiError> {
+    let target_is_admin = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+           SELECT 1 FROM organization_memberships
+           WHERE organization_id = $1 AND user_id = $2
+             AND role = 'admin' AND disabled_at IS NULL
+         )",
+    )
+    .bind(organization_id)
+    .bind(target_user_id)
+    .fetch_one(&state.postgres)
+    .await?;
+    if !target_is_admin {
+        return Ok(());
+    }
+    let other_admins = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM organization_memberships
+         WHERE organization_id = $1 AND user_id <> $2
+           AND role = 'admin' AND disabled_at IS NULL",
+    )
+    .bind(organization_id)
+    .bind(target_user_id)
+    .fetch_one(&state.postgres)
+    .await?;
+    if other_admins == 0 {
+        return Err(ApiError::conflict(
+            "the final organization admin cannot be removed or demoted",
+        ));
+    }
+    Ok(())
+}
+
+async fn update_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(request): Json<UpdateMemberRequest>,
+) -> Result<StatusCode, ApiError> {
+    let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
+    let role = validate_member_role(request.role.trim())?;
+    let organization_id = auth.organization_uuid()?;
+    if role != "admin" {
+        ensure_another_admin(&state, organization_id, user_id).await?;
+    }
+    let updated = sqlx::query(
+        "UPDATE organization_memberships
+         SET role = $3, updated_at = NOW()
+         WHERE organization_id = $1 AND user_id = $2 AND disabled_at IS NULL",
+    )
+    .bind(organization_id)
+    .bind(user_id)
+    .bind(role)
+    .execute(&state.postgres)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::not_found("organization member not found"));
+    }
+    audit(
+        &state,
+        organization_id,
+        &auth.name,
+        "member.update_role",
+        "user",
+        user_id.to_string(),
+        serde_json::json!({"role": role}),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let auth = dashboard_auth(&state, &headers).await?;
+    auth.require_admin()?;
+    let organization_id = auth.organization_uuid()?;
+    ensure_another_admin(&state, organization_id, user_id).await?;
+    let mut transaction = state.postgres.begin().await?;
+    sqlx::query(
+        "UPDATE web_sessions SET active_organization_id = NULL
+         WHERE user_id = $1 AND active_organization_id = $2",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .execute(&mut *transaction)
+    .await?;
+    let removed = sqlx::query(
+        "DELETE FROM organization_memberships
+         WHERE organization_id = $1 AND user_id = $2",
+    )
+    .bind(organization_id)
+    .bind(user_id)
+    .execute(&mut *transaction)
+    .await?;
+    if removed.rows_affected() == 0 {
+        return Err(ApiError::not_found("organization member not found"));
+    }
+    transaction.commit().await?;
+    audit(
+        &state,
+        organization_id,
+        &auth.name,
+        "member.remove",
+        "user",
+        user_id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize)]
@@ -2259,6 +2866,7 @@ async fn update_settings(
 #[serde(rename_all = "camelCase")]
 struct ClassifierSettingsResponse {
     enabled: bool,
+    execution_mode: ClassifierExecutionMode,
     provider_id: String,
     protocol: String,
     endpoint: String,
@@ -2285,10 +2893,11 @@ async fn get_classifier_settings(
         String,
         String,
         String,
+        String,
     )>(
         "SELECT classifier_configured, classifier_enabled, classifier_provider_id, classifier_endpoint,
                 classifier_model, classifier_credential_id, classifier_config_version,
-                classifier_protocol, classifier_response_mode
+                classifier_protocol, classifier_response_mode, classifier_execution_mode
          FROM organizations WHERE id = $1",
     )
     .bind(auth.organization_uuid()?)
@@ -2298,6 +2907,7 @@ async fn get_classifier_settings(
         if let Some(config) = &state.classifier {
             return Ok(Json(ClassifierSettingsResponse {
                 enabled: true,
+                execution_mode: config.execution_mode,
                 provider_id: config.provider_id.clone(),
                 protocol: "openai_chat".into(),
                 endpoint: config.endpoint.clone(),
@@ -2327,6 +2937,7 @@ async fn get_classifier_settings(
             .is_some_and(|config| config.api_key.is_some() && config.credential_id == row.5);
     Ok(Json(ClassifierSettingsResponse {
         enabled: row.1,
+        execution_mode: parse_classifier_execution_mode(&row.9),
         provider_id: row.2,
         protocol: row.7,
         endpoint: row.3,
@@ -2342,6 +2953,8 @@ async fn get_classifier_settings(
 #[serde(rename_all = "camelCase")]
 struct ClassifierSettingsUpdateRequest {
     enabled: bool,
+    #[serde(default)]
+    execution_mode: ClassifierExecutionMode,
     provider_id: String,
     endpoint: String,
     model: String,
@@ -2465,7 +3078,8 @@ async fn update_classifier_settings(
          SET classifier_configured = TRUE, classifier_enabled = $2, classifier_provider_id = $3,
              classifier_endpoint = $4, classifier_model = $5,
              classifier_credential_id = $6, classifier_config_version = $7,
-             classifier_protocol = $8, classifier_response_mode = $9
+             classifier_protocol = $8, classifier_response_mode = $9,
+             classifier_execution_mode = $10
          WHERE id = $1",
     )
     .bind(organization_id)
@@ -2477,6 +3091,7 @@ async fn update_classifier_settings(
     .bind(&config_version)
     .bind(protocol)
     .bind(response_mode.to_string())
+    .bind(request.execution_mode.as_str())
     .execute(&state.postgres)
     .await?;
     let stored_credential = sqlx::query_scalar::<_, bool>(
@@ -2503,6 +3118,7 @@ async fn update_classifier_settings(
         organization_id.to_string(),
         serde_json::json!({
             "enabled": request.enabled,
+            "executionMode": request.execution_mode.as_str(),
             "providerId": provider_id,
             "endpoint": endpoint,
             "model": model,
@@ -2512,6 +3128,7 @@ async fn update_classifier_settings(
     .await;
     Ok(Json(ClassifierSettingsResponse {
         enabled: request.enabled,
+        execution_mode: request.execution_mode,
         provider_id: provider_id.into(),
         protocol: protocol.into(),
         endpoint: endpoint.into(),
@@ -3923,6 +4540,7 @@ mod tests {
     fn classifier_presets_hide_protocol_and_endpoint_complexity() {
         let openrouter = resolve_provider_config(&ClassifierSettingsUpdateRequest {
             enabled: true,
+            execution_mode: ClassifierExecutionMode::Managed,
             provider_id: "openrouter".into(),
             endpoint: "https://ignored.example/v1".into(),
             model: "inclusionai/ling-3.0-flash:free".into(),
@@ -3939,6 +4557,7 @@ mod tests {
 
         let custom = resolve_provider_config(&ClassifierSettingsUpdateRequest {
             enabled: true,
+            execution_mode: ClassifierExecutionMode::Local,
             provider_id: "custom".into(),
             endpoint: "http://localhost:1234/v1/chat/completions".into(),
             model: "local-model".into(),
@@ -3947,6 +4566,60 @@ mod tests {
         })
         .expect("custom localhost provider");
         assert_eq!(custom.response_mode, ResponseMode::PromptJson);
+    }
+
+    #[test]
+    fn managed_classifier_material_never_exposes_provider_access() {
+        let (endpoint, credential_id, credential, version) = provisioned_classifier_material(
+            ClassifierExecutionMode::Managed,
+            "https://provider.example/v1/chat/completions".into(),
+            "provider-key".into(),
+            Some("super-secret".into()),
+            Some(7),
+        );
+        assert!(endpoint.is_empty());
+        assert!(credential_id.is_empty());
+        assert!(credential.is_none());
+        assert!(version.is_none());
+
+        let local = provisioned_classifier_material(
+            ClassifierExecutionMode::Local,
+            "http://localhost:11434/v1/chat/completions".into(),
+            String::new(),
+            None,
+            None,
+        );
+        assert_eq!(local.0, "http://localhost:11434/v1/chat/completions");
+    }
+
+    #[test]
+    fn managed_classification_text_is_bounded_and_non_empty() {
+        assert!(validate_managed_classification_text(" useful context ").is_ok());
+        assert!(validate_managed_classification_text(" \n ").is_err());
+        assert!(
+            validate_managed_classification_text(&"a".repeat(MAX_CLASSIFICATION_TEXT_BYTES))
+                .is_ok()
+        );
+        let oversized =
+            validate_managed_classification_text(&"a".repeat(MAX_CLASSIFICATION_TEXT_BYTES + 1))
+                .expect_err("oversized managed text must be rejected");
+        assert_eq!(oversized.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn workspace_roles_are_explicit_and_classifier_mode_defaults_private() {
+        assert!(validate_member_role("viewer").is_ok());
+        assert!(validate_member_role("analyst").is_ok());
+        assert!(validate_member_role("admin").is_ok());
+        assert!(validate_member_role("owner").is_err());
+        assert_eq!(
+            parse_classifier_execution_mode("managed"),
+            ClassifierExecutionMode::Managed
+        );
+        assert_eq!(
+            parse_classifier_execution_mode("unexpected"),
+            ClassifierExecutionMode::Local
+        );
     }
 
     #[test]

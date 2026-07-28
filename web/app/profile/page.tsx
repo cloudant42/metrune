@@ -42,7 +42,7 @@ export default async function ProfilePage({ searchParams }: PageProps) {
             <Metric label="My clients" value={String(installations.filter(item => !item.revoked).length)} detail="Active installations" />
           </section>
           <section className="panel" aria-labelledby="personal-trend">
-            <div className="panel-header"><div><p className="eyebrow">Last 30 days</p><h2 id="personal-trend">My usage trend</h2></div></div>
+            <div className="panel-header"><div><p className="eyebrow">Your own cost over the last 30 days</p><h2 id="personal-trend">My usage trend</h2></div></div>
             {usage.timeseries.length ? <TrendChart points={usage.timeseries} /> : <p className="empty">No usage in this range yet.</p>}
           </section>
           <div className="three-column">

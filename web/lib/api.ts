@@ -42,6 +42,7 @@ export type OrgSettings = {
 };
 export type ClassifierSettings = {
   enabled: boolean;
+  executionMode: "local" | "managed";
   providerId: string;
   protocol: string;
   endpoint: string;
@@ -58,13 +59,26 @@ export type ProviderCredential = {
   createdAt: string;
   clientsOnVersion: number;
 };
+export type OrganizationMembership = {
+  id: string;
+  name: string;
+  role: "viewer" | "analyst" | "admin";
+};
 export type CurrentUser = {
   id: string;
-  organizationId: string;
-  organizationName: string;
+  organizationId: string | null;
+  organizationName: string | null;
   email: string;
   displayName: string | null;
-  role: string;
+  role: "viewer" | "analyst" | "admin" | null;
+  organizations: OrganizationMembership[];
+};
+export type Member = {
+  userId: string;
+  email: string;
+  displayName: string | null;
+  role: "viewer" | "analyst" | "admin";
+  createdAt: string;
 };
 export type MyInstallation = {
   id: string;
@@ -332,19 +346,27 @@ export async function getFacets(params: PageParams): Promise<Result<Facets>> {
   return withFallback(() => api<Facets>("/v1/analytics/facets", query), demo.facets);
 }
 
-export type AdminData = { teams: Team[]; installations: Installation[]; settings: OrgSettings; classifier: ClassifierSettings; credentials: ProviderCredential[] };
+export type AdminData = {
+  members: Member[];
+  teams: Team[];
+  installations: Installation[];
+  settings: OrgSettings;
+  classifier: ClassifierSettings;
+  credentials: ProviderCredential[];
+};
 
 export async function getAdminData(): Promise<Result<AdminData>> {
   return withFallback(
     async () => {
-      const [teams, installations, settings, classifier, credentials] = await Promise.all([
+      const [members, teams, installations, settings, classifier, credentials] = await Promise.all([
+        api<Member[]>("/v1/org/members"),
         api<Team[]>("/v1/org/teams"),
         api<Installation[]>("/v1/org/installations"),
         api<OrgSettings>("/v1/org/settings"),
         api<ClassifierSettings>("/v1/org/classifier"),
         api<ProviderCredential[]>("/v1/org/credentials"),
       ]);
-      return { teams, installations, settings, classifier, credentials };
+      return { members, teams, installations, settings, classifier, credentials };
     },
     demo.adminData,
   );
@@ -430,7 +452,8 @@ const demo = {
       { id: "i2", name: "ci-runner-03", teamId: null, teamName: null, createdAt: "2026-07-03T00:00:00Z", lastSeenAt: null, revoked: false },
     ] as Installation[],
     settings: { organizationName: "Acme Engineering", retentionDays: 365, ssoEnforced: false, localLoginEnabled: true } as OrgSettings,
-    classifier: { enabled: false, providerId: "", protocol: "openai_chat", endpoint: "", model: "", credentialId: "", configVersion: "disabled", credentialAvailable: false, responseMode: "auto" } as ClassifierSettings,
+    members: [] as Member[],
+    classifier: { enabled: false, executionMode: "local", providerId: "", protocol: "openai_chat", endpoint: "", model: "", credentialId: "", configVersion: "disabled", credentialAvailable: false, responseMode: "auto" } as ClassifierSettings,
     credentials: [] as ProviderCredential[],
   } as AdminData,
 };

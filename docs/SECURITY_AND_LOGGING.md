@@ -39,6 +39,13 @@ internal secrets. Treat logs as sensitive operational data: restrict access,
 apply the organization's retention policy, and avoid enabling debug logging in
 production unless the additional data has been reviewed.
 
+Managed classifier requests are the one API path that may contain bounded
+semantic text. The request body is not persisted or traced, provider error
+bodies are discarded, responses carry `Cache-Control: no-store`, and the
+provider credential remains in the server vault. Operators must still treat
+the API and configured model provider as processors of that text. See
+[MULTI_TENANCY.md](MULTI_TENANCY.md).
+
 ## Deployment boundary
 
 Terminate TLS at the ingress or reverse proxy, forward only the required

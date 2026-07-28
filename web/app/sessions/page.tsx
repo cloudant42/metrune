@@ -97,7 +97,7 @@ export default async function SessionsPage({ searchParams }: PageProps) {
           params={params}
           sort={sort}
           page={page}
-          eyebrow="Private drilldown"
+          eyebrow="Sessions from your own enrolled clients"
           title={selectedInstallation ? `My sessions · ${selectedInstallation}` : "My sessions"}
           installationNames={installationNames}
         />
@@ -110,7 +110,7 @@ export default async function SessionsPage({ searchParams }: PageProps) {
     return (
       <section className="panel" aria-labelledby="sessions-unavailable-title">
         <div className="panel-header">
-          <div><p className="eyebrow">Permission-controlled drilldown</p><h2 id="sessions-unavailable-title">Sessions are private</h2></div>
+          <div><p className="eyebrow">Only analysts and admins can drill into sessions</p><h2 id="sessions-unavailable-title">Sessions are private</h2></div>
         </div>
         <div className="panel-body">
           <p className="onboarding-copy">
@@ -131,7 +131,7 @@ export default async function SessionsPage({ searchParams }: PageProps) {
         params={params}
         sort={sort}
         page={page}
-        eyebrow="Pseudonymous drilldown"
+        eyebrow="Pseudonymous identities, no prompt content"
         title="Classified sessions"
         showExport
       />

@@ -28,14 +28,36 @@
 
 The Rust upload types contain no fields capable of carrying this content. `UsageMessage.classification_text` does not implement serialization, and the privacy contract test searches serialized snapshots for representative secrets.
 
-## Local model boundary
+## Semantic model boundaries
 
-Classification text is sent directly from the client only to the configured `METRUNE_CLASSIFIER_ENDPOINT`. The Metrune server may provision the endpoint, model, and provider credential during installation, but it does not proxy or receive classification text. Provisioned credentials are stored locally in the native system credential store or a protected WSL/Linux fallback file. Metrune never falls back to a public model service automatically.
+Classification is an explicit organization setting:
+
+- **Local mode:** classification text is sent directly from the client only to
+  the configured `METRUNE_CLASSIFIER_ENDPOINT`. A provisioned credential is
+  stored in the native system credential store or protected WSL/Linux fallback
+  file. A localhost model can keep text local without a provider key.
+- **Managed mode:** the client sends bounded classification text to Metrune's
+  installation-authenticated classify endpoint. Metrune loads the provider
+  credential from its encrypted vault, calls the provider, and returns only the
+  category assignment. The provider credential is never returned to the
+  client.
+
+Managed classification text is limited to 64 KiB, marked no-store, omitted
+from traces and error logs, and never inserted into PostgreSQL, ClickHouse, the
+local outbox, or the normal upload envelope. It may still be processed by the
+Metrune API and configured model provider, so operators must disclose and
+govern that transfer. Metrune never switches from local to managed mode
+automatically.
+
+See [MULTI_TENANCY.md](MULTI_TENANCY.md) for the execution trade-off and SaaS
+deployment guidance.
 
 ## Central controls
 
 - Installation, enrollment, and dashboard bearer tokens are hashed at rest.
-- Analytics access is organization-scoped.
+- Browser analytics access is scoped by the web session's active organization
+  membership; service and installation tokens remain bound to one
+  organization.
 - Session drilldown requires analyst or admin role.
 - ClickHouse retention defaults to 365 days.
 - Operational telemetry processors remove prompt, source-code, and raw-session attributes defensively.

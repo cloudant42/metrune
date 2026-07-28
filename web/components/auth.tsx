@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import { MarkIcon } from "./icons";
 import { useState, type FormEvent } from "react";
 
 export function LoginForm() {
@@ -24,17 +25,17 @@ export function LoginForm() {
       setError(payload.error ?? "Sign-in failed.");
       return;
     }
-    router.replace("/profile");
+    router.replace(payload.user?.organizationId ? "/" : "/organizations");
     router.refresh();
   }
 
   return (
     <form className="auth-card" onSubmit={submit}>
       <div className="auth-heading">
-        <span className="brand-mark" aria-hidden="true">M</span>
-        <div><p className="eyebrow">Private workspace</p><h1>Sign in to Metrune</h1></div>
+        <span className="brand-mark" aria-hidden="true"><MarkIcon size={26} /></span>
+        <div><p className="eyebrow">Private, self-hosted workspace</p><h1>Sign in to Metrune</h1></div>
       </div>
-      <p className="auth-copy">Your profile shows only usage from clients enrolled to your account.</p>
+      <p className="auth-copy">Sign in once, then open any workspace you belong to.</p>
       <label className="field">
         <span>Email</span>
         <input name="email" type="email" autoComplete="username" required />

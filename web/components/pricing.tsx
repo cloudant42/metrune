@@ -108,7 +108,7 @@ export function PricingManager({ prices }: { prices: Price[] }) {
       {draft && (
         <section className="panel editor-panel" id="price-editor" aria-labelledby="price-editor-title">
           <div className="panel-header">
-            <div><p className="eyebrow">Shared organization rule</p><h2 id="price-editor-title">{draft.id ? "Edit price" : draft.providerId ? `Override ${draft.providerId}/${draft.modelId}` : "Create provider/model price"}</h2></div>
+            <div><p className="eyebrow">Applies to every client in the organization</p><h2 id="price-editor-title">{draft.id ? "Edit price" : draft.providerId ? `Override ${draft.providerId}/${draft.modelId}` : "Create provider/model price"}</h2></div>
             <button className="btn ghost small" type="button" onClick={() => setDraft(null)}>Cancel</button>
           </div>
           <form className="price-form panel-body" onSubmit={save}>
@@ -137,7 +137,7 @@ export function PricingManager({ prices }: { prices: Price[] }) {
 
       <section className="panel" aria-labelledby="overrides-title">
         <div className="panel-header">
-          <div><p className="eyebrow">Your rules</p><h2 id="overrides-title">Organization overrides</h2></div>
+          <div><p className="eyebrow">Rates your organization has overridden</p><h2 id="overrides-title">Organization overrides</h2></div>
           {!draft && <button className="btn ghost small" type="button" onClick={() => edit(null)}>Add price</button>}
         </div>
         <div className="table-scroll">
@@ -165,7 +165,7 @@ export function PricingManager({ prices }: { prices: Price[] }) {
 
       <section className="panel" aria-labelledby="prices-title">
         <div className="panel-header">
-          <div><p className="eyebrow">Default catalog</p><h2 id="prices-title">Provider and model prices</h2></div>
+          <div><p className="eyebrow">Rates imported from the default model catalog</p><h2 id="prices-title">Provider and model prices</h2></div>
           <label className="search-field"><span className="sr-only">Search prices</span><input type="search" value={query} onChange={event => { setQuery(event.target.value); setPage(0); }} placeholder="Search provider or model" /></label>
         </div>
         <div className="table-scroll">
