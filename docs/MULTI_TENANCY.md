@@ -38,14 +38,12 @@ Login returns all active memberships:
 - `POST /v1/organizations` creates an organization and an admin membership in
   one transaction.
 
-Workspace admins can add an existing Metrune account by email, change its role,
-or remove it. The API prevents removal or demotion of the final active admin.
-Removing a membership clears that workspace from the affected user's active
-sessions.
-
-Email invitations and SSO just-in-time membership are future acquisition
-paths into the same membership table. The current member API intentionally
-requires an existing account.
+Workspace admins invite an email address with a role, resend or revoke a
+pending invitation, change a member's role, or remove a membership. New users
+set their password after following the expiring email link. Existing users
+must sign in as the invited address before acceptance. The API prevents
+removal or demotion of the final active admin. Removing a membership clears
+that workspace from the affected user's active sessions.
 
 ## Semantic classifier execution modes
 
@@ -108,6 +106,6 @@ compute and is not part of this implementation.
 - Keep the vault key outside the container image and back it up separately.
 - Terminate TLS before the API and use an edge rate limiter in addition to the
   per-process installation limit.
-- Treat organization creation policy, invitation delivery, verified domains,
-  SSO, billing, quotas, and abuse controls as deployment policy layers. They
+- Treat organization creation policy, verified domains, SSO, billing, quotas,
+  and abuse controls as deployment policy layers. They
   do not change the organization isolation contract.

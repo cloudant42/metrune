@@ -8,7 +8,5 @@
 target
 web/.next
 web/node_modules
-design
-design-system
 *.db
 *.log

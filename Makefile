@@ -6,6 +6,7 @@ check:
 	cargo test --workspace
 	cd web && npm run typecheck && npm run build
 	docker compose config --quiet
+	bash scripts/check-production-compose.sh
 
 test:
 	cargo test --workspace
@@ -15,3 +16,4 @@ web-build:
 
 compose-check:
 	docker compose config --quiet
+	bash scripts/check-production-compose.sh

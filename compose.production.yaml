@@ -1,0 +1,128 @@
+# Supported v0.1 production-beta topology: one Linux host, four services, and
+# an external HTTPS reverse proxy. This file is standalone and must not be
+# merged with the development Compose file.
+services:
+  postgres:
+    image: postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: metrune
+      POSTGRES_USER: metrune
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metrune -d metrune"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations/postgres:/docker-entrypoint-initdb.d:ro
+    networks: [data]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 60s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server@sha256:b002e56ed5c16e224c312527f6fcba7e77216fec5d7a88a7828f59efc614feb5
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: metrune
+      CLICKHOUSE_USER: metrune
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "metrune", "--password", "${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set}", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./migrations/clickhouse:/docker-entrypoint-initdb.d:ro
+    networks: [data]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 60s
+
+  api:
+    image: ${METRUNE_API_IMAGE:?METRUNE_API_IMAGE must be a released image reference, preferably an immutable digest}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: metrune
+      CLICKHOUSE_USER: metrune
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set}
+      METRUNE_ENV: production
+      METRUNE_PUBLIC_API_URL: ${METRUNE_PUBLIC_API_URL:?METRUNE_PUBLIC_API_URL must be an HTTPS URL}
+      METRUNE_BOOTSTRAP_EMAIL: ${METRUNE_BOOTSTRAP_EMAIL:-}
+      METRUNE_BOOTSTRAP_PASSWORD: ${METRUNE_BOOTSTRAP_PASSWORD:-}
+      METRUNE_BOOTSTRAP_ORGANIZATION: ${METRUNE_BOOTSTRAP_ORGANIZATION:-Metrune Workspace}
+      METRUNE_CLASSIFIER_CONFIG_VERSION: ${METRUNE_CLASSIFIER_CONFIG_VERSION:-production-1}
+      METRUNE_DEFAULT_PRICE_CATALOG: /usr/share/metrune/pricing/openrouter.catalog.json
+      METRUNE_SECRETS_KEY_FILE: /var/lib/metrune/secrets/master.key
+      # Client mirror. The image ships a manifest covering its own Linux client;
+      # mount a directory holding the release's client-manifest.json and the
+      # binaries to mirror every platform, including in air-gapped networks.
+      METRUNE_CLIENT_DOWNLOAD_DIR: ${METRUNE_CLIENT_DOWNLOAD_DIR:-/usr/share/metrune/downloads}
+      METRUNE_TRUST_PROXY_HEADERS: ${METRUNE_TRUST_PROXY_HEADERS:-true}
+      METRUNE_SMTP_HOST: ${METRUNE_SMTP_HOST:?METRUNE_SMTP_HOST must be set}
+      METRUNE_SMTP_PORT: ${METRUNE_SMTP_PORT:?METRUNE_SMTP_PORT must be set}
+      METRUNE_SMTP_USERNAME: ${METRUNE_SMTP_USERNAME:?METRUNE_SMTP_USERNAME must be set}
+      METRUNE_SMTP_PASSWORD: ${METRUNE_SMTP_PASSWORD:?METRUNE_SMTP_PASSWORD must be set}
+      METRUNE_SMTP_FROM: ${METRUNE_SMTP_FROM:?METRUNE_SMTP_FROM must be set}
+      METRUNE_SMTP_SECURITY: ${METRUNE_SMTP_SECURITY:-starttls}
+      RUST_LOG: ${RUST_LOG:-metrune_api=info,tower_http=info}
+    ports:
+      - "127.0.0.1:${METRUNE_API_PORT:-8080}:8080"
+    volumes:
+      - metrune-secrets:/var/lib/metrune/secrets
+    networks: [app, data, egress]
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/v1/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    stop_grace_period: 60s
+
+  web:
+    image: ${METRUNE_WEB_IMAGE:?METRUNE_WEB_IMAGE must be a released image reference, preferably an immutable digest}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /app/.next/cache:size=64m,mode=0755,uid=1000,gid=1000
+    environment:
+      METRUNE_ENV: production
+      METRUNE_API_URL: http://api:8080
+      METRUNE_DASHBOARD_TOKEN: ""
+      METRUNE_PUBLIC_API_URL: ${METRUNE_PUBLIC_API_URL:?METRUNE_PUBLIC_API_URL must be an HTTPS URL}
+      METRUNE_CLIENT_RELEASE_BASE_URL: ${METRUNE_CLIENT_RELEASE_BASE_URL:-}
+    ports:
+      - "127.0.0.1:${METRUNE_WEB_PORT:-3001}:3000"
+    networks: [app]
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    stop_grace_period: 30s
+
+networks:
+  app:
+    internal: true
+  data:
+    internal: true
+  egress:
+
+volumes:
+  postgres-data:
+  clickhouse-data:
+  metrune-secrets:

@@ -1,8 +1,8 @@
 # Operations guide
 
 This is the minimum backup, restore, retention, and upgrade procedure for the
-current self-hosted development-stage deployment. Adapt the commands to the
-operator's secret manager and storage platform before using them in production.
+single-host production-beta deployment. Adapt storage commands to the
+operator's encrypted backup platform.
 
 ## Critical state
 
@@ -35,10 +35,6 @@ For production, use the organization's managed PostgreSQL backup or equivalent
 encrypted `pg_dump`/WAL procedure. Verify that the dump can be read from a
 separate operator account and that its retention matches the recovery
 objective.
-
-For Helm deployments, create the `metrune-vault` Secret with a `master.key`
-entry before starting the API. Preserve that Secret as part of the deployment
-backup; the chart mounts it read-only and does not generate a replacement key.
 
 ## ClickHouse backup
 
@@ -94,9 +90,9 @@ legal records as required by the organization's policy.
 
 Back up PostgreSQL, ClickHouse, and the vault key before every release. The API
 currently runs embedded PostgreSQL migrations during startup and applies
-ClickHouse compatibility changes during startup. For a single-node Compose
-deployment, stop the old API, start one new API instance, verify readiness, and
-only then scale out the web/API services.
+ClickHouse compatibility changes during startup. For the supported Compose
+deployment, stop the old API, start the new API, verify readiness, and only
+then recreate the web service.
 
 Migrations may be forward-only. Do not roll back the application binary across
 an unapplied or partially applied schema change unless the release notes
@@ -152,6 +148,6 @@ substitute the platform's backup and restore commands.
 ### What the drill does not cover
 
 Record these manually as part of a production drill: multi-partition ClickHouse
-history and merge/mutation backlog, replica and ingress rollout order, external
-secret-manager retrieval of the vault key, DNS and TLS cutover, and the elapsed
-wall-clock time against the recovery-time objective.
+history and merge/mutation backlog, external backup retrieval of the vault key,
+DNS and TLS cutover, SMTP delivery, and the elapsed wall-clock time against the
+recovery-time objective.

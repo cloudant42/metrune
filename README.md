@@ -1,317 +1,162 @@
 # Metrune
 
-Metrune is a multi-tenant AI usage intelligence platform for individuals,
-teams, and engineering organizations. It tracks token usage and cost across
-coding agents and sends sanitized session metadata to a self-hosted or managed
-analytics service. Semantic classification can run privately on the developer
-machine or through a managed server endpoint that keeps the provider key out
-of clients.
+Metrune is a privacy-first, self-hosted analytics platform for AI coding
+agents. A local Rust client reads supported agent stores, calculates usage and
+cost data, optionally classifies sessions, and uploads a deliberately limited
+metadata schema. The web app provides organization, team, member, installation,
+pricing, and usage views.
 
-The first release supports OpenCode, Claude Code, and Codex CLI on Linux,
-Windows, and macOS. Its scanner/parser/normalization boundaries are informed
-by [Tokscale](https://github.com/junhoyeo/tokscale), but this repository is an
-independent implementation.
+> **Release status:** production beta. The first open-source release supports a
+> single Linux host deployed with Docker Compose. It is suitable for evaluation
+> and controlled internal rollouts, but it is not yet a high-availability
+> platform.
+
+## What is in the beta
+
+- A Rust client for scanning, exporting, uploading, watching, local
+  classification, and price-catalog management.
+- A Rust API, PostgreSQL control plane, and ClickHouse usage store.
+- A Next.js dashboard with organization-scoped roles and personal analytics.
+- Installation enrollment, email invitations, password resets, and revocable
+  browser sessions.
+- Local or operator-managed semantic classification with explicit privacy
+  boundaries.
+- One supported production deployment: the standalone
+  [`compose.production.yaml`](compose.production.yaml) stack behind an external
+  HTTPS reverse proxy.
+
+The beta intentionally does **not** include Helm, Kubernetes, an embedded
+reverse proxy, Grafana, Prometheus, or an OpenTelemetry collector. Those can be
+added later when their contracts and operating procedures are tested.
+
+## Support matrix
+
+| Surface | Beta status |
+| --- | --- |
+| Server on Linux x86_64 with Docker Compose v2 | Supported |
+| External HTTPS reverse proxy on the same host | Supported |
+| Linux x86_64 client, including WSL2 | Supported |
+| Windows x86_64 client | Experimental artifact |
+| macOS Intel and Apple Silicon clients | Experimental artifacts |
+| Kubernetes / Helm / multi-host HA | Not supported |
+| Bundled Grafana, Prometheus, or OTEL collector | Not included |
+
+“Experimental” means the release workflow builds and smoke-tests the binary,
+but the project does not yet promise full installation, credential-store, and
+long-running watch-mode support on that platform.
 
 ## Privacy boundary
 
-Metrune never includes prompts, source code, outputs, raw session IDs, or
-filesystem paths in its normal upload schema. In local classifier mode,
-semantic text stays on the client and is sent only to the explicitly
-configured model endpoint. In managed mode, bounded semantic text is sent to
-Metrune for classification while the provider key remains in the server vault.
-The analytics service receives HMAC-pseudonymous identities, token/cost
-totals, source/model dimensions, timestamps, and a category assignment.
+The normal upload contains usage metadata: pseudonymous installation, user,
+project, and session identifiers; the final project-folder label by default;
+provider/model/client identifiers; token and cost figures; timestamps; and
+classification results.
 
-The upload also records a semantic status so valid `unknown` classifications
-are distinct from `not_configured`, `unavailable`, `failed`, and `no_input`.
-The automated contract tests assert this boundary. See
-[docs/privacy.md](docs/privacy.md) for the threat model.
-
-## Architecture
-
-```text
-OpenCode / Claude Code / Codex session stores
-                    │ read-only adapters
-                    ▼
-       Rust client + local SQLite outbox
-                    │ local model OR managed classifier
-                    ▼
-       sanitized, revisioned session snapshots
-                    │ HTTPS JSON
-                    ▼
-     Axum API ── Postgres control plane
-          │
-          └──── ClickHouse analytics ── Next.js dashboard
-```
-
-- `crates/metrune-core`: adapters, normalized contracts, pseudonymization, classifier interface, and outbox.
-- `crates/metrune-cli`: enrollment, scanning, export, upload, status, and watch commands.
-- `crates/metrune-api`: membership-scoped multi-tenant ingestion, analytics, administration, and managed-classifier API.
-- `web`: responsive dashboard with workspace selection, overview, usage explorer, session drilldown, model matrix, and administration.
-- `migrations`: Postgres control-plane and ClickHouse analytics schemas.
-- `deploy`: OpenTelemetry and optional operator observability configuration.
-
-## Administration
-
-The dashboard admin area (`/admin`) covers:
-
-- **Teams**: create, rename, and delete teams, and assign enrolled installations. New uploads are stamped with the installation's current team, so re-grouping applies without touching clients.
-- **Workspaces and members**: one account can belong to multiple isolated workspaces with a separate viewer, analyst, or admin role in each. Single-workspace accounts enter directly; multi-workspace accounts choose or switch globally.
-- **Pricing**: the server imports the default model catalog and lets signed-in members create versioned organization, official-provider, custom-provider, and self-hosted rates. Reported provider cost remains authoritative.
-- **Retention**: per-organization retention in days, enforced by a ClickHouse TTL on the per-row stamped retention. Changing the value restamps stored snapshots in the background.
-- **Identity and profiles**: local password sign-in uses hashed, revocable web sessions with one active workspace. Every personal enrollment is bound to its owner, and `/profile` filters usage using the owner stamped by the server rather than a client-provided alias. OIDC and invitations remain the next identity milestones.
-- **Classifier and vault**: choose local/private or managed/SaaS execution per workspace. Managed mode never provisions the provider key to a client.
-
-## Development status
-
-Metrune is still in active development. The current checkout is suitable for
-development and self-hosted evaluation, but it is not yet a finished
-enterprise or public-production release. The [open-source readiness checklist](docs/OPEN_SOURCE_READINESS.md)
-tracks the remaining security, operations, community, and enterprise work.
+It does not have fields for prompts, model responses, source code, patches,
+tool arguments, command output, raw message/session IDs, full filesystem paths,
+classifier summaries, or provider credentials. The default folder label can
+still reveal a project name; set `METRUNE_PROJECT_MODE=anonymous` where that is
+not appropriate. See [the privacy model](docs/privacy.md) for the exact
+contract.
 
 ## Local development
 
-Requirements: Rust stable, Node.js 20+, Docker Compose.
+Prerequisites:
+
+- Rust stable
+- Node.js 20+
+- Docker with Compose v2
+
+Start the development stack:
 
 ```bash
-cargo test --workspace
-cd web && npm ci && npm run build
 docker compose up --build
 ```
 
-The development stack exposes:
+Open <http://localhost:3001> and sign in with the development-only account
+`admin@test.com` / `admin`. The known credentials and broad application port
+bindings in the development stack are not suitable for a shared or production
+host.
 
-- Dashboard: `http://localhost:3001`
-- API: `http://localhost:8080`
-- API health: `http://localhost:8080/v1/healthz`
-- Postgres and ClickHouse inside the Compose network
-- Optional operator stack: `docker compose --profile observability up`
-
-The development API recreates these local-only credentials after migrations:
-
-- Enrollment token: `met_enroll_dev`
-- Dashboard token: `met_dashboard_dev`
-- Profile login: `admin@test.com` / `admin`
-
-Never reuse these values outside local development.
-
-The bootstrap profile is created from `METRUNE_BOOTSTRAP_EMAIL` and
-`METRUNE_BOOTSTRAP_PASSWORD`. Set deployment-specific values before first
-startup and remove the password from the environment after the account exists.
-Set `METRUNE_ENV=production` and provide an HTTPS `METRUNE_PUBLIC_API_URL` for
-production deployments. The API rejects known development database and
-bootstrap credentials in that mode.
-See [the security and logging boundary](docs/SECURITY_AND_LOGGING.md) before
-exposing a deployment beyond localhost.
-The role required by every endpoint, and the rate limits applied on top of
-those rules, are documented in [`docs/AUTHORIZATION.md`](docs/AUTHORIZATION.md).
-The backup, restore, retention, and upgrade procedure is documented in
-[`docs/OPERATIONS.md`](docs/OPERATIONS.md); `./scripts/restore-drill.sh` runs
-that procedure end to end and verifies it.
-The current client release workflow and its remaining production gates are in
-[`docs/RELEASING.md`](docs/RELEASING.md).
-
-For a production-oriented Compose deployment, copy
-`deploy/compose/production.env.example` to a private env file, replace every
-placeholder, and validate the merged configuration:
+Run the repository checks:
 
 ```bash
-docker compose \
-  --env-file .env.production \
-  -f docker-compose.yml \
-  -f docker-compose.production.yml \
-  config --quiet
-docker compose \
-  --env-file .env.production \
-  -f docker-compose.yml \
-  -f docker-compose.production.yml \
-  up --build
+make check
 ```
 
-The production override does not publish PostgreSQL or ClickHouse and binds
-the API and dashboard to localhost by default so an HTTPS reverse proxy can be
-the public boundary. The dashboard token is optional when users sign in with
-the web login; if supplied, it must be a separately managed non-development
-token. Existing databases containing the known development tokens or
-`admin@test.com` are rejected by the production API startup checks.
+The check covers formatting, Clippy, Rust tests, web type-check/build, and both
+the development and production Compose contracts.
 
-## Client workflow
+## Production deployment
+
+Production is a separate, standalone stack; do not merge it with
+`compose.yaml`.
+
+1. Publish or obtain the released API and web image digests.
+2. Copy [`deploy/compose/production.env.example`](deploy/compose/production.env.example)
+   to a private environment file and replace every placeholder.
+3. Configure authenticated TLS SMTP. Invitation and password-reset flows
+   require it.
+4. Configure an external HTTPS reverse proxy. A minimal Caddy example is in
+   [`deploy/compose/Caddyfile.example`](deploy/compose/Caddyfile.example).
+5. Validate and start the stack:
+
+```bash
+docker compose --env-file /private/path/metrune.env \
+  -f compose.production.yaml config
+docker compose --env-file /private/path/metrune.env \
+  -f compose.production.yaml up -d
+```
+
+The first administrator is created from the one-time bootstrap values. After
+the first successful sign-in, clear both bootstrap variables and recreate the
+API container. Startup deliberately fails if bootstrap credentials remain
+configured once a user already exists.
+
+Follow the complete [deployment guide](docs/DEPLOYMENT.md) and
+[operations runbook](docs/OPERATIONS.md), especially the backup requirement
+for PostgreSQL, ClickHouse, and the credential-vault key.
+
+## Client
+
+Build and inspect the CLI:
 
 ```bash
 cargo build --release -p metrune
-
-./target/release/metrune enroll \
-  --server http://localhost:8080 \
-  --token met_enroll_dev \
-  --name "Flo workstation" \
-  --platform wsl \
-  --user-alias employee-17
-
-./target/release/metrune scan
-./target/release/metrune export
-./target/release/metrune upload
-./target/release/metrune watch --interval-seconds 60
+./target/release/metrune --help
 ```
 
-`watch` is a foreground process intended to be managed by the operating
-system's user service manager. It scans changed source files, uploads queued
-snapshots, and sleeps between cycles; unchanged files are skipped. The old
-`daemon` command remains an alias. No separate install flag is required: the
-binary is installed once, while `watch` is simply the long-running process.
-Use `watch --quiet` for background operation; routine status output is
-suppressed while errors remain available on stderr for service logs.
-Organization-managed classifier credentials are refreshed at most every 15
-minutes rather than on every polling cycle.
-
-Each local state database stores a checkpoint per discovered source file. A
-scan skips a file when its adapter version, classifier configuration, file size,
-and modification time are unchanged. Changed files are parsed, but the outbox
-keeps only the newest revision for each stable session key and removes it from
-the pending queue only after a successful upload. Changing the parser or
-classifier configuration intentionally invalidates those checkpoints once.
-
-Enrollment credentials are stored at `~/.config/metrune/config.json` with mode `0600` on Unix. The local SQLite outbox is stored at `~/.local/share/metrune/state.db`.
-
-For a personal installation, sign in at `/profile`, choose Linux, Windows, or
-macOS, install the matching artifact, and create a ten-minute one-time
-enrollment code. The code can be redeemed once and the server binds the
-resulting installation to the signed-in owner. Tag pushes build Linux,
-Windows, Intel macOS, and Apple Silicon macOS artifacts through
-`.github/workflows/release-client.yml`.
-
-In an interactive terminal, enrollment offers the organization classifier,
-a local OpenAI-compatible model, another provider, or classification disabled.
-For scripts, select explicitly with `--classifier organization`, `local`,
-`custom`, or `none`. Local configuration also accepts
-`--classifier-endpoint` and `--classifier-model`; authenticated custom
-providers read `METRUNE_CLASSIFIER_API_KEY` into the protected credential
-store.
-
-For local Compose development, the Linux client is built into the API image and
-served from `http://localhost:8080/v1/downloads/metrune-linux-x86_64`; other
-platform artifacts can be served by configuring their corresponding
-`METRUNE_*_CLIENT_PATH` values or by pointing the web app at a release asset
-base URL.
-
-The server provisions a workspace's semantic classifier profile after the
-client is enrolled. The admin chooses the execution mode first:
-
-- `local`: classification text stays on the client. Hosted-provider
-  credentials are stored locally; Ollama or another localhost endpoint can run
-  without a key.
-- `managed`: bounded classification text is sent to Metrune using the
-  installation token. The API calls the provider with the encrypted vault
-  credential and returns only the category assignment. Provisioning never
-  returns that provider credential.
-
-The admin UI offers presets for OpenRouter, OpenAI, and Ollama/local plus a
-custom OpenAI-compatible endpoint. See
-[`docs/MULTI_TENANCY.md`](docs/MULTI_TENANCY.md) for the tenant isolation model
-and the unavoidable local-versus-managed privacy trade-off.
-
-Environment configuration remains available for unattended deployments:
+A typical installation enrolls once, scans locally, verifies the sanitized
+envelope, and uploads:
 
 ```bash
-METRUNE_CLASSIFIER_EXECUTION_MODE=managed \
-METRUNE_CLASSIFIER_PROVIDER_ID=openrouter \
-METRUNE_CLASSIFIER_CREDENTIAL_ID=openrouter \
-METRUNE_CLASSIFIER_ENDPOINT=https://openrouter.ai/api/v1/chat/completions \
-METRUNE_CLASSIFIER_MODEL=<openrouter-model-slug> \
-METRUNE_CLASSIFIER_API_KEY=<server-side-openrouter-key> \
-docker compose up --build
+metrune enroll --help
+metrune scan
+metrune export
+metrune upload
 ```
 
-Provider credentials can also be managed from `/admin`. Metrune generates an
-AES-256-GCM vault key automatically on first startup and stores it with mode
-`0600` in the persistent `metrune-secrets` Docker volume. PostgreSQL contains
-only authenticated ciphertext and credential version metadata. Replacing a
-credential creates a new version. Local-mode clients receive it on their next
-classifier provisioning refresh; managed-mode clients never receive it. The
-admin can export the vault recovery key once after confirming their password.
+`metrune export` is the easiest way to review exactly what is queued before
+connecting a client to a server.
 
-Classifier response handling is automatic. Known hosted providers first use a
-strict JSON schema and fall back when a model rejects structured output.
-Ollama and custom OpenAI-compatible endpoints use prompt-based JSON by default.
-Metrune tolerates fenced or wrapped JSON, retries one malformed response, and
-degrades to `unknown` without blocking usage collection. The admin
-**Test configuration** action sends fixed synthetic text and never session
-content.
+## Repository map
 
-Enrollment will attempt provisioning automatically. To provision again or refresh the profile later, run:
-
-```bash
-./target/release/metrune classifier provision
-./target/release/metrune classifier status
+```text
+crates/                 Rust client, API, and shared domain types
+web/                    Next.js dashboard and server-side API proxy
+migrations/             PostgreSQL and ClickHouse schema
+deploy/compose/         Production environment and reverse-proxy examples
+docs/                   Architecture, privacy, security, and operations
+scripts/                Validation and restore-drill automation
+compose.yaml            Development stack
+compose.production.yaml Supported production-beta stack
 ```
 
-The server sends the URL, model, and credential only through this authenticated provisioning call. The client stores the credential in the native system keyring when available, with a `0600` fallback file for WSL/Linux environments without a keyring. The credential is never written to the regular Metrune config or upload queue. Classification continues to run directly from the client to the configured endpoint.
+## Project policy
 
-To use a temporary client-side override instead, configure an OpenAI-compatible endpoint:
-
-```bash
-export METRUNE_CLASSIFIER_ENDPOINT=http://localhost:11434/v1/chat/completions
-export METRUNE_CLASSIFIER_MODEL=qwen3:4b
-```
-
-OpenRouter is also supported. The classifier is OpenAI-compatible; only the local classification text is sent to the endpoint you explicitly configure:
-
-```bash
-export METRUNE_CLASSIFIER_ENDPOINT=https://openrouter.ai/api/v1/chat/completions
-export METRUNE_CLASSIFIER_MODEL=<openrouter-model-slug>
-export METRUNE_CLASSIFIER_API_KEY=<your-openrouter-key>
-```
-
-Environment variables override the provisioned profile and are useful for CI or one-off testing. They are not required after provisioning.
-
-Without a configured classifier, sessions are safely uploaded as `unknown`.
-
-By default, the client keeps the full project path local, pseudonymizes the full path into `projectKey`, and sends only the final folder name as `projectAlias`. Set `METRUNE_PROJECT_MODE=anonymous` to suppress the readable folder label while retaining the anonymous project key. Explicit entries in `project_aliases` take precedence over the derived folder label.
-
-Reported provider costs are preserved. The server imports
-`pricing/openrouter.catalog.json` as its default catalog and applies active
-organization overrides at ingest time. Signed-in members manage those entries
-under **Teams & settings → Pricing**; edits affect new ingestion and do not
-silently rewrite historical totals.
-
-The client-side pricebook remains available for offline/local estimates. Point
-`METRUNE_PRICEBOOK` at either the legacy `fixtures/pricebook.example.json`
-format or a versioned catalog. A catalog can be refreshed manually from
-OpenRouter's public model catalog:
-
-```bash
-./target/release/metrune pricing sync-openrouter \
-  --output pricing/openrouter.catalog.json
-
-export METRUNE_PRICEBOOK="$PWD/pricing/openrouter.catalog.json"
-./target/release/metrune scan
-```
-
-The command fetches the current model list and converts OpenRouter's dollar-per-token rates into per-million-token rates. It is intentionally manual, so teams can review and commit each catalog revision. If a catalog contains organization or self-hosted rates, preserve them while refreshing OpenRouter with `--merge-from pricing/company.catalog.json`. See `fixtures/price-catalog.example.json` for the authority-aware format.
-
-For a company-maintained catalog, first generate the file and add any `organization_override` or `self_hosted` entries from `fixtures/price-catalog.example.json`. On later refreshes, keep those entries and replace only the OpenRouter entries:
-
-```bash
-./target/release/metrune pricing sync-openrouter \
-  --output pricing/company.catalog.json \
-  --merge-from pricing/company.catalog.json
-```
-
-`--merge-from` replaces old OpenRouter entries and retains non-OpenRouter entries, so self-hosted and negotiated rates survive a refresh.
-
-Price authority is resolved per provider/model: organization overrides win first, then self-hosted, official-provider, OpenRouter, and manual entries. Provider-reported costs always remain authoritative and are never overwritten by a catalog estimate. Each estimate records both the catalog version and its price authority.
-
-## Validation
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cd web && npm run typecheck && npm run build
-docker compose config --quiet
-```
-
-Metrune is licensed under Apache-2.0.
-
-Contributions, vulnerability reports, and project conduct are covered by
-[`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Release process](docs/RELEASING.md)
+- [Roadmap](docs/ROADMAP.md)
+- [Changelog](CHANGELOG.md)
+- [License](LICENSE)

@@ -120,7 +120,7 @@ jobs:
           path: digests
           merge-multiple: true
 
-      # Operators pin these digests in Helm values or Compose before rollout.
+      # Operators pin these digests in compose.production.yaml before rollout.
       - name: Build the server image manifest
         run: |
           {

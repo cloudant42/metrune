@@ -28,7 +28,7 @@ exposed to a network. See the local workflow in the README and the
   the matrix in [docs/AUTHORIZATION.md](docs/AUTHORIZATION.md).
 - When changing backup, migration, or vault-key handling, run
   `./scripts/restore-drill.sh`.
-- Update the relevant documentation and readiness checklist item.
+- Update the relevant documentation, changelog, and roadmap item.
 - Do not commit `.env` files, credentials, database dumps, generated builds,
   or local browser artifacts.
 

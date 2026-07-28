@@ -60,7 +60,8 @@ deployment guidance.
   organization.
 - Session drilldown requires analyst or admin role.
 - ClickHouse retention defaults to 365 days.
-- Operational telemetry processors remove prompt, source-code, and raw-session attributes defensively.
+- Default request logs exclude bodies, headers, credentials, and classifier
+  text; operational integrations must preserve that boundary.
 - TLS is required for non-local production deployments.
 
 ## Known v1 limitations

@@ -1,6 +1,7 @@
 # Compose override for `scripts/restore-drill.sh`.
 #
-# The drill runs in its own Compose project with its own volumes, but the base
+# The drill runs in its own Compose project with its own volumes, but the
+# development
 # stack publishes the API on a fixed host port. This override moves it out of
 # the way so a restore drill can run while a development deployment is up.
 services:

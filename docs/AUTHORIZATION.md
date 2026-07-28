@@ -47,8 +47,14 @@ Roles are `admin`, `analyst`, and `viewer`. Only `admin` passes
 | Operation | Rule |
 | --- | --- |
 | `GET /v1/healthz`, `GET /v1/readyz` | Unauthenticated liveness and readiness |
-| `GET /v1/downloads/{artifact}` | Unauthenticated client binary download |
+| `GET /v1/client/manifest` | Unauthenticated client release manifest; signed by the release pipeline, never by the deployment |
+| `GET /v1/client/install.sh` | Unauthenticated installer rendered from the manifest |
+| `GET /v1/downloads/{artifact}` | Unauthenticated client binary download; served only when it matches the manifest digest |
 | `POST /v1/auth/login` | Unauthenticated; per-address rate limit plus a per-email failure throttle |
+| `POST /v1/auth/invitations/inspect` | Unauthenticated; returns masked invitation metadata only |
+| `POST /v1/auth/invitations/accept` | Unauthenticated for a new account; an existing account requires its matching user session |
+| `POST /v1/auth/password-reset/request` | Unauthenticated and address-limited; always returns the same accepted response |
+| `POST /v1/auth/password-reset/complete` | Unauthenticated possession flow; consumes the expiring token and revokes existing sessions |
 
 ### Account session
 
@@ -76,6 +82,8 @@ Every operation below resolves the organization from the caller's credential.
 | --- | --- |
 | `GET /v1/org/teams` | Any member. Team names are needed by the self-service enrollment flow on the profile page |
 | `GET /v1/org/members`, `POST /v1/org/members` | Admin. Adding requires an existing account and creates only an organization membership |
+| `GET`/`POST /v1/org/invitations` | Admin user session. Lists metadata or sends an expiring email invitation; service tokens cannot invite |
+| `POST /v1/org/invitations/{id}/resend`, `DELETE /v1/org/invitations/{id}` | Admin user session. Resend rotates the token; revoke invalidates it |
 | `PATCH`/`DELETE /v1/org/members/{user_id}` | Admin. The final active admin cannot be demoted or removed; removal clears affected active sessions |
 | `POST /v1/org/teams`, `PATCH`/`DELETE /v1/org/teams/{id}` | Admin |
 | `GET /v1/org/installations` | Admin. The fleet inventory is an administrative view |
@@ -100,8 +108,7 @@ Every operation below resolves the organization from the caller's credential.
 
 ## Known limits of the current model
 
-These are accepted for the development snapshot and tracked on the enterprise
-roadmap in [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md):
+These are accepted for the beta and tracked in [ROADMAP.md](ROADMAP.md):
 
 - **Organization-wide analytics.** Any signed-in member sees organization-wide
   aggregates. There is no team-level restriction yet. Personal
@@ -110,9 +117,9 @@ roadmap in [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md):
   rather than a durable user ID, so a renamed user weakens attribution.
 - **No delegated administration.** `admin` is a single, organization-wide role;
   there is no separate pricing, credential, or billing administrator.
-- **No email invitation delivery.** Membership administration can add an
-  existing account. Invitations and SSO just-in-time membership remain future
-  account-acquisition paths.
+- **No email ownership verification beyond possession flows.** Invitations and
+  resets prove access to the delivered link; signup without an invitation is
+  not supported.
 - **Dashboard service tokens cannot be attributed to a person.** They are
   rejected from owner-scoped and pricing-write operations for that reason.
 
@@ -131,6 +138,8 @@ authenticated identity where one exists.
 | Ingestion | Installation | 60/minute | `METRUNE_RATE_LIMIT_INGEST_PER_MINUTE` |
 | Analytics | User or dashboard token | 120/minute | `METRUNE_RATE_LIMIT_ANALYTICS_PER_MINUTE` |
 | Enrollment codes | User | 20/hour | `METRUNE_RATE_LIMIT_ENROLLMENT_CODES_PER_HOUR` |
+| Invitations | Admin user | 30/hour | `METRUNE_RATE_LIMIT_INVITATIONS_PER_HOUR` |
+| Password-reset requests | Client address | 10/hour | `METRUNE_RATE_LIMIT_PASSWORD_RESETS_PER_HOUR` |
 
 Setting an override to `0` disables that limit.
 

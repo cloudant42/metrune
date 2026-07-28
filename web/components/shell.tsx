@@ -173,13 +173,17 @@ export function Shell({
 }) {
   const pathname = usePathname();
   const router = useRouter();
+  const authFlow = pathname.startsWith("/login")
+    || pathname.startsWith("/organizations")
+    || pathname.startsWith("/accept-invite")
+    || pathname.startsWith("/forgot-password")
+    || pathname.startsWith("/reset-password");
   const selectionRequired = Boolean(userName) && !organizationId
-    && !pathname.startsWith("/login")
-    && !pathname.startsWith("/organizations");
+    && !authFlow;
   useEffect(() => {
     if (selectionRequired) router.replace("/organizations");
   }, [router, selectionRequired]);
-  if (pathname.startsWith("/login") || pathname.startsWith("/organizations")) return <>{children}</>;
+  if (authFlow) return <>{children}</>;
   if (selectionRequired) return <div className="loading-shell"><div className="loading-heading" /></div>;
   const heading = titles[pathname] ?? titles["/"];
   const canDrillDown = role === "admin" || role === "analyst" || role === undefined;

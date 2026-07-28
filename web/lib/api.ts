@@ -80,6 +80,14 @@ export type Member = {
   role: "viewer" | "analyst" | "admin";
   createdAt: string;
 };
+export type Invitation = {
+  id: string;
+  email: string;
+  role: "viewer" | "analyst" | "admin";
+  status: "sending" | "pending" | "delivery_failed" | "expired" | "accepted" | "revoked";
+  createdAt: string;
+  expiresAt: string;
+};
 export type MyInstallation = {
   id: string;
   name: string;
@@ -348,6 +356,7 @@ export async function getFacets(params: PageParams): Promise<Result<Facets>> {
 
 export type AdminData = {
   members: Member[];
+  invitations: Invitation[];
   teams: Team[];
   installations: Installation[];
   settings: OrgSettings;
@@ -358,15 +367,16 @@ export type AdminData = {
 export async function getAdminData(): Promise<Result<AdminData>> {
   return withFallback(
     async () => {
-      const [members, teams, installations, settings, classifier, credentials] = await Promise.all([
+      const [members, invitations, teams, installations, settings, classifier, credentials] = await Promise.all([
         api<Member[]>("/v1/org/members"),
+        api<Invitation[]>("/v1/org/invitations"),
         api<Team[]>("/v1/org/teams"),
         api<Installation[]>("/v1/org/installations"),
         api<OrgSettings>("/v1/org/settings"),
         api<ClassifierSettings>("/v1/org/classifier"),
         api<ProviderCredential[]>("/v1/org/credentials"),
       ]);
-      return { members, teams, installations, settings, classifier, credentials };
+      return { members, invitations, teams, installations, settings, classifier, credentials };
     },
     demo.adminData,
   );
@@ -453,6 +463,7 @@ const demo = {
     ] as Installation[],
     settings: { organizationName: "Acme Engineering", retentionDays: 365, ssoEnforced: false, localLoginEnabled: true } as OrgSettings,
     members: [] as Member[],
+    invitations: [] as Invitation[],
     classifier: { enabled: false, executionMode: "local", providerId: "", protocol: "openai_chat", endpoint: "", model: "", credentialId: "", configVersion: "disabled", credentialAvailable: false, responseMode: "auto" } as ClassifierSettings,
     credentials: [] as ProviderCredential[],
   } as AdminData,

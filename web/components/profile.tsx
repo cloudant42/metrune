@@ -62,11 +62,12 @@ export function ClientEnrollment({
   const command = useMemo(() => enrollment
     ? `metrune enroll --server ${serverUrl} --token ${enrollment.code} --name "${enrollment.installationName}" --platform ${enrollment.platform}`
     : "", [enrollment, serverUrl]);
+  // The installer is rendered by this server from the signed release manifest:
+  // it picks the artifact for the machine it runs on and verifies the download
+  // against the published SHA-256 before installing it.
   const installCommand = platform === "windows"
     ? null
-    : platform === "macos"
-      ? `arch="$(uname -m)"; case "$arch" in arm64) asset="metrune-macos-arm64";; x86_64) asset="metrune-macos-x86_64";; *) echo "Unsupported macOS architecture: $arch" >&2; exit 1;; esac; curl -fsSL "${releaseBaseUrl}/$asset" -o /tmp/metrune && chmod +x /tmp/metrune && sudo install /tmp/metrune /usr/local/bin/metrune`
-      : `curl -fsSL "${releaseBaseUrl}/metrune-linux-x86_64" -o /tmp/metrune && chmod +x /tmp/metrune && sudo install /tmp/metrune /usr/local/bin/metrune`;
+    : `curl -fsSL ${serverUrl}/v1/client/install.sh | sh`;
 
   async function create(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -127,7 +128,7 @@ export function ClientEnrollment({
           {error && <p className="form-error" role="alert">{error}</p>}
           {enrollment && (
             <div className="enrollment-result" role="status">
-              <div><strong>1. Install the client</strong><p>{platform === "windows" ? "Download the Windows executable for this machine." : platform === "macos" ? "Run this command in macOS; it selects Intel or Apple Silicon automatically." : "Run this command in Linux."}</p></div>
+              <div><strong>1. Install the client</strong><p>{platform === "windows" ? "Download the Windows executable for this machine, then verify it against the published checksum." : "The installer picks the build for this machine and verifies it against the signed release manifest."}</p></div>
               {installCommand ? (
                 <div className="copy-row"><code>{installCommand}</code><button className="btn ghost small" type="button" onClick={() => navigator.clipboard.writeText(installCommand)}>Copy</button></div>
               ) : (

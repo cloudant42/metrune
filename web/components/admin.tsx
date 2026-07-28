@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import type { AdminData } from "@/lib/api";
-import type { ClassifierSettings, Installation, Member, OrgSettings, ProviderCredential, Team } from "@/lib/api";
+import type { ClassifierSettings, Installation, Invitation, Member, OrgSettings, ProviderCredential, Team } from "@/lib/api";
 import { formatTime } from "@/lib/format";
 
 const tabs = [
@@ -25,7 +25,7 @@ export function AdminTabs({ data, initialTab }: { data: AdminData; initialTab?: 
           </button>
         ))}
       </nav>
-      {active === "members" && <MembersPanel members={data.members} />}
+      {active === "members" && <MembersPanel members={data.members} invitations={data.invitations} />}
       {active === "teams" && (
         <div className="admin-grid teams-grid">
           <TeamsPanel teams={data.teams} />
@@ -66,7 +66,7 @@ async function send(path: string, method: string, body?: unknown): Promise<strin
   return payload.error ?? `Request failed with ${response.status}`;
 }
 
-export function MembersPanel({ members }: { members: Member[] }) {
+export function MembersPanel({ members, invitations }: { members: Member[]; invitations: Invitation[] }) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -81,15 +81,24 @@ export function MembersPanel({ members }: { members: Member[] }) {
     return failure;
   }
 
-  async function add(event: FormEvent<HTMLFormElement>) {
+  async function invite(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
     const data = new FormData(form);
-    const failure = await run(() => send("/api/admin/members", "POST", {
+    const failure = await run(() => send("/api/admin/invitations", "POST", {
       email: data.get("email"),
       role: data.get("role"),
     }));
     if (!failure) form.reset();
+  }
+
+  async function resend(invitation: Invitation) {
+    await run(() => send(`/api/admin/invitations/${invitation.id}/resend`, "POST"));
+  }
+
+  async function revokeInvitation(invitation: Invitation) {
+    if (!window.confirm(`Revoke the invitation for ${invitation.email}?`)) return;
+    await run(() => send(`/api/admin/invitations/${invitation.id}`, "DELETE"));
   }
 
   async function changeRole(member: Member, role: Member["role"]) {
@@ -108,18 +117,18 @@ export function MembersPanel({ members }: { members: Member[] }) {
           <p className="eyebrow">Workspace access and roles</p>
           <h2 id="members-title">Members</h2>
         </div>
-        <form className="inline-form member-add-form" onSubmit={add}>
-          <input name="email" type="email" required maxLength={320} placeholder="Existing account email" aria-label="Existing account email" />
+        <form className="inline-form member-add-form" onSubmit={invite}>
+          <input name="email" type="email" required maxLength={320} placeholder="Email address" aria-label="Invitation email address" />
           <select name="role" defaultValue="viewer" aria-label="Workspace role">
             <option value="viewer">Viewer</option>
             <option value="analyst">Analyst</option>
             <option value="admin">Admin</option>
           </select>
-          <button className="btn" type="submit" disabled={busy}>Add member</button>
+          <button className="btn" type="submit" disabled={busy}>Send invitation</button>
         </form>
       </div>
       {error && <p className="form-error" role="alert">{error}</p>}
-      <p className="panel-note">Add an existing Metrune account by email. Roles apply only to this workspace; the same person can have a different role elsewhere.</p>
+      <p className="panel-note">Invitations are emailed as expiring, single-use links. Existing accounts sign in before accepting; new users choose their own password.</p>
       <div className="table-scroll">
         <table>
           <thead><tr><th>Member</th><th>Email</th><th>Role</th><th className="actions-col">Actions</th></tr></thead>
@@ -148,6 +157,33 @@ export function MembersPanel({ members }: { members: Member[] }) {
             {members.length === 0 && <tr><td colSpan={4} className="empty">No active workspace members.</td></tr>}
           </tbody>
         </table>
+      </div>
+      <div className="panel-subsection">
+        <h3>Invitations</h3>
+        <div className="table-scroll">
+          <table>
+            <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Expires</th><th className="actions-col">Actions</th></tr></thead>
+            <tbody>
+              {invitations.map(invitation => (
+                <tr key={invitation.id}>
+                  <td>{invitation.email}</td>
+                  <td>{invitation.role}</td>
+                  <td><span className={`badge ${invitation.status === "pending" ? "ok" : invitation.status === "delivery_failed" || invitation.status === "expired" ? "warn" : ""}`}>{invitation.status.replaceAll("_", " ")}</span></td>
+                  <td>{formatTime(Date.parse(invitation.expiresAt))}</td>
+                  <td className="actions-col">
+                    {(invitation.status === "pending" || invitation.status === "delivery_failed" || invitation.status === "expired") && (
+                      <>
+                        <button className="btn ghost small" type="button" disabled={busy} onClick={() => resend(invitation)}>Resend</button>
+                        <button className="btn danger small" type="button" disabled={busy} onClick={() => revokeInvitation(invitation)}>Revoke</button>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              ))}
+              {invitations.length === 0 && <tr><td colSpan={5} className="empty">No invitations have been sent.</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
   );

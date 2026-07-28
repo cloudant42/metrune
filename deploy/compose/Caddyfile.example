@@ -1,0 +1,20 @@
+# Replace metrune.example.com and install this on the same Linux host as the
+# production Compose stack. Caddy obtains and renews the public certificate.
+metrune.example.com {
+	encode zstd gzip
+
+	@api path /v1 /v1/*
+	handle @api {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3001
+	}
+
+	header {
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+	}
+}

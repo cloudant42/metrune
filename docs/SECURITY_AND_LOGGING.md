@@ -51,7 +51,7 @@ the API and configured model provider as processors of that text. See
 Terminate TLS at the ingress or reverse proxy, forward only the required
 headers, and do not expose PostgreSQL, ClickHouse, or the vault-key volume to
 the public network. Set `METRUNE_ENV=production` and use an HTTPS
-`METRUNE_PUBLIC_API_URL` before exposing the API to users. The production
-Compose override binds the API and dashboard to localhost by default; replace
-that boundary only when an equivalent network policy and TLS termination are
-in place.
+`METRUNE_PUBLIC_API_URL` before exposing the API to users. The standalone
+production Compose file binds the API and dashboard to localhost. Changing
+that binding is outside the supported beta topology and requires an equivalent
+network policy and TLS boundary.

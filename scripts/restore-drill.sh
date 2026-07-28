@@ -34,7 +34,7 @@ CREDENTIAL_SECRET="drill-secret-$(date +%s)"
 
 compose() {
   docker compose -p "$PROJECT" \
-    -f docker-compose.yml -f deploy/compose/restore-drill.yml "$@"
+    -f compose.yaml -f deploy/compose/restore-drill.yml "$@"
 }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$1" >&2; exit 1; }
@@ -169,8 +169,9 @@ compose exec -T postgres createdb -U metrune metrune
 compose exec -T postgres pg_restore -U metrune -d metrune --no-owner < "$BACKUP_DIR/postgres.dump"
 
 step "Restoring the vault master key before the API starts"
-compose run --rm --no-deps -T --entrypoint sh -v "$BACKUP_DIR:/restore:ro" api -c \
-  'install -m 600 /restore/master.key /var/lib/metrune/secrets/master.key'
+compose run --rm --no-deps -T --user 0:0 --entrypoint sh \
+  -v "$BACKUP_DIR:/restore:ro" api -c \
+  'install -o 65532 -g 65532 -m 600 /restore/master.key /var/lib/metrune/secrets/master.key'
 
 step "Starting the restored API"
 compose up -d api

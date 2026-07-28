@@ -25,7 +25,8 @@ export function LoginForm() {
       setError(payload.error ?? "Sign-in failed.");
       return;
     }
-    router.replace(payload.user?.organizationId ? "/" : "/organizations");
+    const next = new URLSearchParams(window.location.search).get("next");
+    router.replace(next?.startsWith("/") ? next : payload.user?.organizationId ? "/" : "/organizations");
     router.refresh();
   }
 
@@ -48,6 +49,7 @@ export function LoginForm() {
       <button className="btn auth-submit" type="submit" disabled={busy}>
         {busy ? "Signing in…" : "Sign in"}
       </button>
+      <a className="auth-link" href="/forgot-password">Forgot your password?</a>
       <p className="auth-note">Local password sign-in is enabled until your organization enforces SSO.</p>
     </form>
   );

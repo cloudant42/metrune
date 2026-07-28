@@ -30,6 +30,7 @@ const poppins = localFont({
 export const metadata: Metadata = {
   title: "Metrune — AI usage intelligence",
   description: "Privacy-first visibility into how teams use AI coding agents.",
+  referrer: "no-referrer",
 };
 
 export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

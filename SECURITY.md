@@ -23,7 +23,7 @@ can vary while the project is pre-release.
 
 ## Supported versions
 
-Until versioned releases exist, only the latest `main` state is considered
-security-supported. Client and server compatibility guarantees are not yet
-established; the release policy will define them before the first production
-release.
+During the production beta, only the latest beta release is
+security-supported. Linux x86_64 is the supported client/server platform;
+Windows and macOS client artifacts are experimental. See the README support
+matrix and release notes for version-specific exceptions.

@@ -49,3 +49,4 @@ jobs:
         with:
           persist-credentials: false
       - run: docker compose config --quiet
+      - run: bash scripts/check-production-compose.sh
