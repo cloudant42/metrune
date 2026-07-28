@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod classifier;
 pub mod pricing;
+pub mod release;
 pub mod state;
 
 use chrono::{DateTime, Utc};
