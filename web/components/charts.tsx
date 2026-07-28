@@ -1,30 +1,7 @@
-import type { Breakdown, CategoryModelBreakdown, TimeseriesPoint } from "@/lib/api";
+import type { Breakdown, CategoryModelBreakdown } from "@/lib/api";
 import { formatCompact, formatMoney, label, shortModel } from "@/lib/format";
 
-export function TrendChart({ points }: { points: TimeseriesPoint[] }) {
-  const width = 800, height = 210, pad = 18;
-  const max = Math.max(...points.map(point => point.cost), 1);
-  const coordinates = points.map((point, index) => ({
-    x: pad + index * ((width - pad * 2) / Math.max(points.length - 1, 1)),
-    y: height - pad - (point.cost / max) * (height - pad * 2),
-    ...point,
-  }));
-  const line = coordinates.map(point => `${point.x},${point.y}`).join(" ");
-  return (
-    <div className="chart-wrap">
-      <svg className="trend-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-labelledby="chart-title chart-description">
-        <title id="chart-title">Daily AI cost</title>
-        <desc id="chart-description">Daily cost rises from {formatMoney(points[0]?.cost ?? 0)} to {formatMoney(points.at(-1)?.cost ?? 0)} over the selected range.</desc>
-        {[0.25, 0.5, 0.75, 1].map(levelPoint => <line key={levelPoint} x1={pad} x2={width - pad} y1={height - pad - levelPoint * (height - pad * 2)} y2={height - pad - levelPoint * (height - pad * 2)} className="grid-line" />)}
-        <polygon points={`${pad},${height - pad} ${line} ${width - pad},${height - pad}`} className="area" />
-        <polyline points={line} className="line" />
-        {coordinates.map(point => <circle key={point.bucket} cx={point.x} cy={point.y} r="4" className="point" tabIndex={0} role="img" aria-label={`${point.bucket}: ${formatMoney(point.cost)}, ${formatCompact(point.tokens)} tokens`} />)}
-      </svg>
-      <div className="chart-axis" aria-hidden="true"><span>{points[0]?.bucket.slice(5)}</span><span>{points.at(-1)?.bucket.slice(5)}</span></div>
-      <details className="data-fallback"><summary>View chart as table</summary><table><thead><tr><th>Date</th><th>Cost</th><th>Tokens</th><th>Sessions</th></tr></thead><tbody>{points.map(point => <tr key={point.bucket}><td>{point.bucket}</td><td>{formatMoney(point.cost)}</td><td>{formatCompact(point.tokens)}</td><td>{point.sessions}</td></tr>)}</tbody></table></details>
-    </div>
-  );
-}
+export { TrendChart } from "./trend-chart";
 
 export function BreakdownBars({ values, limit = 6, format }: { values: Breakdown[]; limit?: number; format?: (value: string) => string }) {
   const shown = values.slice(0, limit);
@@ -36,13 +13,23 @@ export function BreakdownBars({ values, limit = 6, format }: { values: Breakdown
       {shown.map(value => (
         <div className="bar-row" key={value.dimension}>
           <div className="bar-label"><span>{show(value.dimension)}</span><strong>{formatMoney(value.cost)}</strong></div>
-          <div className="bar-track" aria-label={`${show(value.dimension)}: ${formatMoney(value.cost)}`}><span style={{ width: `${Math.max(3, value.cost / max * 100)}%` }} /></div>
+          <div className="bar-track" aria-label={`${show(value.dimension)}: ${formatMoney(value.cost)}`}>
+            <span style={{ width: `${Math.max(2, value.cost / max * 100)}%` }} />
+          </div>
           <small>{formatCompact(value.tokens)} tokens · {value.sessions} sessions</small>
         </div>
       ))}
     </div>
   );
 }
+
+/* Sequential blue ramp — the steps live in globals.css so each theme can run
+   the ramp in the direction that reads as "more" on its own surface (darker on
+   light, brighter on dark). Ink is paired per step to clear contrast. */
+const ramp = Array.from({ length: 8 }, (_, index) => ({
+  bg: `var(--hm-${index + 1})`,
+  ink: `var(--hm-ink-${index + 1})`,
+}));
 
 const heatmapModelCap = 8;
 
@@ -63,7 +50,7 @@ export function ModelHeatmap({ values }: { values: CategoryModelBreakdown[] }) {
     <>
       <div className="table-scroll">
         <table className="heatmap-table">
-          <caption className="sr-only">Token usage by category and model. Darker cells mean a larger token share within the category row.</caption>
+          <caption className="sr-only">Token usage by category and model. Stronger cells mean a larger token share within the category row.</caption>
           <thead>
             <tr><th scope="col">Category</th>{models.map(model => <th scope="col" key={model}>{shortModel(model)}</th>)}</tr>
           </thead>
@@ -76,11 +63,15 @@ export function ModelHeatmap({ values }: { values: CategoryModelBreakdown[] }) {
                   {models.map(model => {
                     const cell = cells.get(`${category}\0${model}`);
                     const share = cell && rowTotal > 0 ? cell.tokens / rowTotal : 0;
+                    const step = ramp[Math.min(ramp.length - 1, Math.floor(share * ramp.length))];
                     return (
                       <td key={model} className={`hm-cell${cell ? "" : " empty"}`}
-                        style={cell ? { backgroundColor: `rgb(59 130 246 / ${(0.07 + share * 0.5).toFixed(3)})` } : undefined}
-                        title={cell ? `${label(category)} · ${model}: ${formatCompact(cell.tokens)} tokens, ${formatMoney(cell.cost)}, ${cell.sessions} sessions` : `${label(category)} · ${model}: no usage`}>
-                        {cell ? <><strong>{formatCompact(cell.tokens)}</strong><small>{formatMoney(cell.cost)}</small></> : <span>—</span>}
+                        title={cell
+                          ? `${label(category)} · ${model}: ${formatCompact(cell.tokens)} tokens, ${formatMoney(cell.cost)}, ${cell.sessions} sessions (${Math.round(share * 100)}% of the row)`
+                          : `${label(category)} · ${model}: no usage`}>
+                        {cell
+                          ? <div style={{ background: step.bg, color: step.ink }}><strong>{formatCompact(cell.tokens)}</strong><small>{formatMoney(cell.cost)}</small></div>
+                          : <span>—</span>}
                       </td>
                     );
                   })}
@@ -91,7 +82,13 @@ export function ModelHeatmap({ values }: { values: CategoryModelBreakdown[] }) {
         </table>
       </div>
       {allModels.length > heatmapModelCap && <p className="panel-note">Showing the top {heatmapModelCap} of {allModels.length} models by tokens. Use the usage explorer for the full list.</p>}
-      <p className="panel-note"><span className="hm-swatch" />Darker cells represent a larger token share within that category row.</p>
+      <p className="panel-note">
+        <span className="hm-legend">
+          <span>Less</span>
+          {ramp.filter((_, index) => index % 2 === 0).map(step => <span key={step.bg} className="hm-swatch" style={{ background: step.bg }} />)}
+          <span>More of the category row</span>
+        </span>
+      </p>
     </>
   );
 }

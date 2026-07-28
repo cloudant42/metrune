@@ -7,221 +7,190 @@
 ---
 
 **Project:** Metrune
-**Generated:** 2026-07-27 07:54:30
+**Updated:** 2026-07-28
 **Category:** Analytics Dashboard
-**Design Dials:** Variance 3/10 (Centered / Minimal) | Motion 2/10 (Subtle) | Density 8/10 (Dense / Dashboard)
+**Design Dials:** Variance 3/10 (Centered / Minimal) | Motion 2/10 (Subtle) | Density 7/10 (Dashboard)
+
+The implementation of record is `web/app/globals.css`. Every value below exists
+there as a CSS custom property — read tokens from the variable, never hard-code
+a hex in a component.
 
 ---
 
 ## Global Rules
 
-### Color Palette
+### Theming
 
-| Role | Hex | CSS Variable |
-|------|-----|--------------|
-| Primary | `#1E40AF` | `--color-primary` |
-| On Primary | `#FFFFFF` | `--color-on-primary` |
-| Secondary | `#3B82F6` | `--color-secondary` |
-| Accent/CTA | `#D97706` | `--color-accent` |
-| Background | `#F8FAFC` | `--color-background` |
-| Foreground | `#1E3A8A` | `--color-foreground` |
-| Muted | `#E9EEF6` | `--color-muted` |
-| Border | `#DBEAFE` | `--color-border` |
-| Destructive | `#DC2626` | `--color-destructive` |
-| Ring | `#1E40AF` | `--color-ring` |
+Light is the default. Dark is a **selected** set of steps, not an inversion, and
+is declared twice: under `@media (prefers-color-scheme: dark)` scoped with
+`:root:where(:not([data-theme="light"]))` (the OS preference) and under
+`:root[data-theme="dark"]` (the viewer's own choice, which must win both ways).
+The choice lives in `localStorage` under `metrune-theme` and is stamped on
+`<html>` before first paint by `ThemeScript` in `web/components/theme.tsx`.
 
-**Color Notes:** Blue data + amber highlights [Accent adjusted from #F59E0B for WCAG 3:1]
+### Brand
+
+The logo (`Metrune_logo.png`) is the source of the palette and the type: a deep
+navy wordmark, an electric-blue peak, and a geometric sans. Two colors are
+sampled straight from it and everything else is derived from them:
+
+| Brand color | Hex | Role |
+|-------------|-----|------|
+| Metrune navy | `#001553` | Primary ink, darkest heatmap step, ink on bright fills in dark mode |
+| Metrune blue | `#007cf1` | Accent family, categorical slot 1, the mark's bright peak |
+
+The mark itself is `MarkIcon` in `web/components/icons.tsx` — the one two-tone
+icon in the set (`--mark-deep` / `--mark-bright`). It sits on the page plane at
+26px, never inside a colored tile, so it reads as the logo rather than an app
+badge. `web/app/icon.svg` is the same mark reversed out of a navy tile.
+
+### Color palette
+
+| Role | Variable | Light | Dark |
+|------|----------|-------|------|
+| Page plane | `--bg` | `#f4f7fc` | `#050a18` |
+| Surface (cards, panels) | `--surface` | `#ffffff` | `#0c1224` |
+| Raised / inset fill | `--surface-2` | `#eef2f9` | `#121a30` |
+| Track / chip fill | `--surface-3` | `#e3eaf6` | `#1a2440` |
+| Hairline border | `--border` | `#dde4f0` | `#1e2947` |
+| Border (hover) | `--border-strong` | `#c6d1e4` | `#2c3a5f` |
+| Primary ink | `--fg` | `#001553` | `#eaeffb` |
+| Secondary ink | `--fg-2` | `#38456b` | `#aebbd8` |
+| Muted ink | `--muted` | `#5f6b8f` | `#8492b8` |
+| Accent (marks, fills) | `--accent` | `#0070e0` | `#2b90ff` |
+| Accent ink (text/links) | `--accent-ink` | `#0059bd` | `#86bfff` |
+| Accent wash | `--accent-soft` | `#e6f1fe` | `#0d2044` |
+| Ink on accent / danger fills | `--on-accent` `--on-danger` | `#ffffff` | `#001553` |
+| Good / warning / danger | `--good` `--warn` `--danger` | `#0ca30c` `#fab219` `#d03b3b` | `#0ca30c` `#fab219` `#e66767` |
+
+Neutrals are navy-tinted rather than grey — they are the logo's navy desaturated
+toward the plane, which is what keeps the chrome and the mark in one family.
+In the dark theme the accent is a *light* plane, so its ink is the brand navy
+(`--on-accent`), not white; white would fall to 3.2:1 on `#2b90ff`.
+
+Status colors are reserved for state and never reused as a series color; each
+ships with a label, never color alone.
+
+### Data visualization
+
+Follows the `dataviz` method. Series slots come from the validated categorical
+order — slot 1 blue `#0070e0` / `#2b90ff`, slot 2 orange `#eb6834` / `#f0794a`,
+slot 3 aqua `#1baf7a` / `#22c08a` (`--series-1..3`), assigned in fixed order and
+never cycled.
+
+The heatmap ramp is eight paired steps (`--hm-1..8` with `--hm-ink-1..8`), and
+it **runs in opposite directions per theme**: on the light plane it darkens
+toward navy `#001553`, on the dark plane it brightens toward `#a7ceff`, so the
+heaviest cell is always the one carrying the most weight against its own
+surface. `web/components/charts.tsx` reads the steps as variables and holds no
+hexes of its own.
+
+Mark specs: 2px lines with round caps, ~10–18% area wash under the line, ≥8px
+end markers with a 2px surface ring, 4px rounded data-ends on bars (square at
+the baseline), hairline recessive gridlines. Every chart ships a hover tooltip
+and a "View chart as table" fallback; a single-series chart carries no legend.
 
 ### Typography
 
-- **Heading Font:** Fira Code
-- **Body Font:** Fira Sans
-- **Mood:** dashboard, data, analytics, code, technical, precise
-- **Google Fonts:** [Fira Code + Fira Sans](https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap)
+Two faces, both vendored under `web/app/fonts/` and loaded with
+`next/font/local` in `web/app/layout.tsx` — a build never calls a font CDN.
 
-**CSS Import:**
-```css
-@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap');
-```
+- **Display (`--font-display`, Poppins 600):** the wordmark's geometric face.
+  It carries `h1, h2, h3` and the sidebar brand name, nothing else. Only weight
+  600 ships, so never set 650/680 on a heading — the browser would synthesize it.
+- **UI and figures (`--font-sans`, Inter 400–700 variable):** everything dense —
+  body, controls, tables, stat values — at 14px base.
+- **Code and identifiers only:** `--font-mono`.
+- Large standalone values (stat tiles) use proportional figures;
+  `font-variant-numeric: tabular-nums` is reserved for columns that must align
+  (table cells, axis ticks).
 
-### Spacing Variables
-
-*Density: 8/10 — Dense / Dashboard*
+### Shape and elevation
 
 | Token | Value | Usage |
 |-------|-------|-------|
-| `--space-xs` | `2px` / `0.125rem` | Tight gaps |
-| `--space-sm` | `4px` / `0.25rem` | Icon gaps, inline spacing |
-| `--space-md` | `8px` / `0.5rem` | Standard padding |
-| `--space-lg` | `12px` / `0.75rem` | Section padding |
-| `--space-xl` | `16px` / `1rem` | Large gaps |
-| `--space-2xl` | `24px` / `1.5rem` | Section margins |
-| `--space-3xl` | `32px` / `2rem` | Hero padding |
+| `--r-xs` | `6px` | Menu items, tab pills, inner cells |
+| `--r-sm` | `8px` | Buttons, inputs, small chips |
+| `--r` | `12px` | Panels, cards, filter bar |
+| `--r-lg` | `16px` | Auth card, modals |
+| `--shadow-sm` | hairline lift | Resting cards and panels |
+| `--shadow` | soft ambient | Hover state of cards |
+| `--shadow-lg` | deep ambient | Menus, popovers, auth card |
 
-### Shadow Depths
-
-| Level | Value | Usage |
-|-------|-------|-------|
-| `--shadow-sm` | `0 1px 2px rgba(0,0,0,0.05)` | Subtle lift |
-| `--shadow-md` | `0 4px 6px rgba(0,0,0,0.1)` | Cards, buttons |
-| `--shadow-lg` | `0 10px 15px rgba(0,0,0,0.1)` | Modals, dropdowns |
-| `--shadow-xl` | `0 20px 25px rgba(0,0,0,0.15)` | Hero images, featured cards |
+Spacing runs on a 4px rhythm: 4 / 8 / 12 / 16 / 22 / 28.
 
 ---
 
 ## Component Specs
 
+### Navigation
+
+- **Left sidebar** (236px) carries all chrome: the two-tone logo mark with the
+  organization name beneath the wordmark, grouped nav (`Analyze`, `Manage`), and the account button in
+  the footer.
+- **Account menu** (sidebar footer): profile, settings, the Light/Dark/Auto
+  theme switch, and sign in/out. This is the single home for account and
+  appearance controls.
+- **Page header** lives in the content column, not in a separate chrome band:
+  a 26px title with a one-line description beneath it. No sticky top bar, no
+  uppercase eyebrow, no status chips — connection state is already carried by
+  the demo banner on the pages that have data.
+- Below 1100px the sidebar collapses to icons; below 720px it becomes a bottom
+  tab bar.
+
+### Panel headers
+
+Markup keeps the caption before the heading; the header renders it
+`column-reverse` so the **title reads first and the caption sits under it**.
+Captions are sentence-case descriptions ("Daily cost across the selected range"),
+never uppercase labels.
+
 ### Buttons
 
 ```css
-/* Primary Button */
-.btn-primary {
-  background: #D97706;
-  color: white;
-  padding: 12px 24px;
-  border-radius: 8px;
-  font-weight: 600;
-  transition: all 200ms ease;
-  cursor: pointer;
-}
-
-.btn-primary:hover {
-  opacity: 0.9;
-  transform: translateY(-1px);
-}
-
-/* Secondary Button */
-.btn-secondary {
-  background: transparent;
-  color: #1E40AF;
-  border: 2px solid #1E40AF;
-  padding: 12px 24px;
-  border-radius: 8px;
-  font-weight: 600;
-  transition: all 200ms ease;
-  cursor: pointer;
-}
-```
-
-### Cards
-
-```css
-.card {
-  background: #F8FAFC;
-  border-radius: 12px;
-  padding: 24px;
-  box-shadow: var(--shadow-md);
-  transition: all 200ms ease;
-  cursor: pointer;
-}
-
-.card:hover {
-  box-shadow: var(--shadow-lg);
-  transform: translateY(-2px);
-}
+.btn        /* accent fill, 34px, radius 8, weight 600 */
+.btn.ghost  /* surface fill, hairline border */
+.btn.danger /* destructive fill */
+.btn.small  /* 30px */
 ```
 
 ### Inputs
 
-```css
-.input {
-  padding: 12px 16px;
-  border: 1px solid #E2E8F0;
-  border-radius: 8px;
-  font-size: 16px;
-  transition: border-color 200ms ease;
-}
-
-.input:focus {
-  border-color: #1E40AF;
-  outline: none;
-  box-shadow: 0 0 0 3px #1E40AF20;
-}
-```
-
-### Modals
-
-```css
-.modal-overlay {
-  background: rgba(0, 0, 0, 0.5);
-  backdrop-filter: blur(4px);
-}
-
-.modal {
-  background: white;
-  border-radius: 16px;
-  padding: 32px;
-  box-shadow: var(--shadow-xl);
-  max-width: 500px;
-  width: 90%;
-}
-```
-
----
-
-## Style Guidelines
-
-**Style:** Exaggerated Minimalism
-
-**Keywords:** Bold minimalism, oversized typography, high contrast, negative space, loud minimal, statement design
-
-**Best For:** Fashion, architecture, portfolios, agency landing pages, luxury brands, editorial
-
-**Key Effects:** font-size: clamp(3rem 10vw 12rem), font-weight: 900, letter-spacing: -0.05em, massive whitespace
-
-### Page Pattern
-
-**Pattern Name:** Enterprise Gateway
-
-- **Conversion Strategy:** Path selection (I am a...). Mega menu navigation. Trust signals prominent.
-- **CTA Placement:** Contact Sales (Primary) + Login (Secondary)
-- **Section Order:** 1. Hero (Video/Mission), 2. Solutions by Industry, 3. Solutions by Role, 4. Client Logos, 5. Contact Sales
+34px min height, hairline border, radius 8, `--ring` focus glow. Selects draw
+their own chevron; native appearance is reset.
 
 ---
 
 ## Motion
 
-**Scroll Reveal** (Subtle) — Trigger: scroll (viewport enter) | Duration: 300-400ms | Easing: `power1.out`
-
-```js
-gsap.from(el, { opacity: 0, y: 12, duration: 0.35, ease: 'power1.out', scrollTrigger: { trigger: el, start: 'top 90%', toggleActions: 'play none none reverse' } });
-```
-
-**Framework notes:** Requires the ScrollTrigger plugin registered once via gsap.registerPlugin(ScrollTrigger)
-
-- ✅ Keep the y offset small (8-16px) so it reads as a fade, not a slide
-- ❌ Don't reveal below-the-fold content needed for SEO/crawlers as invisible-by-default without a no-JS fallback
-- ⚡ toggleActions 'play none none reverse' avoids re-triggering on every scroll direction change
+Subtle only: 120–180ms `ease` on color, border, background and shadow. Menus
+fade and rise 4px over 140ms. No layout-shifting hovers; cards change border and
+shadow, never scale. `prefers-reduced-motion: reduce` collapses all durations.
 
 ---
 
 ## Anti-Patterns (Do NOT Use)
 
-- ❌ Ornate design
-- ❌ No filtering
-
-### Additional Forbidden Patterns
-
-- ❌ **Emojis as icons** — Use SVG icons (Heroicons, Lucide, Simple Icons)
-- ❌ **Missing cursor:pointer** — All clickable elements must have cursor:pointer
-- ❌ **Layout-shifting hovers** — Avoid scale transforms that shift layout
-- ❌ **Low contrast text** — Maintain 4.5:1 minimum contrast ratio
-- ❌ **Instant state changes** — Always use transitions (150-300ms)
-- ❌ **Invisible focus states** — Focus states must be visible for a11y
+- ❌ Uppercase letter-spaced eyebrows above titles
+- ❌ Emojis as icons — use the SVG set in `web/components/icons.tsx`
+  (24px grid, 1.75 stroke, round caps)
+- ❌ Hard-coded hex values in components — use the tokens (including the
+  heatmap ramp, which is theme-aware and would otherwise invert in dark mode)
+- ❌ Dual-axis charts, rainbow sequential ramps, cycled categorical hues
+- ❌ Colored text carrying series identity (the mark beside it carries it)
+- ❌ Instant state changes, invisible focus states, layout-shifting hovers
+- ❌ Text contrast below 4.5:1
 
 ---
 
 ## Pre-Delivery Checklist
 
-Before delivering any UI code, verify:
-
-- [ ] No emojis used as icons (use SVG instead)
-- [ ] All icons from consistent icon set (Heroicons/Lucide)
-- [ ] `cursor-pointer` on all clickable elements
-- [ ] Hover states with smooth transitions (150-300ms)
-- [ ] Light mode: text contrast 4.5:1 minimum
-- [ ] Focus states visible for keyboard navigation
-- [ ] `prefers-reduced-motion` respected
-- [ ] Responsive: 375px, 768px, 1024px, 1440px
-- [ ] No content hidden behind fixed navbars
-- [ ] No horizontal scroll on mobile
+- [ ] Colors read from tokens, and the view was checked in light **and** dark
+- [ ] Chart palette validated (`dataviz` validator) against both surfaces
+- [ ] Charts ship a tooltip and a table fallback
+- [ ] Icons from `components/icons.tsx`; no emoji
+- [ ] Headings on Poppins at weight 600 only; no synthesized weights
+- [ ] `cursor: pointer` and a visible focus ring on every control
+- [ ] Transitions 120–300ms; `prefers-reduced-motion` respected
+- [ ] Responsive at 375px, 768px, 1024px, 1440px, no horizontal scroll
+- [ ] No content hidden behind the sticky top bar or the mobile tab bar
