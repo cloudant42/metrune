@@ -23,6 +23,50 @@ jobs:
         run: cargo install cargo-audit --locked
       - run: cargo audit
 
+  # THIRD_PARTY_NOTICES.md commits maintainers to reviewing dependency licenses
+  # for Apache-2.0 compatibility. Enforced here so an incompatible dependency
+  # fails the pull request that adds it rather than surfacing at release.
+  rust-licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - run: cargo deny check licenses sources bans
+
+  # The dashboard's licenses come from the installed tree, so the notice
+  # generator needs node_modules. This also proves the generator still runs.
+  npm-licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - name: Generate third-party notices
+        run: python3 scripts/generate-notices.py --output NOTICE
+      - name: Report licenses that still need their text
+        run: |
+          if grep -q "^## Action required before release" NOTICE; then
+            echo "::warning::NOTICE lists dependencies whose license text must be added before release"
+            sed -n '/^## Action required before release/,/^## /p' NOTICE | head -40
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: third-party-notices
+          path: NOTICE
+
   npm-audit:
     runs-on: ubuntu-latest
     defaults:

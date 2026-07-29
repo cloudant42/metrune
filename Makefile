@@ -1,4 +1,4 @@
-.PHONY: check test test-integration integration-up integration-down web-build compose-check
+.PHONY: check test test-integration integration-up integration-down web-build compose-check licenses notices
 
 TEST_PG_CONTAINER := metrune-test-postgres
 TEST_PG_PORT := 55432
@@ -60,6 +60,16 @@ integration-up:
 
 integration-down:
 	@docker rm -f $(TEST_PG_CONTAINER) $(TEST_CH_CONTAINER) >/dev/null 2>&1 || true
+
+# Dependency license policy for the Rust workspace. Needs cargo-deny:
+#   cargo install cargo-deny --locked
+licenses:
+	cargo deny check licenses sources bans
+
+# Regenerates NOTICE from the resolved Rust graph and the installed dashboard
+# tree. Run `npm ci` in web/ first, or the npm section comes out empty.
+notices:
+	python3 scripts/generate-notices.py --output NOTICE
 
 web-build:
 	cd web && npm run build
