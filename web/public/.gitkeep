@@ -1,0 +1,4 @@
+Next.js serves this directory at the site root, and web/Dockerfile copies it
+into the runtime image. Git does not track empty directories, so without this
+placeholder a fresh checkout has no web/public and the image build fails at
+`COPY /app/public`. Delete it once real static assets live here.

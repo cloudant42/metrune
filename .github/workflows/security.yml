@@ -22,6 +22,19 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - run: cargo audit
+      # .cargo/audit.toml suppresses one advisory on the grounds that the
+      # vulnerable crate is in Cargo.lock but never compiled. cargo-audit reads
+      # the lockfile and cannot tell the difference; cargo-tree is feature-aware
+      # and can. If the crate ever enters the build, the justification is void
+      # and this fails rather than letting the suppression stand.
+      - name: Verify suppressed advisories still do not affect the build
+        run: |
+          if cargo tree --workspace --target all --invert rsa 2>/dev/null | grep -q '^rsa'; then
+            echo "::error::rsa is now compiled into the build, so RUSTSEC-2023-0071 can no longer be suppressed. Remove the ignore in .cargo/audit.toml and address the advisory."
+            cargo tree --workspace --target all --invert rsa
+            exit 1
+          fi
+          echo "rsa is absent from the compiled graph; the suppression still holds."
 
   # THIRD_PARTY_NOTICES.md commits maintainers to reviewing dependency licenses
   # for Apache-2.0 compatibility. Enforced here so an incompatible dependency

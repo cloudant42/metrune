@@ -1,0 +1,24 @@
+# cargo-audit configuration.
+#
+# cargo-audit scans Cargo.lock, which records every package in the resolution
+# graph whether or not it is ever compiled. Optional dependencies of our
+# dependencies appear there even when the feature that would pull them in is
+# switched off, so an advisory against one of them is not necessarily an
+# advisory against anything we ship.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack, a timing sidechannel in `rsa`.
+    #
+    # `rsa` reaches Cargo.lock solely through `sqlx-mysql`. Metrune enables
+    # sqlx with `default-features = false` and only the `postgres` driver, so
+    # `sqlx-mysql` is never built and `rsa` is never compiled into any binary.
+    # `cargo tree` confirms this: the crate is absent from the graph for every
+    # target.
+    #
+    # There is no fixed release to upgrade to, so this cannot be resolved by
+    # bumping. The `rust-audit` job re-checks that `rsa` is still outside the
+    # compiled graph, and fails if that ever stops being true — enabling the
+    # MySQL driver must not silently inherit this suppression.
+    "RUSTSEC-2023-0071",
+]
