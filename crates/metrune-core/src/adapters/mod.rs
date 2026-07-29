@@ -1,10 +1,12 @@
 mod claude;
 mod codex;
 mod common;
+mod copilot;
 mod opencode;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub use copilot::CopilotAdapter;
 pub use opencode::OpenCodeAdapter;
 
 use crate::UsageMessage;
@@ -22,5 +24,6 @@ pub fn built_in_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(OpenCodeAdapter),
         Box::new(ClaudeAdapter),
         Box::new(CodexAdapter),
+        Box::new(CopilotAdapter),
     ]
 }

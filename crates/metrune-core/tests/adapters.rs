@@ -1,4 +1,6 @@
-use metrune_core::adapters::{ClaudeAdapter, CodexAdapter, OpenCodeAdapter, SourceAdapter};
+use metrune_core::adapters::{
+    ClaudeAdapter, CodexAdapter, CopilotAdapter, OpenCodeAdapter, SourceAdapter,
+};
 use rusqlite::Connection;
 use std::fs;
 use uuid::Uuid;
@@ -80,6 +82,125 @@ fn codex_without_session_metadata_uses_a_source_stable_fallback() {
     let messages = CodexAdapter.parse(&codex_path).unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].session_id, codex_path.display().to_string());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parses_copilot_otel_chat_spans() {
+    let root = test_root();
+    let otel_path = root.join("copilot-otel-20260728-101500.jsonl");
+    fs::write(
+        &otel_path,
+        r#"{"type":"span","spanId":"span-1","endTimeUnixNano":1785269459374000000,"name":"chat gpt-5.4-mini","attributes":{"gen_ai.operation.name":"chat","gen_ai.response.model":"gpt-5.4-mini","gen_ai.conversation.id":"conversation-1","gen_ai.usage.input_tokens":1234,"gen_ai.usage.output_tokens":567,"gen_ai.usage.cache_read.input_tokens":890,"gen_ai.usage.reasoning.output_tokens":123}}
+{"type":"span","spanId":"span-2","name":"tool read_file","attributes":{"gen_ai.operation.name":"execute_tool","gen_ai.tool.name":"read_file"}}
+{"type":"metric","name":"github.copilot.cost","value":0.42}
+"#,
+    )
+    .unwrap();
+
+    let messages = CopilotAdapter.parse(&otel_path).unwrap();
+    assert_eq!(messages.len(), 1, "tool spans and metrics must not count");
+    assert_eq!(messages[0].source_message_id, "span-1");
+    assert_eq!(messages[0].session_id, "conversation-1");
+    assert_eq!(messages[0].model_id, "gpt-5.4-mini");
+    assert_eq!(messages[0].provider_id, "github-copilot");
+    assert_eq!(messages[0].tokens.input, 1234);
+    assert_eq!(messages[0].tokens.output, 567);
+    assert_eq!(messages[0].tokens.cache_read, 890);
+    assert_eq!(messages[0].tokens.reasoning, 123);
+    assert_eq!(
+        messages[0].observed_at.to_rfc3339(),
+        "2026-07-28T20:10:59.374+00:00",
+        "nanosecond epochs must not be read as seconds"
+    );
+    assert_eq!(
+        messages[0].project_path, None,
+        "Copilot spans carry no workspace attribute"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copilot_never_reads_captured_prompt_content() {
+    let root = test_root();
+    let otel_path = root.join("copilot-content.jsonl");
+    fs::write(
+        &otel_path,
+        r#"{"type":"span","spanId":"span-3","name":"chat gpt-5.4","attributes":{"gen_ai.operation.name":"chat","gen_ai.response.model":"gpt-5.4","gen_ai.conversation.id":"conversation-2","gen_ai.usage.input_tokens":10,"gen_ai.usage.output_tokens":5,"gen_ai.prompt":"private implementation detail","gen_ai.completion":"private response","content":"private implementation detail"}}
+"#,
+    )
+    .unwrap();
+
+    let messages = CopilotAdapter.parse(&otel_path).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].classification_text, None,
+        "captureContent payloads must never reach the classifier"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copilot_without_a_conversation_id_uses_a_source_stable_fallback() {
+    let root = test_root();
+    let otel_path = root.join("copilot-no-conversation.jsonl");
+    // Spans that predate the conversation attribute, or that Copilot emits
+    // without one, must still be counted rather than dropped.
+    fs::write(
+        &otel_path,
+        r#"{"type":"span","spanId":"span-4","name":"chat gpt-5.4","attributes":{"gen_ai.operation.name":"chat","gen_ai.usage.input_tokens":40,"gen_ai.usage.output_tokens":20}}
+"#,
+    )
+    .unwrap();
+
+    let messages = CopilotAdapter.parse(&otel_path).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].session_id, otel_path.display().to_string());
+    assert_eq!(
+        messages[0].model_id, "unknown",
+        "a span with no model must not be attributed to another one"
+    );
+    assert_eq!(
+        messages[0].provider_id, "github-copilot",
+        "the client is known even when the span omits the provider"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copilot_ignores_spans_that_report_no_tokens() {
+    let root = test_root();
+    let otel_path = root.join("copilot-zero.jsonl");
+    fs::write(
+        &otel_path,
+        r#"{"type":"span","spanId":"span-5","name":"chat gpt-5.4","attributes":{"gen_ai.operation.name":"chat","gen_ai.conversation.id":"conversation-3","gen_ai.usage.input_tokens":0,"gen_ai.usage.output_tokens":0}}
+{"not":"json"
+"#,
+    )
+    .unwrap();
+
+    assert!(CopilotAdapter.parse(&otel_path).unwrap().is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn discovers_copilot_exports_from_the_default_folder() {
+    let root = test_root();
+    let otel_dir = root.join(".copilot/otel");
+    fs::create_dir_all(&otel_dir).unwrap();
+    let export = otel_dir.join("copilot-otel-20260728-101500.jsonl");
+    fs::write(&export, "").unwrap();
+    fs::write(otel_dir.join("notes.txt"), "").unwrap();
+
+    // Asserted by membership, not equality: the README tells operators to set
+    // COPILOT_OTEL_FILE_EXPORTER_PATH, and discovery honours it, so a developer
+    // who followed those instructions must not see this test fail.
+    let sources = CopilotAdapter.discover(&root, &[]).unwrap();
+    assert!(sources.contains(&export), "the export was not discovered");
+    assert!(
+        !sources.iter().any(|path| path.ends_with("notes.txt")),
+        "discovery picked up a file that is not a telemetry export"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

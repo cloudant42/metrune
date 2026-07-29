@@ -1,162 +1,189 @@
-# Metrune
+<p align="center">
+  <img src="docs/media/metrune-logo.png" alt="Metrune" width="320">
+</p>
 
-Metrune is a privacy-first, self-hosted analytics platform for AI coding
-agents. A local Rust client reads supported agent stores, calculates usage and
-cost data, optionally classifies sessions, and uploads a deliberately limited
-metadata schema. The web app provides organization, team, member, installation,
-pricing, and usage views.
+<p align="center">
+  Privacy-first, self-hosted analytics for AI coding agents.
+</p>
 
-> **Release status:** production beta. The first open-source release supports a
-> single Linux host deployed with Docker Compose. It is suitable for evaluation
-> and controlled internal rollouts, but it is not yet a high-availability
-> platform.
+<p align="center">
+  <a href="#client">Client</a> ·
+  <a href="#server">Server</a> ·
+  <a href="#development">Development</a> ·
+  <a href="#privacy">Privacy</a> ·
+  <a href="#documentation">Documentation</a>
+</p>
 
-## What is in the beta
+---
 
-- A Rust client for scanning, exporting, uploading, watching, local
-  classification, and price-catalog management.
-- A Rust API, PostgreSQL control plane, and ClickHouse usage store.
-- A Next.js dashboard with organization-scoped roles and personal analytics.
-- Installation enrollment, email invitations, password resets, and revocable
-  browser sessions.
-- Local or operator-managed semantic classification with explicit privacy
-  boundaries.
-- One supported production deployment: the standalone
-  [`compose.production.yaml`](compose.production.yaml) stack behind an external
-  HTTPS reverse proxy.
+A local client reads the session stores your coding agents already write,
+calculates usage and cost, optionally classifies sessions, and uploads a
+deliberately limited metadata schema to a server you run. The web dashboard
+shows organizations, teams, members, installations, pricing, and usage.
 
-The beta intentionally does **not** include Helm, Kubernetes, an embedded
-reverse proxy, Grafana, Prometheus, or an OpenTelemetry collector. Those can be
-added later when their contracts and operating procedures are tested.
+> **Current version:** a single Linux host deployed with Docker Compose. Good
+> for evaluation and internal rollouts; not yet a high-availability platform.
+> Kubernetes, Helm and bundled observability are not included.
 
-## Support matrix
+## Client
 
-| Surface | Beta status |
+### Install
+
+From a Metrune server (the installer is rendered from the signed release
+manifest, so it needs no dependencies on the workstation):
+
+```bash
+curl -fsSL https://metrune.example.com/v1/client/install.sh | sh
+```
+
+Then enroll and start uploading:
+
+```bash
+metrune enroll --server https://metrune.example.com --token <enrollment-token>
+metrune scan       # read local agent sessions
+metrune export     # review exactly what would be uploaded
+metrune upload
+```
+
+Create the one-time enrollment code on your profile page in the dashboard.
+`enroll` also
+takes `--name`, `--user-alias` and `--classifier`; run `metrune enroll --help`
+for the full set.
+
+`metrune update` verifies and replaces the binary in place. Details and the
+air-gapped path are in the [client distribution guide](docs/CLIENT_DISTRIBUTION.md).
+
+<!-- TODO: client screenshot / demo video -->
+<!-- <p align="center"><img src="docs/media/client-demo.gif" alt="Metrune client" width="720"></p> -->
+
+### Supported coding CLIs
+
+| Agent | Session store it reads | Setup |
+| --- | --- | --- |
+| Claude Code | `~/.claude/projects`, `~/.claude/transcripts` | none |
+| Codex CLI | `~/.codex/sessions` | none |
+| OpenCode | `~/.local/share/opencode` | none |
+| GitHub Copilot CLI | `~/.copilot/otel/*.jsonl` | [telemetry export](#github-copilot-cli) |
+
+Restrict a run to one of them with
+`metrune scan --clients claude,codex,opencode,copilot`.
+
+#### GitHub Copilot CLI
+
+Copilot only writes token counts when OpenTelemetry file export is switched on,
+so enable it in your shell profile **before** starting a session:
+
+```bash
+export COPILOT_OTEL_ENABLED=true
+export COPILOT_OTEL_EXPORTER_TYPE=file
+mkdir -p "$HOME/.copilot/otel"
+export COPILOT_OTEL_FILE_EXPORTER_PATH="$HOME/.copilot/otel/copilot-otel-$(date +%Y%m%d-%H%M%S).jsonl"
+```
+
+Two consequences worth knowing. Sessions that ran before you enabled this leave
+no usage data behind, so there is nothing to backfill. And Copilot's telemetry
+carries no workspace attribute, so its sessions group under **Unassigned**
+rather than a project.
+
+Metrune reads only the telemetry export, never Copilot's `session-state`
+directory — that one holds prompts and responses. Copilot inside VS Code uses a
+separate exporter and is not read yet.
+
+### Supported systems
+
+| Platform | Status |
 | --- | --- |
-| Server on Linux x86_64 with Docker Compose v2 | Supported |
-| External HTTPS reverse proxy on the same host | Supported |
-| Linux x86_64 client, including WSL2 | Supported |
-| Windows x86_64 client | Experimental artifact |
-| macOS Intel and Apple Silicon clients | Experimental artifacts |
-| Kubernetes / Helm / multi-host HA | Not supported |
-| Bundled Grafana, Prometheus, or OTEL collector | Not included |
+| Linux x86_64 (including WSL2) | Supported |
+| macOS Intel and Apple Silicon | Experimental |
+| Windows x86_64 | Experimental |
 
-“Experimental” means the release workflow builds and smoke-tests the binary,
-but the project does not yet promise full installation, credential-store, and
-long-running watch-mode support on that platform.
+Experimental means CI builds and smoke-tests the binary, but installation,
+credential storage and long-running watch mode are not yet guaranteed there.
 
-## Privacy boundary
+## Server
 
-The normal upload contains usage metadata: pseudonymous installation, user,
-project, and session identifiers; the final project-folder label by default;
-provider/model/client identifiers; token and cost figures; timestamps; and
-classification results.
+### Install
 
-It does not have fields for prompts, model responses, source code, patches,
-tool arguments, command output, raw message/session IDs, full filesystem paths,
-classifier summaries, or provider credentials. The default folder label can
-still reveal a project name; set `METRUNE_PROJECT_MODE=anonymous` where that is
-not appropriate. See [the privacy model](docs/privacy.md) for the exact
-contract.
+The server is a Rust API, PostgreSQL control plane, ClickHouse usage store and
+Next.js dashboard, run as one Docker Compose stack.
 
-## Local development
-
-Prerequisites:
-
-- Rust stable
-- Node.js 20+
-- Docker with Compose v2
-
-Start the development stack:
+Local, for trying it out:
 
 ```bash
 docker compose up --build
 ```
 
-Open <http://localhost:3001> and sign in with the development-only account
-`admin@test.com` / `admin`. The known credentials and broad application port
-bindings in the development stack are not suitable for a shared or production
-host.
+Open <http://localhost:3001> and sign in as `admin@test.com` / `admin`. These
+credentials and port bindings are development-only — never expose this stack.
 
-Run the repository checks:
+Production, as a separate standalone stack:
 
 ```bash
-make check
+cp deploy/compose/production.env.example /private/path/metrune.env
+# fill in every placeholder, then:
+docker compose --env-file /private/path/metrune.env -f compose.production.yaml up -d
 ```
 
-The check covers formatting, Clippy, Rust tests, web type-check/build, and both
-the development and production Compose contracts.
+You also need authenticated TLS SMTP (invitations and password resets depend on
+it) and an external HTTPS reverse proxy — a minimal Caddy example is in
+[`deploy/compose/Caddyfile.example`](deploy/compose/Caddyfile.example). Every
+configurable variable, the bootstrap-admin flow and the backup requirements are
+in the [deployment guide](docs/DEPLOYMENT.md) and
+[operations runbook](docs/OPERATIONS.md).
 
-## Production deployment
+### Supported systems
 
-Production is a separate, standalone stack; do not merge it with
-`compose.yaml`.
+| Platform | Status |
+| --- | --- |
+| Linux x86_64 with Docker Compose v2 | Supported |
+| Kubernetes / Helm / multi-host HA | Not supported |
 
-1. Publish or obtain the released API and web image digests.
-2. Copy [`deploy/compose/production.env.example`](deploy/compose/production.env.example)
-   to a private environment file and replace every placeholder.
-3. Configure authenticated TLS SMTP. Invitation and password-reset flows
-   require it.
-4. Configure an external HTTPS reverse proxy. A minimal Caddy example is in
-   [`deploy/compose/Caddyfile.example`](deploy/compose/Caddyfile.example).
-5. Validate and start the stack:
+<!-- TODO: dashboard screenshot / demo video -->
+<!-- <p align="center"><img src="docs/media/server-demo.gif" alt="Metrune dashboard" width="720"></p> -->
+
+## Privacy
+
+Uploads carry usage metadata only: pseudonymous installation, user, project and
+session identifiers; the project-folder label; provider, model and client
+identifiers; tokens, cost, timestamps and classification results.
+
+There are no fields for prompts, responses, source code, patches, tool
+arguments, command output, raw session IDs, full paths, classifier summaries or
+provider credentials. The folder label can still reveal a project name — set
+`METRUNE_PROJECT_MODE=anonymous` where that matters. The exact contract is in
+[the privacy model](docs/privacy.md).
+
+## Development
+
+Prerequisites: Rust stable, Node.js 20+, Docker with Compose v2.
 
 ```bash
-docker compose --env-file /private/path/metrune.env \
-  -f compose.production.yaml config
-docker compose --env-file /private/path/metrune.env \
-  -f compose.production.yaml up -d
+docker compose up --build    # run the full stack locally
+make check                   # fmt, clippy, Rust tests, web build, compose contracts
 ```
 
-The first administrator is created from the one-time bootstrap values. After
-the first successful sign-in, clear both bootstrap variables and recreate the
-API container. Startup deliberately fails if bootstrap credentials remain
-configured once a user already exists.
-
-Follow the complete [deployment guide](docs/DEPLOYMENT.md) and
-[operations runbook](docs/OPERATIONS.md), especially the backup requirement
-for PostgreSQL, ClickHouse, and the credential-vault key.
-
-## Client
-
-Build and inspect the CLI:
+Build and inspect the client on its own:
 
 ```bash
 cargo build --release -p metrune
 ./target/release/metrune --help
 ```
 
-A typical installation enrolls once, scans locally, verifies the sanitized
-envelope, and uploads:
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
-```bash
-metrune enroll --help
-metrune scan
-metrune export
-metrune upload
-```
+## Documentation
 
-`metrune export` is the easiest way to review exactly what is queued before
-connecting a client to a server.
+- [Architecture](docs/architecture.md)
+- [Deployment](docs/DEPLOYMENT.md) · [Operations](docs/OPERATIONS.md)
+- [Client distribution](docs/CLIENT_DISTRIBUTION.md)
+- [Privacy](docs/privacy.md) · [Security and logging](docs/SECURITY_AND_LOGGING.md)
+- [Authorization](docs/AUTHORIZATION.md) · [Multi-tenancy](docs/MULTI_TENANCY.md) · [Identity](docs/identity.md)
+- [Pricing](docs/pricing.md) · [Classifier provisioning](docs/classifier-provisioning.md)
+- [Releasing](docs/RELEASING.md) · [Roadmap](docs/ROADMAP.md) · [Changelog](CHANGELOG.md)
 
-## Repository map
+## Project
 
-```text
-crates/                 Rust client, API, and shared domain types
-web/                    Next.js dashboard and server-side API proxy
-migrations/             PostgreSQL and ClickHouse schema
-deploy/compose/         Production environment and reverse-proxy examples
-docs/                   Architecture, privacy, security, and operations
-scripts/                Validation and restore-drill automation
-compose.yaml            Development stack
-compose.production.yaml Supported production-beta stack
-```
-
-## Project policy
-
-- [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-- [Release process](docs/RELEASING.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Changelog](CHANGELOG.md)
-- [License](LICENSE)
+[Contributing](CONTRIBUTING.md) ·
+[Security policy](SECURITY.md) ·
+[Code of conduct](CODE_OF_CONDUCT.md) ·
+[License](LICENSE)
