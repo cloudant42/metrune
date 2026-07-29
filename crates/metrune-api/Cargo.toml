@@ -14,6 +14,7 @@ chrono.workspace = true
 base64.workspace = true
 clickhouse.workspace = true
 hex.workspace = true
+hkdf.workspace = true
 lettre.workspace = true
 metrune-core = { path = "../metrune-core" }
 serde.workspace = true
@@ -25,3 +26,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower.workspace = true

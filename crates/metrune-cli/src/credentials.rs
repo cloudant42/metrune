@@ -74,7 +74,22 @@ impl CredentialStore {
         if let Some(parent) = self.fallback_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.fallback_path, serde_json::to_vec_pretty(credentials)?)?;
+        let contents = serde_json::to_vec_pretty(credentials)?;
+        // Create the file already private. Writing first and chmod-ing after
+        // leaves the plaintext credentials readable to every local account for
+        // the width of that window.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&self.fallback_path).with_context(|| {
+            format!("open credential fallback {}", self.fallback_path.display())
+        })?;
+        std::io::Write::write_all(&mut file, &contents)?;
+        // An existing file keeps its original mode, so re-assert it.
         set_private_permissions(&self.fallback_path)?;
         Ok(())
     }

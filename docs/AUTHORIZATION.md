@@ -92,7 +92,7 @@ Every operation below resolves the organization from the caller's credential.
 | `PATCH /v1/org/settings` | Admin |
 | `GET`/`PATCH /v1/org/classifier`, `POST /v1/org/classifier/test` | Admin |
 | `GET`/`POST /v1/org/credentials`, `DELETE /v1/org/credentials/{id}` | Admin. Responses carry credential metadata only, never the secret |
-| `POST /v1/org/vault/recovery` | Admin, **plus** re-verification of the caller's own password, **plus** a one-time database constraint so the recovery key can never be exported twice |
+| `POST /v1/org/vault/recovery` | Admin, **plus** re-verification of the caller's own password, **plus** a one-time database constraint so the recovery key can never be exported twice. Returns the key derived for the caller's **active** organization, so an admin of one tenant cannot obtain a co-tenant's key |
 | `GET /v1/org/prices` | Any member. Prices explain the costs already shown in analytics |
 | `POST /v1/org/prices`, `PATCH`/`DELETE /v1/org/prices/{id}` | Admin, and a user session, so the pricing change has a durable actor |
 

@@ -56,6 +56,23 @@ the `metrune-secrets` volume. The API refuses to start when encrypted
 credentials exist but the key is missing; treat that as a restore signal, not
 as a reason to generate a new key.
 
+Provider credentials are not sealed with the master key directly. Each
+organization gets its own key, derived from the master key with HKDF-SHA256
+over the organization's id, so one tenant's key cannot open another tenant's
+credentials. Derivation is deterministic: restoring the same master key
+restores every organization's key.
+
+The recovery key an admin exports from the dashboard
+(`POST /v1/org/vault/recovery`) is that **organization's** derived key, not the
+master key. It lets that organization decrypt its own credentials out of band.
+It is not a deployment backup and cannot be used to restore the server — back
+up `METRUNE_SECRETS_KEY_FILE` for that.
+
+Credentials written before this scheme carry `key_derivation = 0` in
+`provider_credentials` and stay readable under the master key. The API re-seals
+them under their organization's key on the next start; a row that fails to
+decrypt is logged and left untouched rather than dropped.
+
 ## Restore order
 
 1. Restore PostgreSQL to a new or empty instance and verify the application

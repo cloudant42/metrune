@@ -132,7 +132,13 @@ export type Result<T> = { data: T; source: Source };
 const base = () => process.env.METRUNE_API_URL ?? "http://localhost:8080";
 async function token() {
   const store = await cookies();
-  return store.get("metrune_session")?.value ?? process.env.METRUNE_DASHBOARD_TOKEN;
+  const session = store.get("metrune_session")?.value;
+  if (session) return session;
+  // The shared dashboard token is not tied to a signed-in user, so falling back
+  // to it would serve organization data to anonymous visitors. It stays a
+  // development-only convenience.
+  if (process.env.METRUNE_ENV === "production") return undefined;
+  return process.env.METRUNE_DASHBOARD_TOKEN;
 }
 
 async function api<T>(path: string, query = ""): Promise<T> {

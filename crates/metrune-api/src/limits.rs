@@ -95,6 +95,8 @@ pub(crate) struct RateLimits {
     pub(crate) enrollment_code: RateLimit,
     pub(crate) invitation: RateLimit,
     pub(crate) password_reset: RateLimit,
+    pub(crate) vault_recovery: RateLimit,
+    pub(crate) organization_create: RateLimit,
 }
 
 impl RateLimits {
@@ -110,6 +112,9 @@ impl RateLimits {
                 .with_env_override("ENROLLMENT_CODES_PER_HOUR"),
             invitation: RateLimit::new(3600, 30).with_env_override("INVITATIONS_PER_HOUR"),
             password_reset: RateLimit::new(3600, 10).with_env_override("PASSWORD_RESETS_PER_HOUR"),
+            vault_recovery: RateLimit::new(3600, 5).with_env_override("VAULT_RECOVERIES_PER_HOUR"),
+            organization_create: RateLimit::new(3600, 5)
+                .with_env_override("ORGANIZATIONS_PER_HOUR"),
         }
     }
 }

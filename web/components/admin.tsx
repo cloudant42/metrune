@@ -633,7 +633,7 @@ export function CredentialsPanel({ credentials }: { credentials: ProviderCredent
             <label className="field">
               <span>Confirm your password</span>
               <input type="password" autoComplete="current-password" value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} required autoFocus />
-              <small>The recovery key is shown only once. Store it outside this server.</small>
+              <small>This unlocks only this workspace&apos;s provider credentials. It is shown once — store it outside this server.</small>
             </label>
             <div className="form-actions">
               <button className="btn" type="submit">Show recovery key</button>

@@ -29,6 +29,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use clickhouse::Row;
+use hkdf::Hkdf;
 use metrune_core::{
     canonical_model_id,
     classifier::{OpenAiCompatibleClassifier, ResponseMode},
@@ -36,6 +37,7 @@ use metrune_core::{
     BatchEnvelope, CostKind, IngestAck, SessionSnapshot, SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use sqlx::PgPool;
 use std::{
     env,
@@ -72,6 +74,14 @@ pub(crate) struct AppState {
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BATCH_SNAPSHOTS: usize = 1_000;
 const MAX_CLASSIFICATION_TEXT_BYTES: usize = 64 * 1024;
+const MAX_SESSION_PAGE_OFFSET: u32 = 100_000;
+/// HKDF context separating credential keys from any other future use of the
+/// master key. Changing it invalidates every stored credential.
+const CREDENTIAL_KEY_INFO: &[u8] = b"metrune/provider-credential/v1";
+/// Sealed under the deployment master key directly (pre-derivation rows).
+const KEY_DERIVATION_MASTER: i16 = 0;
+/// Sealed under a per-organization key derived from the master key.
+const KEY_DERIVATION_ORGANIZATION: i16 = 1;
 const DEFAULT_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(60);
 const LONG_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(300);
 const DEVELOPMENT_ORGANIZATION_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -101,14 +111,19 @@ impl SecretVault {
                 let mut key = [0_u8; 32];
                 OsRng.fill_bytes(&mut key);
                 let encoded = URL_SAFE_NO_PAD.encode(key);
-                let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-                file.write_all(encoded.as_bytes())?;
-                file.sync_all()?;
+                // The mode is set at creation: writing the key first and
+                // chmod-ing afterwards exposes the master key to every local
+                // account for the width of that window.
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
                 }
+                let mut file = options.open(path)?;
+                file.write_all(encoded.as_bytes())?;
+                file.sync_all()?;
                 (encoded, true)
             }
             Err(error) => return Err(error.into()),
@@ -120,10 +135,56 @@ impl SecretVault {
         Ok(Self { key, created })
     }
 
-    fn encrypt(&self, plaintext: &str, aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    /// Credential key for one organization, derived from the deployment master
+    /// key. Exporting or compromising one organization's key tells an attacker
+    /// nothing about any other organization's credentials, and the master key
+    /// cannot be recovered from a derived one.
+    fn organization_key(&self, organization_id: Uuid) -> [u8; 32] {
+        let mut key = [0_u8; 32];
+        Hkdf::<Sha256>::new(Some(organization_id.as_bytes()), &self.key)
+            .expand(CREDENTIAL_KEY_INFO, &mut key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        key
+    }
+
+    /// Rows written before per-organization derivation are sealed under the
+    /// master key and carry [`KEY_DERIVATION_MASTER`] until they are re-wrapped.
+    fn key_for(&self, organization_id: Uuid, derivation: i16) -> [u8; 32] {
+        match derivation {
+            KEY_DERIVATION_MASTER => self.key,
+            _ => self.organization_key(organization_id),
+        }
+    }
+
+    fn encrypt(
+        &self,
+        organization_id: Uuid,
+        plaintext: &str,
+        aad: &[u8],
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        Self::seal(&self.organization_key(organization_id), plaintext, aad)
+    }
+
+    fn decrypt(
+        &self,
+        organization_id: Uuid,
+        derivation: i16,
+        ciphertext: &[u8],
+        nonce: &[u8],
+        aad: &[u8],
+    ) -> anyhow::Result<String> {
+        Self::open(
+            &self.key_for(organization_id, derivation),
+            ciphertext,
+            nonce,
+            aad,
+        )
+    }
+
+    fn seal(key: &[u8; 32], plaintext: &str, aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
         let mut nonce = [0_u8; 12];
         OsRng.fill_bytes(&mut nonce);
-        let cipher = Aes256Gcm::new_from_slice(&self.key)?;
+        let cipher = Aes256Gcm::new_from_slice(key)?;
         let ciphertext = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
@@ -136,11 +197,11 @@ impl SecretVault {
         Ok((ciphertext, nonce.to_vec()))
     }
 
-    fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<String> {
+    fn open(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<String> {
         if nonce.len() != 12 {
             anyhow::bail!("invalid credential nonce");
         }
-        let cipher = Aes256Gcm::new_from_slice(&self.key)?;
+        let cipher = Aes256Gcm::new_from_slice(key)?;
         let plaintext = cipher
             .decrypt(
                 Nonce::from_slice(nonce),
@@ -153,8 +214,14 @@ impl SecretVault {
         Ok(String::from_utf8(plaintext)?)
     }
 
-    fn recovery_key(&self) -> String {
-        format!("mvrk_{}", URL_SAFE_NO_PAD.encode(self.key))
+    /// The exportable key for one organization. It unlocks that organization's
+    /// credentials and nothing else, so an admin holding it cannot reach a
+    /// co-tenant's secrets.
+    fn recovery_key(&self, organization_id: Uuid) -> String {
+        format!(
+            "mvrk_{}",
+            URL_SAFE_NO_PAD.encode(self.organization_key(organization_id))
+        )
     }
 }
 
@@ -203,7 +270,72 @@ impl ServerClassifierConfig {
     }
 }
 
-pub(crate) async fn run() -> anyhow::Result<()> {
+impl AppState {
+    /// Seals a secret the way the vault did before per-organization key
+    /// derivation, so tests can plant a genuine pre-migration row.
+    #[cfg(test)]
+    pub(crate) fn seal_under_master_key(
+        &self,
+        plaintext: &str,
+        aad: &[u8],
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        SecretVault::seal(&self.vault.key, plaintext, aad)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn credential_aad(
+        organization_id: Uuid,
+        credential_id: &str,
+        version: i32,
+    ) -> String {
+        credential_aad(organization_id, credential_id, version)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decrypt_for_tests(
+        &self,
+        organization_id: Uuid,
+        derivation: i16,
+        ciphertext: &[u8],
+        nonce: &[u8],
+        aad: &[u8],
+    ) -> anyhow::Result<String> {
+        self.vault
+            .decrypt(organization_id, derivation, ciphertext, nonce, aad)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clickhouse_for_tests(&self) -> &clickhouse::Client {
+        &self.clickhouse
+    }
+
+    /// Builds a state around a live Postgres pool for integration tests.
+    ///
+    /// With no ClickHouse URL the client points at an unroutable address on
+    /// purpose: routes that must never reach the analytics store fail loudly
+    /// instead of passing for the wrong reason.
+    #[cfg(test)]
+    pub(crate) fn for_tests(postgres: PgPool, clickhouse: Option<clickhouse::Client>) -> Self {
+        Self {
+            postgres,
+            clickhouse: clickhouse
+                .unwrap_or_else(|| clickhouse::Client::default().with_url("http://127.0.0.1:1")),
+            classifier: None,
+            vault: SecretVault {
+                key: [3_u8; 32],
+                created: false,
+            },
+            login_limiter: LoginAttemptLimiter::default(),
+            rate_limiter: RateLimiter::default(),
+            rate_limits: RateLimits::from_env(),
+            trust_proxy_headers: false,
+            mailer: None,
+            distribution: ClientDistribution::from_env(),
+        }
+    }
+}
+
+pub async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -279,7 +411,29 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     bootstrap_local_user(&state).await?;
     import_default_price_catalog(&state).await?;
     reprice_unknown_history(&state).await?;
+    rewrap_legacy_credentials(&state).await?;
 
+    let app = router(state.clone());
+
+    tokio::spawn(expired_session_reaper(state.postgres.clone()));
+
+    let address: SocketAddr = env::var("METRUNE_API_ADDRESS")
+        .unwrap_or_else(|_| "0.0.0.0:8080".into())
+        .parse()?;
+    tracing::info!(%address, "Metrune API listening");
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Builds the HTTP surface. Kept separate from [`run`] so tests can exercise
+/// routing, authentication and authorization against a state they construct,
+/// without binding a socket or running the boot-time migrations.
+pub(crate) fn router(state: AppState) -> Router {
     let long_running_routes = Router::new()
         .route("/v1/ingest/sessions", post(ingest_sessions))
         .route("/v1/analytics/overview", get(analytics_overview))
@@ -298,7 +452,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             LONG_REQUEST_TIMEOUT,
         ));
 
-    let app = Router::new()
+    Router::new()
         .route("/v1/healthz", get(health))
         .route("/v1/readyz", get(ready))
         .route(
@@ -405,24 +559,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }),
         )
         .layer(PropagateRequestIdLayer::x_request_id())
-        .with_state(state.clone());
-
-    tokio::spawn(expired_session_reaper(state.postgres.clone()));
-
-    let address: SocketAddr = env::var("METRUNE_API_ADDRESS")
-        .unwrap_or_else(|_| "0.0.0.0:8080".into())
-        .parse()?;
-    tracing::info!(%address, "Metrune API listening");
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+        .with_state(state)
 }
 
-async fn ensure_deduplicated_session_table(clickhouse: &clickhouse::Client) -> anyhow::Result<()> {
+pub(crate) async fn ensure_deduplicated_session_table(
+    clickhouse: &clickhouse::Client,
+) -> anyhow::Result<()> {
     clickhouse
         .query(
             "CREATE TABLE IF NOT EXISTS session_snapshots_dedup (
@@ -850,10 +992,10 @@ struct CurrentUserResponse {
     organizations: Vec<OrganizationMembershipResponse>,
 }
 
+/// Charges a failed attempt against the account's budget. `login` rejects an
+/// already-exhausted budget up front, so reaching here means the account still
+/// had attempts left and the caller deserves the generic credential error.
 fn failed_login(state: &AppState, email: &str) -> ApiError {
-    if state.login_limiter.is_limited(email) {
-        return ApiError::too_many_requests("too many login attempts; try again later");
-    }
     state.login_limiter.record_failure(email);
     ApiError::unauthorized("invalid email or password")
 }
@@ -953,6 +1095,15 @@ async fn login(
         .rate_limiter
         .check("login", &address, state.rate_limits.login)?;
     let email = request.email.trim().to_ascii_lowercase();
+    // Refuse the attempt before the account lookup and the Argon2 verification.
+    // Checking the per-account budget only on the failure path would let a
+    // guesser keep spending a password hash per request and still learn a
+    // correct password while nominally "locked out".
+    if state.login_limiter.is_limited(&email) {
+        return Err(ApiError::too_many_requests(
+            "too many login attempts; try again later",
+        ));
+    }
     let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>)>(
         "SELECT u.id, u.email, u.display_name, u.password_hash
          FROM users u
@@ -1087,6 +1238,11 @@ async fn create_organization(
     Json(request): Json<CreateOrganizationRequest>,
 ) -> Result<(StatusCode, Json<CurrentUserResponse>), ApiError> {
     let session = user_session_auth(&state, &headers).await?;
+    state.rate_limiter.check(
+        "organization-create",
+        &format!("user:{}", session.user_id),
+        state.rate_limits.organization_create,
+    )?;
     let name = request.name.trim();
     if name.is_empty() || name.chars().count() > 120 {
         return Err(ApiError::bad_request(
@@ -1190,6 +1346,33 @@ fn provisioned_classifier_material(
     }
 }
 
+const SUPPORTED_PLATFORMS: [&str; 5] = ["linux", "wsl", "windows", "macos", "other"];
+
+/// Installation names are chosen by whoever holds an enrollment secret and are
+/// rendered back to organization admins, so they are bounded at the edge rather
+/// than trusted because the caller authenticated.
+fn validate_installation_name(name: &str) -> Result<&str, ApiError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err(ApiError::bad_request(
+            "installationName must be between 1 and 120 characters",
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "installationName cannot contain control characters",
+        ));
+    }
+    Ok(name)
+}
+
+fn validate_platform(platform: &str) -> Result<&str, ApiError> {
+    if SUPPORTED_PLATFORMS.contains(&platform) {
+        return Ok(platform);
+    }
+    Err(ApiError::bad_request("unsupported platform"))
+}
+
 async fn enroll(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1200,6 +1383,13 @@ async fn enroll(
     state
         .rate_limiter
         .check("enroll", &address, state.rate_limits.enroll)?;
+    let installation_name = validate_installation_name(&request.installation_name)?.to_owned();
+    let requested_platform = request
+        .platform
+        .as_deref()
+        .map(validate_platform)
+        .transpose()?
+        .map(str::to_owned);
     let hash = token_hash(&request.enrollment_token);
     let mut transaction = state.postgres.begin().await?;
     let personal = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, Option<String>, String, Uuid)>(
@@ -1223,12 +1413,12 @@ async fn enroll(
         )
         .bind(installation_id)
         .bind(organization_id)
-        .bind(&request.installation_name)
+        .bind(&installation_name)
         .bind(token_hash(&installation_token))
         .bind(&team_name)
         .bind(team_id)
         .bind(owner_user_id)
-        .bind(request.platform.as_deref().unwrap_or(&platform))
+        .bind(requested_platform.as_deref().unwrap_or(&platform))
         .execute(&mut *transaction)
         .await?;
         sqlx::query("UPDATE enrollment_codes SET redeemed_at = NOW() WHERE id = $1")
@@ -1254,9 +1444,9 @@ async fn enroll(
     let team_key = row.3.clone().or(row.1.clone());
     sqlx::query(
         "INSERT INTO installations(id, organization_id, name, token_hash, team_key, team_id, platform, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())"
-    ).bind(installation_id).bind(row.0).bind(request.installation_name)
+    ).bind(installation_id).bind(row.0).bind(&installation_name)
         .bind(token_hash(&installation_token)).bind(team_key.clone()).bind(row.2)
-        .bind(request.platform.as_deref().unwrap_or("other"))
+        .bind(requested_platform.as_deref().unwrap_or("other"))
         .execute(&state.postgres).await?;
     Ok(Json(EnrollResponse {
         installation_id,
@@ -1899,7 +2089,9 @@ async fn analytics_sessions(
         _ => "ended_at_ms DESC",
     };
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let offset = query.offset.unwrap_or(0);
+    // ClickHouse still scans every row it skips, so an unbounded offset is a
+    // cheap way to make the server do expensive work.
+    let offset = query.offset.unwrap_or(0).min(MAX_SESSION_PAGE_OFFSET);
     let filters = AnalyticsQuery {
         from: query.from,
         to: query.to,
@@ -2376,6 +2568,26 @@ async fn remove_member(
     .bind(organization_id)
     .execute(&mut *transaction)
     .await?;
+    // Dashboard access dies with the membership, but an installation token is
+    // an independent credential: without this the removed member's client keeps
+    // uploading into the organization indefinitely.
+    let revoked_installations = sqlx::query(
+        "UPDATE installations SET revoked_at = NOW()
+         WHERE organization_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(organization_id)
+    .bind(user_id)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "UPDATE enrollment_codes SET redeemed_at = NOW()
+         WHERE organization_id = $1 AND owner_user_id = $2 AND redeemed_at IS NULL",
+    )
+    .bind(organization_id)
+    .bind(user_id)
+    .execute(&mut *transaction)
+    .await?;
     let removed = sqlx::query(
         "DELETE FROM organization_memberships
          WHERE organization_id = $1 AND user_id = $2",
@@ -2395,7 +2607,7 @@ async fn remove_member(
         "member.remove",
         "user",
         user_id.to_string(),
-        serde_json::json!({}),
+        serde_json::json!({"revokedInstallations": revoked_installations}),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
@@ -2850,6 +3062,41 @@ struct ResolvedProviderConfig {
     response_mode: ResponseMode,
 }
 
+/// Returns the `host[:port]` authority of an absolute URL.
+fn url_authority(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    // Userinfo can disguise the real host (`localhost@evil.example`), so an
+    // authority carrying any is refused rather than parsed.
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.rsplit_once(':') {
+        // Only a trailing `:<digits>` is a port; IPv6 literals keep brackets.
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "[::1]"
+    )
+}
+
+/// In managed mode the server itself calls this endpoint, so cleartext is
+/// confined to the loopback interface. The host must be compared exactly: a
+/// `starts_with("http://localhost")` prefix test also accepts
+/// `http://localhost.attacker.example`, which is neither local nor encrypted.
+fn endpoint_transport_is_allowed(endpoint: &str) -> bool {
+    if endpoint.starts_with("https://") {
+        return url_authority(endpoint).is_some_and(|authority| !authority.is_empty());
+    }
+    endpoint.starts_with("http://") && url_authority(endpoint).is_some_and(is_loopback_authority)
+}
+
 fn resolve_provider_config(
     request: &ClassifierSettingsUpdateRequest,
 ) -> Result<ResolvedProviderConfig, ApiError> {
@@ -2887,10 +3134,7 @@ fn resolve_provider_config(
     if model.is_empty() {
         return Err(ApiError::bad_request("model is required"));
     }
-    if !(endpoint.starts_with("https://")
-        || endpoint.starts_with("http://localhost")
-        || endpoint.starts_with("http://127.0.0.1"))
-    {
+    if !endpoint_transport_is_allowed(&endpoint) {
         return Err(ApiError::bad_request(
             "endpoint must use HTTPS, or HTTP on localhost",
         ));
@@ -3074,6 +3318,75 @@ fn credential_aad(organization_id: Uuid, credential_id: &str, version: i32) -> S
     format!("{organization_id}:{credential_id}:{version}")
 }
 
+/// Re-seals credentials written before per-organization key derivation under
+/// their organization's key. Runs once per deployment: after it completes no
+/// stored ciphertext is readable with the master key alone.
+///
+/// A row that fails to decrypt is left alone and reported rather than dropped,
+/// because the master key file may legitimately have been replaced.
+pub(crate) async fn rewrap_legacy_credentials(state: &AppState) -> anyhow::Result<()> {
+    let legacy = sqlx::query_as::<_, (Uuid, Uuid, String, i32, Vec<u8>, Vec<u8>)>(
+        "SELECT id, organization_id, credential_id, version, ciphertext, nonce
+         FROM provider_credentials
+         WHERE key_derivation = $1
+         ORDER BY created_at",
+    )
+    .bind(KEY_DERIVATION_MASTER)
+    .fetch_all(&state.postgres)
+    .await?;
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    let total = legacy.len();
+    let mut rewrapped = 0_usize;
+    let mut failed = 0_usize;
+    for (id, organization_id, credential_id, version, ciphertext, nonce) in legacy {
+        let aad = credential_aad(organization_id, &credential_id, version);
+        let secret = match state.vault.decrypt(
+            organization_id,
+            KEY_DERIVATION_MASTER,
+            &ciphertext,
+            &nonce,
+            aad.as_bytes(),
+        ) {
+            Ok(secret) => secret,
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    credential_id,
+                    %organization_id,
+                    %error,
+                    "leaving a provider credential sealed under the master key; it did not decrypt"
+                );
+                continue;
+            }
+        };
+        let (ciphertext, nonce) = state
+            .vault
+            .encrypt(organization_id, &secret, aad.as_bytes())?;
+        sqlx::query(
+            "UPDATE provider_credentials
+             SET ciphertext = $2, nonce = $3, key_derivation = $4
+             WHERE id = $1 AND key_derivation = $5",
+        )
+        .bind(id)
+        .bind(ciphertext)
+        .bind(nonce)
+        .bind(KEY_DERIVATION_ORGANIZATION)
+        .bind(KEY_DERIVATION_MASTER)
+        .execute(&state.postgres)
+        .await?;
+        rewrapped += 1;
+    }
+    tracing::info!(
+        total,
+        rewrapped,
+        failed,
+        "re-sealed provider credentials under per-organization keys"
+    );
+    Ok(())
+}
+
 async fn active_classifier_credential(
     state: &AppState,
     organization_id: Uuid,
@@ -3082,8 +3395,8 @@ async fn active_classifier_credential(
     if credential_id.is_empty() {
         return Ok((None, None));
     }
-    let stored = sqlx::query_as::<_, (i32, Vec<u8>, Vec<u8>)>(
-        "SELECT version, ciphertext, nonce FROM provider_credentials
+    let stored = sqlx::query_as::<_, (i32, Vec<u8>, Vec<u8>, i16)>(
+        "SELECT version, ciphertext, nonce, key_derivation FROM provider_credentials
          WHERE organization_id = $1 AND credential_id = $2
            AND revoked_at IS NULL AND grace_until IS NULL
          ORDER BY version DESC LIMIT 1",
@@ -3092,12 +3405,18 @@ async fn active_classifier_credential(
     .bind(credential_id)
     .fetch_optional(&state.postgres)
     .await?;
-    let Some((version, ciphertext, nonce)) = stored else {
+    let Some((version, ciphertext, nonce, derivation)) = stored else {
         return Ok((None, None));
     };
     let aad = credential_aad(organization_id, credential_id, version);
     Ok((
-        Some(state.vault.decrypt(&ciphertext, &nonce, aad.as_bytes())?),
+        Some(state.vault.decrypt(
+            organization_id,
+            derivation,
+            &ciphertext,
+            &nonce,
+            aad.as_bytes(),
+        )?),
         Some(version),
     ))
 }
@@ -3196,7 +3515,10 @@ async fn upsert_credential(
     .unwrap_or(0)
         + 1;
     let aad = credential_aad(organization_id, credential_id, version);
-    let (ciphertext, nonce) = state.vault.encrypt(&request.secret, aad.as_bytes())?;
+    let (ciphertext, nonce) =
+        state
+            .vault
+            .encrypt(organization_id, &request.secret, aad.as_bytes())?;
     sqlx::query(
         "UPDATE provider_credentials
          SET grace_until = NOW() + ($3 * INTERVAL '1 hour')
@@ -3213,8 +3535,8 @@ async fn upsert_credential(
     sqlx::query(
         "INSERT INTO provider_credentials(
             id, organization_id, credential_id, provider_id, version,
-            ciphertext, nonce, created_by, created_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            ciphertext, nonce, created_by, created_at, key_derivation
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
     )
     .bind(id)
     .bind(organization_id)
@@ -3225,6 +3547,7 @@ async fn upsert_credential(
     .bind(nonce)
     .bind(user_id)
     .bind(created_at)
+    .bind(KEY_DERIVATION_ORGANIZATION)
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
@@ -3297,24 +3620,37 @@ async fn export_recovery_key(
     let user_id = auth
         .user_id
         .ok_or(ApiError::unauthorized("user session required"))?;
-    let row = sqlx::query_as::<_, (String, Uuid)>(
-        "SELECT password_hash, organization_id FROM users
-         WHERE id = $1 AND disabled_at IS NULL",
+    state.rate_limiter.check(
+        "vault-recovery",
+        &auth.subject,
+        state.rate_limits.vault_recovery,
+    )?;
+    let organization_id = auth.organization_uuid()?;
+    let password_hash = sqlx::query_scalar::<_, String>(
+        "SELECT password_hash FROM users WHERE id = $1 AND disabled_at IS NULL",
     )
     .bind(user_id)
     .fetch_one(&state.postgres)
     .await?;
-    let parsed = PasswordHash::new(&row.0)
-        .map_err(|_| ApiError::unauthorized("password verification failed"))?;
-    Argon2::default()
-        .verify_password(request.password.as_bytes(), &parsed)
-        .map_err(|_| ApiError::unauthorized("password verification failed"))?;
+    let password = request.password.clone();
+    let password_valid = tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&password_hash).is_ok_and(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        })
+    })
+    .await?;
+    if !password_valid {
+        return Err(ApiError::unauthorized("password verification failed"));
+    }
     let inserted = sqlx::query(
-        "INSERT INTO vault_recovery_exports(organization_id, exported_by)
-         VALUES ($1,$2) ON CONFLICT (organization_id) DO NOTHING",
+        "INSERT INTO vault_recovery_exports(organization_id, exported_by, key_derivation)
+         VALUES ($1,$2,$3) ON CONFLICT (organization_id) DO NOTHING",
     )
-    .bind(row.1)
+    .bind(organization_id)
     .bind(user_id)
+    .bind(KEY_DERIVATION_ORGANIZATION)
     .execute(&state.postgres)
     .await?;
     if inserted.rows_affected() == 0 {
@@ -3322,8 +3658,18 @@ async fn export_recovery_key(
             "the recovery key has already been exported",
         ));
     }
+    audit(
+        &state,
+        organization_id,
+        &auth.name,
+        "vault.export_recovery_key",
+        "organization",
+        organization_id.to_string(),
+        serde_json::json!({"scope": "organization"}),
+    )
+    .await;
     Ok(Json(RecoveryResponse {
-        recovery_key: state.vault.recovery_key(),
+        recovery_key: state.vault.recovery_key(organization_id),
     }))
 }
 
@@ -3850,7 +4196,9 @@ async fn my_sessions(
         _ => "ended_at_ms DESC",
     };
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let offset = query.offset.unwrap_or(0);
+    // ClickHouse still scans every row it skips, so an unbounded offset is a
+    // cheap way to make the server do expensive work.
+    let offset = query.offset.unwrap_or(0).min(MAX_SESSION_PAGE_OFFSET);
     let mut sql = format!(
         "SELECT session_key, installation_id, client_id, project_alias, category_id, category_confidence, classification_status, total_tokens, total_cost, ended_at_ms FROM session_snapshots_dedup FINAL{}",
         personal_usage_suffix(query.installation_id.is_some())
@@ -4094,18 +4442,8 @@ async fn create_enrollment_code(
         state.rate_limits.enrollment_code,
     )?;
     let organization_id = auth.organization_uuid()?;
-    let installation_name = request.installation_name.trim();
-    if installation_name.is_empty() || installation_name.chars().count() > 120 {
-        return Err(ApiError::bad_request(
-            "installationName must be between 1 and 120 characters",
-        ));
-    }
-    if !matches!(
-        request.platform.as_str(),
-        "linux" | "wsl" | "windows" | "macos" | "other"
-    ) {
-        return Err(ApiError::bad_request("unsupported platform"));
-    }
+    let installation_name = validate_installation_name(&request.installation_name)?;
+    validate_platform(&request.platform)?;
     if let Some(team_id) = request.team_id {
         let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM teams WHERE id = $1 AND organization_id = $2)",
@@ -4152,25 +4490,117 @@ async fn create_enrollment_code(
 mod tests {
     use super::*;
 
-    #[test]
-    fn credential_vault_uses_authenticated_context() {
-        let vault = SecretVault {
+    fn test_vault() -> SecretVault {
+        SecretVault {
             key: [7_u8; 32],
             created: false,
-        };
+        }
+    }
+
+    #[test]
+    fn credential_vault_uses_authenticated_context() {
+        let vault = test_vault();
+        let organization = Uuid::from_u128(1);
         let (ciphertext, nonce) = vault
-            .encrypt("provider-secret", b"org:credential:1")
+            .encrypt(organization, "provider-secret", b"org:credential:1")
             .expect("encrypt");
         assert_ne!(ciphertext, b"provider-secret");
         assert_eq!(
             vault
-                .decrypt(&ciphertext, &nonce, b"org:credential:1")
+                .decrypt(
+                    organization,
+                    KEY_DERIVATION_ORGANIZATION,
+                    &ciphertext,
+                    &nonce,
+                    b"org:credential:1"
+                )
                 .expect("decrypt"),
             "provider-secret"
         );
         assert!(vault
-            .decrypt(&ciphertext, &nonce, b"other-org:credential:1")
+            .decrypt(
+                organization,
+                KEY_DERIVATION_ORGANIZATION,
+                &ciphertext,
+                &nonce,
+                b"other-org:credential:1"
+            )
             .is_err());
+    }
+
+    #[test]
+    fn one_organization_cannot_decrypt_another_organizations_credential() {
+        let vault = test_vault();
+        let (alpha, beta) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let aad = credential_aad(alpha, "openrouter", 1);
+        let (ciphertext, nonce) = vault
+            .encrypt(alpha, "alpha-secret", aad.as_bytes())
+            .expect("encrypt");
+
+        // The co-tenant's derived key must not open it even with the right AAD.
+        assert!(vault
+            .decrypt(
+                beta,
+                KEY_DERIVATION_ORGANIZATION,
+                &ciphertext,
+                &nonce,
+                aad.as_bytes()
+            )
+            .is_err());
+        // Neither may the deployment master key, which is what the exported
+        // recovery key used to be.
+        assert!(vault
+            .decrypt(
+                alpha,
+                KEY_DERIVATION_MASTER,
+                &ciphertext,
+                &nonce,
+                aad.as_bytes()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn organization_keys_are_distinct_and_are_not_the_master_key() {
+        let vault = test_vault();
+        let alpha = vault.organization_key(Uuid::from_u128(1));
+        let beta = vault.organization_key(Uuid::from_u128(2));
+        assert_ne!(alpha, beta);
+        assert_ne!(alpha, vault.key);
+        // Derivation is deterministic, or a restart would orphan every secret.
+        assert_eq!(alpha, vault.organization_key(Uuid::from_u128(1)));
+    }
+
+    #[test]
+    fn an_exported_recovery_key_is_scoped_to_its_organization() {
+        let vault = test_vault();
+        let alpha = vault.recovery_key(Uuid::from_u128(1));
+        assert!(alpha.starts_with("mvrk_"));
+        assert_ne!(alpha, vault.recovery_key(Uuid::from_u128(2)));
+        // The master key must never leave the deployment.
+        assert_ne!(alpha, format!("mvrk_{}", URL_SAFE_NO_PAD.encode(vault.key)));
+    }
+
+    #[test]
+    fn credentials_sealed_before_derivation_stay_readable() {
+        let vault = test_vault();
+        let organization = Uuid::from_u128(9);
+        let aad = credential_aad(organization, "openrouter", 3);
+        // A pre-migration row: sealed under the master key directly.
+        let (ciphertext, nonce) =
+            SecretVault::seal(&vault.key, "legacy-secret", aad.as_bytes()).expect("seal");
+        assert_eq!(
+            vault
+                .decrypt(
+                    organization,
+                    KEY_DERIVATION_MASTER,
+                    &ciphertext,
+                    &nonce,
+                    aad.as_bytes()
+                )
+                .expect("legacy rows must survive the migration"),
+            "legacy-secret"
+        );
     }
 
     #[test]
@@ -4467,6 +4897,91 @@ mod tests {
             Some("admin")
         )
         .is_ok());
+    }
+
+    #[test]
+    fn installation_names_are_bounded_trimmed_and_printable() {
+        assert_eq!(
+            validate_installation_name("  flo-laptop  ").expect("trimmed name"),
+            "flo-laptop"
+        );
+        assert!(validate_installation_name("   ").is_err());
+        assert!(validate_installation_name(&"a".repeat(120)).is_ok());
+        assert!(validate_installation_name(&"a".repeat(121)).is_err());
+        // Enrollment is reachable by anyone holding a code, and the name is
+        // rendered back to admins.
+        assert!(validate_installation_name("laptop\u{7}\u{1b}[2J").is_err());
+        assert!(validate_installation_name("line\nbreak").is_err());
+    }
+
+    #[test]
+    fn only_known_platforms_are_accepted() {
+        for platform in SUPPORTED_PLATFORMS {
+            assert!(validate_platform(platform).is_ok());
+        }
+        assert!(validate_platform("solaris").is_err());
+        assert!(validate_platform("").is_err());
+        assert!(validate_platform("Linux").is_err());
+    }
+
+    #[test]
+    fn cleartext_classifier_endpoints_are_confined_to_the_loopback_host() {
+        assert!(endpoint_transport_is_allowed(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
+        assert!(endpoint_transport_is_allowed(
+            "http://localhost:11434/v1/chat/completions"
+        ));
+        assert!(endpoint_transport_is_allowed("http://127.0.0.1:1234/v1"));
+        assert!(endpoint_transport_is_allowed("http://[::1]:8080/v1"));
+        assert!(endpoint_transport_is_allowed("http://LocalHost:11434/v1"));
+
+        // A prefix test would accept all of these as "localhost".
+        assert!(!endpoint_transport_is_allowed(
+            "http://localhost.attacker.example/v1"
+        ));
+        assert!(!endpoint_transport_is_allowed(
+            "http://127.0.0.1.attacker.example/v1"
+        ));
+        assert!(!endpoint_transport_is_allowed(
+            "http://localhost@attacker.example/v1"
+        ));
+        assert!(!endpoint_transport_is_allowed(
+            "http://localhost:11434@attacker.example/v1"
+        ));
+
+        assert!(!endpoint_transport_is_allowed("http://10.0.0.5/v1"));
+        assert!(!endpoint_transport_is_allowed(
+            "http://169.254.169.254/latest/meta-data/"
+        ));
+        assert!(!endpoint_transport_is_allowed("ftp://localhost/v1"));
+        assert!(!endpoint_transport_is_allowed("file:///etc/passwd"));
+        assert!(!endpoint_transport_is_allowed("https://"));
+        assert!(!endpoint_transport_is_allowed("not-a-url"));
+    }
+
+    #[test]
+    fn custom_classifier_providers_reject_cleartext_remote_endpoints() {
+        let request = |endpoint: &str| ClassifierSettingsUpdateRequest {
+            enabled: true,
+            execution_mode: ClassifierExecutionMode::Managed,
+            provider_id: "custom".into(),
+            endpoint: endpoint.into(),
+            model: "local-model".into(),
+            credential_id: String::new(),
+            response_mode: None,
+        };
+        assert!(resolve_provider_config(&request("http://localhost:1234/v1")).is_ok());
+        assert!(resolve_provider_config(&request("http://localhost.evil.example/v1")).is_err());
+        assert!(resolve_provider_config(&request("")).is_err());
+    }
+
+    #[test]
+    fn session_pagination_offset_is_capped() {
+        let clamp = |offset: Option<u32>| offset.unwrap_or(0).min(MAX_SESSION_PAGE_OFFSET);
+        assert_eq!(clamp(None), 0);
+        assert_eq!(clamp(Some(250)), 250);
+        assert_eq!(clamp(Some(u32::MAX)), MAX_SESSION_PAGE_OFFSET);
     }
 
     #[test]
