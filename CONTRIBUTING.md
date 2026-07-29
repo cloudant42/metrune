@@ -36,56 +36,53 @@ When you add a route, add it to the table in
 `crates/metrune-api/src/testing/authorization.rs` so it is covered by the
 unauthenticated and forged-token sweeps.
 
-## Sign your commits (DCO)
+## Sign the CLA
 
-Metrune uses the [Developer Certificate of Origin](https://developercertificate.org/),
-the same lightweight mechanism as the Linux kernel and Kubernetes. There is no
-form to sign and no account to create: you certify the
-[DCO](DCO.txt) by adding a `Signed-off-by` line to each commit.
+Metrune uses an Individual Contributor License Agreement. You sign it once, and
+it covers every contribution you make afterwards.
+
+Add yourself to `signatures/cla.json` in your first pull request:
+
+```json
+{
+  "githubUsername": "your-github-username",
+  "name": "Your Full Name",
+  "signedAt": "2026-07-29",
+  "claVersion": "1.0"
+}
+```
+
+That entry, in a commit authored by you, is your signature on [CLA.md](CLA.md).
+It lives in this repository's history rather than with a third-party service.
+CI checks it; you can check first with:
 
 ```bash
-git commit -s -m "Your message"
+scripts/check-cla.py your-github-username
 ```
 
-That appends a trailer built from your git identity:
+You will not be asked again on later pull requests.
 
-```
-Signed-off-by: Your Name <you@example.com>
-```
+### What you are agreeing to
 
-By adding it you are certifying that you wrote the change, or that you have the
-right to submit it under Apache-2.0. The sign-off must match the commit author,
-and every commit in a pull request needs one. CI enforces this.
+You keep the copyright in your work, and you can still use it anywhere else —
+the licence you grant is non-exclusive. What you grant the maintainer is the
+right to distribute your contribution, including under commercial terms
+alongside the open source project.
 
-Forgot? Nothing is lost:
+In exchange, section 7 of the CLA is a binding commitment in the other
+direction: your contribution will remain available under Apache-2.0, or another
+OSI-approved licence, for as long as it is distributed at all. It can be
+included in a paid edition. It cannot be taken out of the open source project.
 
-```bash
-git commit --amend -s --no-edit     # the most recent commit
-git rebase --signoff origin/main    # every commit on your branch
-```
-
-Then force-push the branch. To check before you open the pull request:
-
-```bash
-scripts/check-dco.sh origin/main..HEAD
-```
-
-Merge commits and commits authored by bots are exempt.
-
-### What this does and does not mean
-
-Your contribution is licensed under Apache-2.0, the same license as the rest of
-the project — Apache-2.0 section 5 places inbound contributions under the
-project's own terms, including its patent grant. The DCO transfers no
-copyright, and it does not give the maintainers the right to relicense your
-contribution. Metrune's core is Apache-2.0 and is intended to stay that way.
+That asymmetry is real and worth understanding before you contribute. The
+commitment in section 7 exists so the trade is explicit rather than implied.
 
 ## Before opening a pull request
 
 - Keep raw prompts, source code, outputs, full filesystem paths, and provider
   credentials out of server-bound payloads and fixtures.
 - Add or update Rust, web, or contract tests for behavior changes.
-- Sign off every commit (`git commit -s`); see the DCO section above.
+- Sign the CLA when the bot asks; see the CLA section above.
 - Run `make check` and `git diff --check`.
 - For anything larger than a bug fix, open an issue first so we can agree on
   the approach before you spend time on it.

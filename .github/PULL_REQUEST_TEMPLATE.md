@@ -12,7 +12,7 @@
 - [ ] `make check`
 - [ ] `git diff --check`
 - [ ] Documentation updated
-- [ ] Every commit signed off (`git commit -s`) — see [CONTRIBUTING.md](../CONTRIBUTING.md#sign-your-commits-dco)
+- [ ] CLA signed — see [CONTRIBUTING.md](../CONTRIBUTING.md#sign-the-cla)
 
 ## Migration and rollback
 

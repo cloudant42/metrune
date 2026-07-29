@@ -8,27 +8,23 @@ permissions:
   contents: read
 
 jobs:
-  # Contributions arrive under Apache-2.0 via the license's own section 5; the
-  # sign-off is the contributor's per-commit assertion that they had the right
-  # to submit them. Only a pull request has a well-defined set of new commits,
-  # so this does not run on plain pushes.
-  dco:
+  # Contributors sign the CLA by adding themselves to signatures/cla.json in
+  # their first pull request, so this only has to read a file that is already
+  # in the checkout. No write permission, no `pull_request_target`, and no
+  # third-party service holding signatures.
+  cla:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-          # The check walks base..head, which needs real history rather than
-          # the default single-commit checkout.
-          fetch-depth: 0
-      - name: Verify Developer Certificate of Origin sign-offs
-        # The SHAs go through the environment rather than being interpolated
+      - name: Verify the author has signed the CLA
+        # The login goes through the environment rather than being interpolated
         # into the script, so no workflow expression is expanded by the shell.
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: bash scripts/check-dco.sh "${BASE_SHA}..${HEAD_SHA}"
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: python3 scripts/check-cla.py "$PR_AUTHOR"
 
   rust:
     runs-on: ubuntu-latest
