@@ -10,6 +10,36 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    # The API's authorization rules are SQL predicates, so its HTTP tests need
+    # a real Postgres and ClickHouse. Without these the suite still passes, but
+    # every one of those tests skips itself — which is the same as not having
+    # them.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: metrune
+          POSTGRES_PASSWORD: metrune-test
+          POSTGRES_DB: metrune_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U metrune -d metrune_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8-alpine
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      METRUNE_TEST_DATABASE_URL: postgres://metrune:metrune-test@localhost:5432/metrune_test
+      METRUNE_TEST_CLICKHOUSE_URL: http://localhost:8123
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -23,6 +53,15 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # A skipped integration test is invisible in a green run, so fail loudly
+      # if the databases were not actually reachable.
+      - name: Verify the integration tests were not skipped
+        run: |
+          cargo test -p metrune-api --lib -- --nocapture 2>&1 | tee /tmp/api-tests.log
+          if grep -q "^skipping: set METRUNE_TEST" /tmp/api-tests.log; then
+            echo "::error::integration tests skipped; the service containers were not reachable"
+            exit 1
+          fi
 
   web:
     runs-on: ubuntu-latest
