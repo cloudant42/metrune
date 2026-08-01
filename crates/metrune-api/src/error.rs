@@ -3,6 +3,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use metrune_core::release::{ClientUnsupportedResponse, CLIENT_UNSUPPORTED_ERROR_CODE};
 use sha2::{Digest, Sha256};
 
 pub(crate) fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -21,6 +22,8 @@ pub(crate) fn token_hash(token: &str) -> String {
 pub(crate) struct ApiError {
     pub(crate) status: StatusCode,
     message: String,
+    code: Option<&'static str>,
+    minimum_client_version: Option<String>,
 }
 
 impl ApiError {
@@ -60,10 +63,24 @@ impl ApiError {
         Self::new(StatusCode::TOO_MANY_REQUESTS, message)
     }
 
+    pub(crate) fn client_unsupported(
+        message: impl Into<String>,
+        minimum_client_version: Option<String>,
+    ) -> Self {
+        Self {
+            status: StatusCode::UPGRADE_REQUIRED,
+            message: message.into(),
+            code: Some(CLIENT_UNSUPPORTED_ERROR_CODE),
+            minimum_client_version,
+        }
+    }
+
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
+            code: None,
+            minimum_client_version: None,
         }
     }
 }
@@ -81,10 +98,15 @@ impl<E: std::fmt::Display> From<E> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({"error": self.message})),
-        )
-            .into_response()
+        let body = match self.code {
+            Some(code) => serde_json::to_value(ClientUnsupportedResponse {
+                error: self.message,
+                code: code.into(),
+                minimum_client_version: self.minimum_client_version,
+            })
+            .expect("serialize the compatibility error contract"),
+            None => serde_json::json!({"error": self.message}),
+        };
+        (self.status, Json(body)).into_response()
     }
 }

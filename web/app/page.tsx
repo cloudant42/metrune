@@ -14,14 +14,31 @@ export function DemoBanner() {
   return (
     <div className="banner" role="status">
       <strong>Demo data</strong>
-      <span>The API is unreachable or no dashboard token is configured. Connect it to see live organization usage.</span>
+      <span>Live organization data is not available. Demo fixtures are enabled for this local showcase only.</span>
     </div>
+  );
+}
+
+export function UnavailablePanel({ message = "Live organization data is temporarily unavailable." }: { message?: string }) {
+  return (
+    <section className="panel" aria-labelledby="data-unavailable-title">
+      <div className="panel-header">
+        <div>
+          <p className="eyebrow">Live data unavailable</p>
+          <h2 id="data-unavailable-title">No organization data shown</h2>
+        </div>
+      </div>
+      <div className="panel-body">
+        <p className="onboarding-copy">{message} Check the API connection and try again.</p>
+      </div>
+    </section>
   );
 }
 
 export default async function Home({ searchParams }: PageProps) {
   const params = await toParams(await searchParams);
   const [{ data, source }, facets] = await Promise.all([getOverviewData(params), getFacets(params)]);
+  if (source === "unavailable" || facets.source === "unavailable") return <UnavailablePanel />;
   return (
     <>
       {source === "demo" && <DemoBanner />}

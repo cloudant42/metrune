@@ -51,6 +51,15 @@ async fn an_admin_cannot_mutate_a_team_belonging_to_another_organization() {
     let alpha = harness.workspace("alpha-team").await;
     let beta = harness.workspace("beta-team").await;
     let beta_team = harness.create_team(beta.organization_id, "beta-only").await;
+    let (beta_installation, _) = harness
+        .create_installation(beta.organization_id, Some(beta.admin.user_id))
+        .await;
+    sqlx::query("UPDATE installations SET team_id = $2, team_key = 'beta-only' WHERE id = $1")
+        .bind(beta_installation)
+        .bind(beta_team)
+        .execute(&harness.postgres)
+        .await
+        .expect("assign beta installation");
 
     let (status, _) = harness
         .send(
@@ -78,6 +87,17 @@ async fn an_admin_cannot_mutate_a_team_belonging_to_another_organization() {
         .await
         .expect("the team must still exist");
     assert_eq!(name, "beta-only");
+    let team_key =
+        sqlx::query_scalar::<_, Option<String>>("SELECT team_key FROM installations WHERE id = $1")
+            .bind(beta_installation)
+            .fetch_one(&harness.postgres)
+            .await
+            .expect("the installation must still exist");
+    assert_eq!(
+        team_key.as_deref(),
+        Some("beta-only"),
+        "a cross-tenant delete attempt changed the foreign installation"
+    );
 }
 
 #[tokio::test]

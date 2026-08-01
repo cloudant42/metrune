@@ -3,6 +3,7 @@ pub mod classifier;
 pub mod pricing;
 pub mod release;
 pub mod state;
+pub mod taxonomy;
 
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
@@ -10,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
+pub const LEGACY_SCHEMA_VERSION: &str = "1";
 pub const TAXONOMY_VERSION: &str = "2026-01";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,7 +74,7 @@ pub enum CostKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CategoryId {
     Implementation,
@@ -121,6 +123,27 @@ pub enum ClassificationStatus {
     Failed,
     /// The local adapter did not provide any text to classify.
     NoInput,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassificationMethod {
+    Rule,
+    SemanticModel,
+    Inherited,
+    #[default]
+    None,
+}
+
+impl ClassificationMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::SemanticModel => "semantic_model",
+            Self::Inherited => "inherited",
+            Self::None => "none",
+        }
+    }
 }
 
 impl ClassificationStatus {
@@ -193,11 +216,69 @@ pub struct UsageMessage {
     pub client_version: Option<String>,
     pub provider_id: String,
     pub model_id: String,
+    /// Local-only source session start used to lock schema activation. It is
+    /// never serialized into an upload.
+    pub session_started_at: Option<DateTime<Utc>>,
     pub observed_at: DateTime<Utc>,
     pub tokens: TokenBreakdown,
     pub cost: Cost,
+    /// Local-only stable ordering within the source session.
+    pub turn_sequence: u32,
+    /// Local-only ordering of model activity within a turn.
+    pub activity_sequence: u32,
+    /// Locally observed workflow events. Counts are metadata; raw tool
+    /// arguments, commands and paths are never retained.
+    pub workflow_signals: Vec<WorkflowSignal>,
+    /// Signals the source can meaningfully observe. An absent capability is
+    /// distinct from an observed count of zero.
+    pub signal_capabilities: Vec<WorkflowSignal>,
     /// Local-only text supplied to the classifier. It must never be persisted or uploaded.
     pub classification_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSignal {
+    Read,
+    Searched,
+    Edited,
+    TestsRun,
+    TestsFailed,
+    Planned,
+    Delegated,
+    GitUsed,
+    Built,
+    Deployed,
+}
+
+impl WorkflowSignal {
+    pub const ALL: [Self; 10] = [
+        Self::Read,
+        Self::Searched,
+        Self::Edited,
+        Self::TestsRun,
+        Self::TestsFailed,
+        Self::Planned,
+        Self::Delegated,
+        Self::GitUsed,
+        Self::Built,
+        Self::Deployed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Searched => "searched",
+            Self::Edited => "edited",
+            Self::TestsRun => "tests_run",
+            Self::TestsFailed => "tests_failed",
+            Self::Planned => "planned",
+            Self::Delegated => "delegated",
+            Self::GitUsed => "git_used",
+            Self::Built => "built",
+            Self::Deployed => "deployed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -207,6 +288,88 @@ pub struct UsageSlice {
     pub model_id: String,
     pub tokens: TokenBreakdown,
     pub cost: Cost,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelActivityStep {
+    pub sequence: u32,
+    pub provider_id: String,
+    pub model_id: String,
+    pub tokens: TokenBreakdown,
+    pub cost: Cost,
+    pub call_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalCount {
+    pub signal: WorkflowSignal,
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_step_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSnapshot {
+    pub sequence: u32,
+    pub category: CategoryAssignment,
+    pub classification_method: ClassificationMethod,
+    #[serde(default)]
+    pub classification_cached: bool,
+    pub model_activity: Vec<ModelActivityStep>,
+    pub workflow_signals: Vec<SignalCount>,
+}
+
+impl TurnSnapshot {
+    pub fn total_tokens(&self) -> u64 {
+        self.model_activity
+            .iter()
+            .map(|step| step.tokens.total())
+            .sum()
+    }
+
+    pub fn total_cost(&self) -> f64 {
+        self.model_activity
+            .iter()
+            .map(|step| step.cost.amount)
+            .sum()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalCapability {
+    pub signal: WorkflowSignal,
+    pub supported: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassificationMethodCount {
+    pub method: ClassificationMethod,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageMeasurement {
+    Reported,
+    Estimated,
+    #[default]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierUsage {
+    pub provider_id: String,
+    pub model_id: String,
+    pub tokens: TokenBreakdown,
+    pub cost: Cost,
+    pub request_count: u32,
+    pub measurement: UsageMeasurement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -225,6 +388,18 @@ pub struct SessionSnapshot {
     pub ended_at: DateTime<Utc>,
     pub usage_by_model: Vec<UsageSlice>,
     pub category: CategoryAssignment,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<TurnSnapshot>,
+    #[serde(default)]
+    pub classifier_usage: ClassifierUsage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signal_capabilities: Vec<SignalCapability>,
+    #[serde(default)]
+    pub classified_token_coverage: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classification_method_counts: Vec<ClassificationMethodCount>,
+    #[serde(default)]
+    pub turn_detail_truncated: bool,
     pub source_schema_version: Option<String>,
 }
 
@@ -241,6 +416,20 @@ impl SessionSnapshot {
             .iter()
             .map(|slice| slice.cost.amount)
             .sum()
+    }
+
+    pub fn calculate_classified_token_coverage(&self) -> f64 {
+        let total = self.total_tokens();
+        if total == 0 {
+            return 0.0;
+        }
+        let classified = self
+            .turns
+            .iter()
+            .filter(|turn| turn.category.classification_status == ClassificationStatus::Classified)
+            .map(TurnSnapshot::total_tokens)
+            .sum::<u64>();
+        classified as f64 / total as f64
     }
 }
 
@@ -261,6 +450,16 @@ pub struct IngestAck {
     pub duplicates: usize,
     pub rejected: usize,
     pub errors: Vec<String>,
+    /// Session keys accepted in this response. These are explicit so a
+    /// partially valid batch can be acknowledged without retrying accepted
+    /// rows forever when one malformed snapshot is present.
+    #[serde(default)]
+    pub accepted_session_keys: Vec<String>,
+    /// Session keys rejected as permanently invalid. The CLI quarantines
+    /// these derived snapshots locally and reports the validation errors,
+    /// allowing later queued sessions to upload.
+    #[serde(default)]
+    pub rejected_session_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -362,8 +561,80 @@ pub fn aggregate_session(
         ended_at: last.observed_at,
         usage_by_model: grouped.into_values().collect(),
         category,
+        turns: Vec::new(),
+        classifier_usage: ClassifierUsage::default(),
+        signal_capabilities: Vec::new(),
+        classified_token_coverage: 0.0,
+        classification_method_counts: Vec::new(),
+        turn_detail_truncated: false,
         source_schema_version: None,
     })
+}
+
+pub fn aggregate_session_v2(
+    messages: &[UsageMessage],
+    identity: &IdentityContext,
+    revision: u64,
+    turns: Vec<TurnSnapshot>,
+    classifier_usage: ClassifierUsage,
+) -> Option<SessionSnapshot> {
+    let mut snapshot = aggregate_session(messages, identity, revision, dominant_category(&turns))?;
+    snapshot.schema_version = SCHEMA_VERSION.into();
+    snapshot.turns = turns;
+    snapshot.classifier_usage = classifier_usage;
+    snapshot.classified_token_coverage = snapshot.calculate_classified_token_coverage();
+    let mut methods = BTreeMap::<&'static str, (ClassificationMethod, u32)>::new();
+    for turn in &snapshot.turns {
+        let entry = methods
+            .entry(turn.classification_method.as_str())
+            .or_insert((turn.classification_method, 0));
+        entry.1 = entry.1.saturating_add(1);
+    }
+    snapshot.classification_method_counts = methods
+        .into_values()
+        .map(|(method, count)| ClassificationMethodCount { method, count })
+        .collect();
+    let supported = messages
+        .iter()
+        .flat_map(|message| message.signal_capabilities.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>();
+    snapshot.signal_capabilities = WorkflowSignal::ALL
+        .into_iter()
+        .map(|signal| SignalCapability {
+            signal,
+            supported: supported.contains(&signal),
+        })
+        .collect();
+    if serde_json::to_vec(&snapshot.turns).is_ok_and(|encoded| encoded.len() > 512 * 1024) {
+        snapshot.turns.clear();
+        snapshot.turn_detail_truncated = true;
+    }
+    Some(snapshot)
+}
+
+fn dominant_category(turns: &[TurnSnapshot]) -> CategoryAssignment {
+    let mut weighted: BTreeMap<&'static str, (u64, CategoryAssignment)> = BTreeMap::new();
+    for turn in turns
+        .iter()
+        .filter(|turn| turn.category.classification_status == ClassificationStatus::Classified)
+    {
+        let entry = weighted
+            .entry(turn.category.category_id.as_str())
+            .or_insert((0, turn.category.clone()));
+        entry.0 = entry.0.saturating_add(turn.total_tokens());
+        if turn.category.confidence > entry.1.confidence {
+            entry.1 = turn.category.clone();
+        }
+    }
+    weighted
+        .into_values()
+        .max_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.confidence.total_cmp(&right.1.confidence))
+        })
+        .map(|(_, assignment)| assignment)
+        .unwrap_or_default()
 }
 
 /// Derive the same opaque session identity when the same local CLI history is

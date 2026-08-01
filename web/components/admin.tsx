@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import type { AdminData } from "@/lib/api";
 import type { ClassifierSettings, Installation, Invitation, Member, OrgSettings, ProviderCredential, Team } from "@/lib/api";
-import { formatTime } from "@/lib/format";
+import { formatDate, formatTime } from "@/lib/format";
 
 const tabs = [
   { id: "members", label: "Members" },
@@ -25,7 +25,7 @@ export function AdminTabs({ data, initialTab }: { data: AdminData; initialTab?: 
           </button>
         ))}
       </nav>
-      {active === "members" && <MembersPanel members={data.members} invitations={data.invitations} />}
+      {active === "members" && <MembersPanel members={data.members} invitations={data.invitations} settings={data.settings} />}
       {active === "teams" && (
         <div className="admin-grid teams-grid">
           <TeamsPanel teams={data.teams} />
@@ -35,7 +35,7 @@ export function AdminTabs({ data, initialTab }: { data: AdminData; initialTab?: 
       {active === "classifier" && (
         <div className="stack">
           <ClassifierPanel classifier={data.classifier} credentials={data.credentials} />
-          <CredentialsPanel credentials={data.credentials} />
+          <CredentialsPanel credentials={data.credentials} settings={data.settings} />
         </div>
       )}
       {active === "organization" && (
@@ -66,7 +66,7 @@ async function send(path: string, method: string, body?: unknown): Promise<strin
   return payload.error ?? `Request failed with ${response.status}`;
 }
 
-export function MembersPanel({ members, invitations }: { members: Member[]; invitations: Invitation[] }) {
+export function MembersPanel({ members, invitations, settings }: { members: Member[]; invitations: Invitation[]; settings: OrgSettings }) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -128,7 +128,11 @@ export function MembersPanel({ members, invitations }: { members: Member[]; invi
         </form>
       </div>
       {error && <p className="form-error" role="alert">{error}</p>}
-      <p className="panel-note">Invitations are emailed as expiring, single-use links. Existing accounts sign in before accepting; new users choose their own password.</p>
+      <p className="panel-note">
+        {settings.ssoEnforced
+          ? "Invitations are expiring and single-use. New members accept the invitation, then sign in through the configured identity provider."
+          : "Invitations are expiring and single-use. Existing accounts sign in before accepting; new users choose their own password."}
+      </p>
       <div className="table-scroll">
         <table>
           <thead><tr><th>Member</th><th>Email</th><th>Role</th><th className="actions-col">Actions</th></tr></thead>
@@ -286,7 +290,7 @@ export function InstallationsPanel({ installations, teams }: { installations: In
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="table-scroll">
         <table>
-          <thead><tr><th>Name</th><th>Team</th><th>Last seen</th><th>Enrolled</th></tr></thead>
+          <thead><tr><th>Name</th><th>Team</th><th>Client version</th><th>Last seen</th><th>Enrolled</th></tr></thead>
           <tbody>
             {visible.map(installation => (
               <tr key={installation.id} className={installation.revoked ? "muted-row" : undefined}>
@@ -302,11 +306,12 @@ export function InstallationsPanel({ installations, teams }: { installations: In
                     {teams.map(team => <option key={team.id} value={team.id}>{team.name}</option>)}
                   </select>
                 </td>
+                <td>{installation.lastClientVersion ?? "Not reported"}</td>
                 <td>{installation.lastSeenAt ? formatTime(Date.parse(installation.lastSeenAt)) : "Never"}</td>
-                <td>{new Date(installation.createdAt).toLocaleDateString("en", { month: "short", day: "numeric" })}</td>
+                <td>{formatDate(Date.parse(installation.createdAt))}</td>
               </tr>
             ))}
-            {visible.length === 0 && <tr><td colSpan={4} className="empty">No active installations.</td></tr>}
+            {visible.length === 0 && <tr><td colSpan={5} className="empty">No active installations.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -371,16 +376,16 @@ export function IdentityPanel({ settings }: { settings: OrgSettings }) {
         </div>
         <div className="identity-row">
           <span>SSO enforcement</span>
-          <span className={`badge ${settings.ssoEnforced ? "ok" : ""}`}>{settings.ssoEnforced ? "enforced" : "off"}</span>
+          <span className={`badge ${settings.ssoEnforced ? "ok" : ""}`}>{settings.ssoEnforced ? "enforced" : "not configured"}</span>
         </div>
         <div className="identity-row">
-          <span>OIDC providers (Entra ID, Okta, Keycloak)</span>
-          <span className="badge">none connected</span>
+          <span>OIDC sign-in (Entra ID, Okta, Keycloak)</span>
+          <span className={`badge ${settings.ssoEnforced ? "ok" : ""}`}>{settings.ssoEnforced ? "enabled" : "not configured"}</span>
         </div>
         <p className="panel-note">
-          Local password sign-in is active and stays available for easy setup. It is disabled automatically
-          for an organization once SSO is enforced. OIDC connections (Entra ID, Okta, Keycloak) and SCIM
-          provisioning build on the provisioned identity schema in the next milestone.
+          {settings.ssoEnforced
+            ? "OIDC is configured for this deployment. All browser and client-enrollment approvals require single sign-on; local passwords and password recovery are disabled."
+            : "No identity provider is configured. Local password sign-in and password recovery remain available."}
         </p>
       </div>
     </section>
@@ -567,13 +572,14 @@ export function ClassifierPanel({ classifier, credentials }: { classifier: Class
   );
 }
 
-export function CredentialsPanel({ credentials }: { credentials: ProviderCredential[] }) {
+export function CredentialsPanel({ credentials, settings }: { credentials: ProviderCredential[]; settings: OrgSettings }) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
   const [showRecovery, setShowRecovery] = useState(false);
   const [recoveryPassword, setRecoveryPassword] = useState("");
+  const [reauthRequired, setReauthRequired] = useState(false);
   const [busy, setBusy] = useState(false);
 
   async function save(event: FormEvent<HTMLFormElement>) {
@@ -605,15 +611,19 @@ export function CredentialsPanel({ credentials }: { credentials: ProviderCredent
   }
 
   async function exportRecovery() {
-    if (!recoveryPassword) return;
+    if (settings.localLoginEnabled && !recoveryPassword) return;
     setError(null);
+    setReauthRequired(false);
     const response = await fetch("/api/admin/vault/recovery", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password: recoveryPassword }),
+      body: JSON.stringify(settings.localLoginEnabled ? { password: recoveryPassword } : {}),
     });
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) setError(payload.error ?? "Could not export recovery key.");
+    if (!response.ok) {
+      setError(payload.error ?? "Could not export recovery key.");
+      setReauthRequired(response.status === 401 && settings.ssoEnforced);
+    }
     else {
       setRecoveryKey(payload.recoveryKey);
       setShowRecovery(false);
@@ -630,15 +640,26 @@ export function CredentialsPanel({ credentials }: { credentials: ProviderCredent
       <div className="panel-body">
         {showRecovery && !recoveryKey && (
           <form className="recovery-form" onSubmit={(event) => { event.preventDefault(); void exportRecovery(); }}>
-            <label className="field">
-              <span>Confirm your password</span>
-              <input type="password" autoComplete="current-password" value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} required autoFocus />
-              <small>This unlocks only this workspace&apos;s provider credentials. It is shown once — store it outside this server.</small>
-            </label>
+            {settings.localLoginEnabled ? (
+              <label className="field">
+                <span>Confirm your password</span>
+                <input type="password" autoComplete="current-password" value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} required autoFocus />
+                <small>This unlocks only this workspace&apos;s provider credentials. It is shown once — store it outside this server.</small>
+              </label>
+            ) : (
+              <p className="panel-note">
+                A single sign-on completed within the last 10 minutes is required. The recovery key is shown once.
+              </p>
+            )}
             <div className="form-actions">
               <button className="btn" type="submit">Show recovery key</button>
               <button className="btn ghost" type="button" onClick={() => { setShowRecovery(false); setRecoveryPassword(""); }}>Cancel</button>
             </div>
+            {reauthRequired && (
+              <a className="btn ghost" href="/api/auth/sso/start?next=%2Fadmin%3Ftab%3Dclassifier">
+                Sign in again
+              </a>
+            )}
           </form>
         )}
         <form className="settings-form" onSubmit={save}>

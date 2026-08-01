@@ -10,8 +10,12 @@ for this repository: open the repository's **Security** tab, choose
 **Advisories**, and select **Report a vulnerability**. This URL-independent
 flow stays valid even if the repository is renamed or moved.
 
-Private vulnerability reporting must be enabled before the repository is made
-public. Do not open a public issue as a substitute.
+Do not open a public issue as a substitute.
+
+If the advisory flow is unavailable to you, email <cloudant42@gmail.com> with
+"metrune security" in the subject and no sensitive detail in the body; a
+maintainer will move the report into a private advisory. The advisory flow is
+preferred, because it keeps the report, the fix, and any CVE together.
 
 Include the affected version or commit, deployment mode, reproduction steps,
 impact, and a minimal proof of concept. Redact tokens, provider keys, prompts,
@@ -23,7 +27,7 @@ can vary while the project is pre-release.
 
 ## Supported versions
 
-During the production beta, only the latest beta release is
+During the production beta, only the latest production-beta release is
 security-supported. Linux x86_64 is the supported client/server platform;
 Windows and macOS client artifacts are experimental. See the README support
 matrix and release notes for version-specific exceptions.

@@ -5,11 +5,13 @@
 //! whole server. [`app::run`] is what the binary calls.
 
 pub mod app;
+mod device_auth;
 mod distribution;
 mod error;
 mod identity;
 mod limits;
 mod mailer;
+mod oidc;
 
 #[cfg(test)]
 mod testing;

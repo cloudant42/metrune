@@ -6,7 +6,7 @@ operator or privacy impact.
 
 ## Development setup
 
-Install Rust stable, Node.js 20+, and Docker Compose. From the repository root:
+Install Rust stable, Node.js 24+, and Docker Compose. From the repository root:
 
 ```bash
 cargo test --workspace
@@ -82,7 +82,8 @@ commitment in section 7 exists so the trade is explicit rather than implied.
 - Keep raw prompts, source code, outputs, full filesystem paths, and provider
   credentials out of server-bound payloads and fixtures.
 - Add or update Rust, web, or contract tests for behavior changes.
-- Sign the CLA when the bot asks; see the CLA section above.
+- Sign the CLA in your first pull request; see the CLA section above. A CI job
+  checks it — there is no third-party bot involved.
 - Run `make check` and `git diff --check`.
 - For anything larger than a bug fix, open an issue first so we can agree on
   the approach before you spend time on it.

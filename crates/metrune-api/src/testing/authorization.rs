@@ -71,6 +71,16 @@ fn protected_routes() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             "/v1/me/enrollment-codes",
             json!({"installationName": "laptop", "platform": "linux"}),
         ),
+        (
+            "POST",
+            "/v1/oauth/device/verification",
+            json!({"userCode": "ABCD-2345"}),
+        ),
+        (
+            "POST",
+            "/v1/oauth/device/approval",
+            json!({"userCode": "ABCD-2345", "decision": "approve"}),
+        ),
     ]
 }
 
@@ -230,8 +240,22 @@ async fn a_malformed_authorization_header_is_not_mistaken_for_a_token() {
 }
 
 #[tokio::test]
-async fn health_and_readiness_stay_open() {
+async fn health_readiness_and_server_info_stay_open() {
     let harness = harness!();
     let (status, _) = harness.get("/v1/healthz", None).await;
     assert_eq!(status, StatusCode::OK);
+    let (status, info) = harness.get("/v1/server/info", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        info["serverVersion"].as_str(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        info["supportedSchemaVersions"],
+        json!([
+            metrune_core::LEGACY_SCHEMA_VERSION,
+            metrune_core::SCHEMA_VERSION
+        ])
+    );
+    assert!(info["minimumClientVersion"].is_null());
 }

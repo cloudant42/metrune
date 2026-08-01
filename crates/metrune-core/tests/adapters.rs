@@ -15,7 +15,8 @@ fn test_root() -> std::path::PathBuf {
 fn parses_claude_and_codex_jsonl_without_persisting_content() {
     let root = test_root();
     let claude_path = root.join("claude.jsonl");
-    fs::write(&claude_path, r#"{"id":"m1","session_id":"s1","role":"assistant","model":"claude-sonnet-4-5","provider":"anthropic","timestamp":"2026-07-22T10:00:00Z","usage":{"input_tokens":120,"output_tokens":45},"content":"private implementation detail"}
+    fs::write(&claude_path, r#"{"id":"u1","session_id":"s1","role":"user","timestamp":"2026-07-22T09:59:00Z","content":"private implementation detail"}
+{"id":"m1","session_id":"s1","role":"assistant","model":"claude-sonnet-4-5","provider":"anthropic","timestamp":"2026-07-22T10:00:00Z","usage":{"input_tokens":120,"output_tokens":45},"content":"private response"}
 "#).unwrap();
     let claude = ClaudeAdapter.parse(&claude_path).unwrap();
     assert_eq!(claude.len(), 1);
@@ -31,6 +32,40 @@ fn parses_claude_and_codex_jsonl_without_persisting_content() {
     let codex = CodexAdapter.parse(&codex_path).unwrap();
     assert_eq!(codex.len(), 1);
     assert_eq!(codex[0].tokens.total(), 140);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_turn_usage_uses_cumulative_deltas_and_handles_counter_resets() {
+    let root = test_root();
+    let path = root.join("codex-deltas.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session_meta","payload":{"session_id":"delta-session","model_provider":"openai"}}
+{"type":"turn_context","payload":{"model":"gpt-5-codex"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"investigate this"}]}}
+{"type":"event_msg","timestamp":"2026-07-22T10:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20}}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}}
+{"type":"event_msg","timestamp":"2026-07-22T10:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":145,"output_tokens":30}}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"new process"}]}}
+{"type":"event_msg","timestamp":"2026-07-22T10:02:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":8,"output_tokens":2}}}}
+"#,
+    )
+    .unwrap();
+    let messages = CodexAdapter.parse(&path).unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].tokens.input, 100);
+    assert_eq!(messages[1].tokens.input, 45);
+    assert_eq!(messages[2].tokens.input, 8);
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.tokens.total())
+            .sum::<u64>(),
+        185
+    );
+    assert_eq!(messages[0].turn_sequence, 1);
+    assert_eq!(messages[2].turn_sequence, 3);
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -1,18 +1,17 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { FilterBar } from "@/components/filters";
 import {
   getCurrentUser,
-  getFacets,
   getMyInstallations,
   getMySessions,
   getMyUsage,
-  getOrgSessions,
   type PageParams,
   type Session,
   type SessionsResult,
 } from "@/lib/api";
 import { formatCompact, formatMoney, formatTime, label } from "@/lib/format";
-import { DemoBanner, toParams } from "../page";
+import { UnavailablePanel, toParams } from "../page";
 
 type PageProps = { searchParams: Promise<Record<string, string | string[] | undefined>> };
 
@@ -23,6 +22,15 @@ function buildHref(params: PageParams, patch: Record<string, string | undefined>
   return text ? `/sessions?${text}` : "/sessions";
 }
 
+function exportHref(params: PageParams): string {
+  const query = new URLSearchParams();
+  for (const key of ["range", "team", "project", "category", "client", "status", "workflow"] as const) {
+    if (params[key]) query.set(key, params[key] as string);
+  }
+  const text = query.toString();
+  return text ? `/api/export?${text}` : "/api/export";
+}
+
 const sortable = new Set(["ended", "cost", "tokens", "category"]);
 
 export default async function SessionsPage({ searchParams }: PageProps) {
@@ -30,18 +38,20 @@ export default async function SessionsPage({ searchParams }: PageProps) {
   const sort = sortable.has(params.sort ?? "") ? (params.sort as string) : "ended";
   const page = Math.max(0, Number.parseInt(params.page ?? "0", 10) || 0);
   const user = await getCurrentUser();
+  if (!user) redirect(`/login?next=${encodeURIComponent("/sessions")}`);
+  if (!user.organizationId) redirect(`/organizations?next=${encodeURIComponent("/sessions")}`);
 
-  if (user) {
+  {
     const [result, installations, usage] = await Promise.all([
       getMySessions(params, page, sort),
       getMyInstallations(),
       getMyUsage(),
     ]);
+    if (result.kind === "unavailable" || result.kind === "unauthorized") return <UnavailablePanel />;
     const installationNames = new Map(installations.map(item => [item.id, item.name]));
     const selectedInstallation = params.installation ? installationNames.get(params.installation) : undefined;
     return (
       <>
-        {result.kind === "unavailable" && <DemoBanner />}
         <form className="filter-bar" aria-label="Filter my sessions">
           <label>
             <span>Date range</span>
@@ -89,7 +99,7 @@ export default async function SessionsPage({ searchParams }: PageProps) {
           </label>
           <div className="filter-actions">
             <button type="submit" className="btn">Apply</button>
-            <a className="btn ghost" href="/sessions">Reset</a>
+            <Link className="btn ghost" href="/sessions">Reset</Link>
           </div>
         </form>
         <SessionTable
@@ -100,43 +110,11 @@ export default async function SessionsPage({ searchParams }: PageProps) {
           eyebrow="Sessions from your own enrolled clients"
           title={selectedInstallation ? `My sessions · ${selectedInstallation}` : "My sessions"}
           installationNames={installationNames}
+          showExport={user.role === "admin" || user.role === "analyst"}
         />
       </>
     );
   }
-
-  const [result, facets] = await Promise.all([getOrgSessions(params, page, sort), getFacets(params)]);
-  if (result.kind === "forbidden") {
-    return (
-      <section className="panel" aria-labelledby="sessions-unavailable-title">
-        <div className="panel-header">
-          <div><p className="eyebrow">Only analysts and admins can drill into sessions</p><h2 id="sessions-unavailable-title">Sessions are private</h2></div>
-        </div>
-        <div className="panel-body">
-          <p className="onboarding-copy">
-            Session-level drilldown is only available to analyst and admin service tokens.
-            Signed-in members can review their own sessions after signing in — organization analytics stay aggregated
-            and never expose another person&apos;s sessions.
-          </p>
-        </div>
-      </section>
-    );
-  }
-  return (
-    <>
-      {result.kind === "unavailable" && <DemoBanner />}
-      <FilterBar params={params} facets={facets.data} />
-      <SessionTable
-        result={result}
-        params={params}
-        sort={sort}
-        page={page}
-        eyebrow="Pseudonymous identities, no prompt content"
-        title="Classified sessions"
-        showExport
-      />
-    </>
-  );
 }
 
 function SessionTable({
@@ -169,7 +147,7 @@ function SessionTable({
     <section className="panel" aria-label={title}>
       <div className="panel-header">
         <div><p className="eyebrow">{eyebrow}</p><h2>{title}</h2></div>
-        {showExport && <a className="btn ghost" href="/api/export">Export CSV</a>}
+        {showExport && <a className="btn ghost" href={exportHref(params)} title="Exports all matching sessions up to 10,000 rows">Export CSV (up to 10k)</a>}
       </div>
       <div className="table-scroll">
         <table>
@@ -189,7 +167,7 @@ function SessionTable({
           <tbody>
             {sessions.map(session => (
               <tr key={`${session.sessionKey}-${session.endedAtMs}`}>
-                <td><code>{session.sessionKey.slice(0, 8)}</code></td>
+                <td><Link href={`/sessions/${encodeURIComponent(session.sessionKey)}`} className="session-link"><code>{session.sessionKey.slice(0, 8)}</code><span className="sr-only"> Open session timeline</span></Link></td>
                 {installationNames && <td>{installationNames.get(session.installationId) ?? "Unknown"}</td>}
                 <td>{session.projectAlias || "Unassigned"}</td>
                 <td><span className="client-badge">{session.clientId}</span></td>

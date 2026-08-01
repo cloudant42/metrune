@@ -12,7 +12,6 @@ services:
       retries: 20
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./migrations/postgres:/docker-entrypoint-initdb.d:ro
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8-alpine
@@ -41,7 +40,18 @@ services:
       CLICKHOUSE_USER: metrune
       CLICKHOUSE_PASSWORD: metrune-dev
       METRUNE_ENV: development
-      METRUNE_PUBLIC_API_URL: http://localhost:8080
+      METRUNE_PUBLIC_API_URL: ${METRUNE_PUBLIC_API_URL:-http://localhost:8080}
+      METRUNE_PUBLIC_WEB_URL: ${METRUNE_PUBLIC_WEB_URL:-http://localhost:3001}
+      METRUNE_MINIMUM_CLIENT_VERSION: ${METRUNE_MINIMUM_CLIENT_VERSION:-}
+      METRUNE_OIDC_ISSUER_URL: ${METRUNE_OIDC_ISSUER_URL:-}
+      METRUNE_OIDC_CLIENT_ID: ${METRUNE_OIDC_CLIENT_ID:-}
+      # Direct client secrets are accepted only in development.
+      METRUNE_OIDC_CLIENT_SECRET: ${METRUNE_OIDC_CLIENT_SECRET:-}
+      METRUNE_OIDC_PROVIDER_NAME: ${METRUNE_OIDC_PROVIDER_NAME:-Single sign-on}
+      METRUNE_OIDC_PROVISIONING: ${METRUNE_OIDC_PROVISIONING:-none}
+      METRUNE_OIDC_DEFAULT_ORGANIZATION: ${METRUNE_OIDC_DEFAULT_ORGANIZATION:-}
+      METRUNE_OIDC_DEFAULT_ROLE: ${METRUNE_OIDC_DEFAULT_ROLE:-viewer}
+      METRUNE_OIDC_SESSION_TTL_HOURS: ${METRUNE_OIDC_SESSION_TTL_HOURS:-12}
       # `local` provisions client-side inference. `managed` proxies bounded
       # semantic text through this API without returning the provider key.
       METRUNE_CLASSIFIER_EXECUTION_MODE: ${METRUNE_CLASSIFIER_EXECUTION_MODE:-local}
@@ -61,7 +71,7 @@ services:
       METRUNE_SECRETS_KEY_FILE: /var/lib/metrune/secrets/master.key
       RUST_LOG: metrune_api=info,tower_http=info
     ports:
-      - "8080:8080"
+      - "${METRUNE_API_PORT:-8080}:8080"
     volumes:
       - metrune-secrets:/var/lib/metrune/secrets
     depends_on:
@@ -76,10 +86,11 @@ services:
       METRUNE_ENV: development
       METRUNE_API_URL: http://api:8080
       METRUNE_DASHBOARD_TOKEN: met_dashboard_dev
-      METRUNE_PUBLIC_API_URL: http://localhost:8080
-      METRUNE_CLIENT_RELEASE_BASE_URL: http://localhost:8080/v1/downloads
+      METRUNE_ENABLE_DEMO_DATA: ${METRUNE_ENABLE_DEMO_DATA:-0}
+      METRUNE_PUBLIC_API_URL: ${METRUNE_PUBLIC_API_URL:-http://localhost:8080}
+      METRUNE_CLIENT_RELEASE_BASE_URL: ${METRUNE_CLIENT_RELEASE_BASE_URL:-http://localhost:8080/v1/downloads}
     ports:
-      - "3001:3000"
+      - "${METRUNE_WEB_PORT:-3001}:3000"
     depends_on:
       - api
 

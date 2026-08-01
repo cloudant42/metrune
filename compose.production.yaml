@@ -16,7 +16,6 @@ services:
       retries: 20
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./migrations/postgres:/docker-entrypoint-initdb.d:ro
     networks: [data]
     security_opt: [no-new-privileges:true]
     stop_grace_period: 60s
@@ -55,6 +54,18 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set}
       METRUNE_ENV: production
       METRUNE_PUBLIC_API_URL: ${METRUNE_PUBLIC_API_URL:?METRUNE_PUBLIC_API_URL must be an HTTPS URL}
+      METRUNE_PUBLIC_WEB_URL: ${METRUNE_PUBLIC_WEB_URL:?METRUNE_PUBLIC_WEB_URL must be an HTTPS URL}
+      METRUNE_MINIMUM_CLIENT_VERSION: ${METRUNE_MINIMUM_CLIENT_VERSION:-}
+      METRUNE_RELEASE_PUBKEY: ${METRUNE_RELEASE_PUBKEY:?METRUNE_RELEASE_PUBKEY must be set to the release public key}
+      METRUNE_CLIENT_RELEASE_DIR: ${METRUNE_CLIENT_RELEASE_DIR:?METRUNE_CLIENT_RELEASE_DIR must point at the signed client release directory}
+      METRUNE_OIDC_ISSUER_URL: ${METRUNE_OIDC_ISSUER_URL:-}
+      METRUNE_OIDC_CLIENT_ID: ${METRUNE_OIDC_CLIENT_ID:-}
+      METRUNE_OIDC_CLIENT_SECRET_FILE: ${METRUNE_OIDC_CLIENT_SECRET_FILE:-}
+      METRUNE_OIDC_PROVIDER_NAME: ${METRUNE_OIDC_PROVIDER_NAME:-Single sign-on}
+      METRUNE_OIDC_PROVISIONING: ${METRUNE_OIDC_PROVISIONING:-none}
+      METRUNE_OIDC_DEFAULT_ORGANIZATION: ${METRUNE_OIDC_DEFAULT_ORGANIZATION:-}
+      METRUNE_OIDC_DEFAULT_ROLE: ${METRUNE_OIDC_DEFAULT_ROLE:-viewer}
+      METRUNE_OIDC_SESSION_TTL_HOURS: ${METRUNE_OIDC_SESSION_TTL_HOURS:-12}
       METRUNE_BOOTSTRAP_EMAIL: ${METRUNE_BOOTSTRAP_EMAIL:-}
       METRUNE_BOOTSTRAP_PASSWORD: ${METRUNE_BOOTSTRAP_PASSWORD:-}
       METRUNE_BOOTSTRAP_ORGANIZATION: ${METRUNE_BOOTSTRAP_ORGANIZATION:-Metrune Workspace}
@@ -64,8 +75,8 @@ services:
       # Client mirror. The image ships a manifest covering its own Linux client;
       # mount a directory holding the release's client-manifest.json and the
       # binaries to mirror every platform, including in air-gapped networks.
-      METRUNE_CLIENT_DOWNLOAD_DIR: ${METRUNE_CLIENT_DOWNLOAD_DIR:-/usr/share/metrune/downloads}
-      METRUNE_TRUST_PROXY_HEADERS: ${METRUNE_TRUST_PROXY_HEADERS:-true}
+      METRUNE_CLIENT_DOWNLOAD_DIR: /usr/share/metrune/downloads
+      METRUNE_TRUST_PROXY_HEADERS: ${METRUNE_TRUST_PROXY_HEADERS:-false}
       METRUNE_SMTP_HOST: ${METRUNE_SMTP_HOST:?METRUNE_SMTP_HOST must be set}
       METRUNE_SMTP_PORT: ${METRUNE_SMTP_PORT:?METRUNE_SMTP_PORT must be set}
       METRUNE_SMTP_USERNAME: ${METRUNE_SMTP_USERNAME:?METRUNE_SMTP_USERNAME must be set}
@@ -77,6 +88,19 @@ services:
       - "127.0.0.1:${METRUNE_API_PORT:-8080}:8080"
     volumes:
       - metrune-secrets:/var/lib/metrune/secrets
+      # The manifest and binaries must come from the signed release bundle,
+      # never from the unsigned source artifact baked into the image.
+      - type: bind
+        source: ${METRUNE_CLIENT_RELEASE_DIR:?METRUNE_CLIENT_RELEASE_DIR must point at the signed client release directory}
+        target: /usr/share/metrune/downloads
+        read_only: true
+      # /dev/null makes the mount inert for password-only deployments. An SSO
+      # deployment points the host variable at a private mode-0600 file and
+      # sets METRUNE_OIDC_CLIENT_SECRET_FILE to this container target.
+      - type: bind
+        source: ${METRUNE_OIDC_CLIENT_SECRET_HOST_FILE:-/dev/null}
+        target: /run/secrets/metrune-oidc-client-secret
+        read_only: true
     networks: [app, data, egress]
     depends_on:
       postgres: { condition: service_healthy }
@@ -101,6 +125,7 @@ services:
       METRUNE_ENV: production
       METRUNE_API_URL: http://api:8080
       METRUNE_DASHBOARD_TOKEN: ""
+      METRUNE_ENABLE_DEMO_DATA: "0"
       METRUNE_PUBLIC_API_URL: ${METRUNE_PUBLIC_API_URL:?METRUNE_PUBLIC_API_URL must be an HTTPS URL}
       METRUNE_CLIENT_RELEASE_BASE_URL: ${METRUNE_CLIENT_RELEASE_BASE_URL:-}
     ports:

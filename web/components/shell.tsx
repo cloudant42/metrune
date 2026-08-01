@@ -177,7 +177,8 @@ export function Shell({
     || pathname.startsWith("/organizations")
     || pathname.startsWith("/accept-invite")
     || pathname.startsWith("/forgot-password")
-    || pathname.startsWith("/reset-password");
+    || pathname.startsWith("/reset-password")
+    || pathname.startsWith("/device");
   const selectionRequired = Boolean(userName) && !organizationId
     && !authFlow;
   useEffect(() => {
@@ -185,9 +186,15 @@ export function Shell({
   }, [router, selectionRequired]);
   if (authFlow) return <>{children}</>;
   if (selectionRequired) return <div className="loading-shell"><div className="loading-heading" /></div>;
-  const heading = titles[pathname] ?? titles["/"];
-  const canDrillDown = role === "admin" || role === "analyst" || role === undefined;
-  const canAdmin = role === "admin" || role === undefined;
+  const heading = titles[pathname]
+    ?? Object.entries(titles)
+      .filter(([href]) => href !== "/" && pathname.startsWith(`${href}/`))
+      .sort(([left], [right]) => right.length - left.length)[0]?.[1]
+    ?? titles["/"];
+  // An absent role means there is no verified active membership. Treat it as
+  // least privilege even in development; the API remains the final guard.
+  const canDrillDown = role === "admin" || role === "analyst";
+  const canAdmin = role === "admin";
   return (
     <div className="shell">
       <a className="skip-link" href="#main-content">Skip to content</a>

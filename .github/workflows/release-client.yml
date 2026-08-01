@@ -2,13 +2,28 @@ name: Release client
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["client-v*"]
 
 permissions:
   contents: read
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Wait for the release commit's CI and security checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/verify-release-checks.py
+
   build:
+    needs: gate
     strategy:
       matrix:
         include:
@@ -42,14 +57,27 @@ jobs:
       - name: Build the client
         env:
           # Pinned into the binary so `metrune update` only installs manifests
-          # signed by the Metrune release key. Absent on forks, which produce a
-          # client that reports updates but refuses to self-install them.
+          # signed by the Metrune release key. Release builds fail closed when
+          # the repository variable has not been configured.
           METRUNE_RELEASE_PUBKEY: ${{ vars.METRUNE_RELEASE_PUBKEY }}
-        run: cargo build --release -p metrune --target "${{ matrix.target }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${METRUNE_RELEASE_PUBKEY}" || {
+            echo "METRUNE_RELEASE_PUBKEY must be configured for release builds" >&2
+            exit 1
+          }
+          package_id="$(cargo pkgid -p metrune)"
+          package_version="${package_id##*@}"
+          bash scripts/check-release-version.sh client "${GITHUB_REF_NAME}" "${package_version}" >/dev/null
+          cargo build --locked --release -p metrune --target "${{ matrix.target }}"
       - name: Smoke-test the native binary
         shell: bash
         run: |
-          "${{ matrix.source }}" --version
+          version="$("${{ matrix.source }}" --version 2>/dev/null)"
+          echo "$version"
+          expected="${GITHUB_REF_NAME#client-v}"
+          grep -F "${expected}" <<<"$version"
           "${{ matrix.source }}" --help
       - name: Name release artifact
         shell: bash
@@ -67,16 +95,39 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
+      # The release job disables setup-node's package cache explicitly. Keep
+      # this scoped ignore because zizmor cannot distinguish that from its
+      # cache-enabled form on tag-triggered publishing workflows.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # zizmor: ignore[cache-poisoning]
+        with:
+          node-version: 24
+          cache: ''
+      - name: Verify the committed third-party notices
+        run: |
+          set -euo pipefail
+          npm ci --omit=dev --omit=optional --prefix web
+          python3 scripts/generate-notices.py --output /tmp/metrune-NOTICE
+          cmp -s NOTICE /tmp/metrune-NOTICE || {
+            echo "NOTICE is stale; run make notices and commit the generated file" >&2
+            diff -u NOTICE /tmp/metrune-NOTICE || true
+            exit 1
+          }
+          cp NOTICE artifacts/NOTICE
       - name: Generate checksums and release manifest
         shell: bash
         run: |
           sha256sum artifacts/metrune-* > artifacts/SHA256SUMS
+          client_version="${GITHUB_REF_NAME#client-v}"
           cat > artifacts/RELEASE_MANIFEST.txt <<EOF
-          version: ${GITHUB_REF_NAME}
+          version: ${client_version}
+          tag: ${GITHUB_REF_NAME}
           commit: ${GITHUB_SHA}
           clients:
             - artifact: metrune-linux-x86_64
@@ -95,18 +146,30 @@ jobs:
       - name: Build the machine-readable client manifest
         shell: bash
         env:
-          # Absent on forks and on releases cut before a key was provisioned;
-          # the manifest is then published unsigned and clients that pin a key
-          # refuse to auto-install from it.
+          # Releases fail closed until the signing key and explicit version
+          # floor are configured; a publishable client manifest is always
+          # signed and verifiable by clients that pin the public key.
           METRUNE_RELEASE_SIGNING_KEY: ${{ secrets.METRUNE_RELEASE_SIGNING_KEY }}
           MINIMUM_CLIENT_VERSION: ${{ vars.MINIMUM_CLIENT_VERSION }}
         run: |
+          set -euo pipefail
+          test -n "${METRUNE_RELEASE_SIGNING_KEY}" || {
+            echo "METRUNE_RELEASE_SIGNING_KEY must be configured for release builds" >&2
+            exit 1
+          }
+          test -n "${MINIMUM_CLIENT_VERSION}" || {
+            echo "MINIMUM_CLIENT_VERSION must be configured explicitly" >&2
+            exit 1
+          }
+          client_version="${GITHUB_REF_NAME#client-v}"
+          minimum_version="${MINIMUM_CLIENT_VERSION#v}"
+          bash scripts/check-release-version.sh client "client-v${minimum_version}" "${minimum_version}" >/dev/null
           # Generated by the released binary itself, so the manifest can never
           # drift from the format this version's `metrune update` parses.
           chmod +x artifacts/metrune-linux-x86_64
           (cd artifacts && ./metrune-linux-x86_64 release manifest \
-            --version "${GITHUB_REF_NAME}" \
-            --minimum-version "${MINIMUM_CLIENT_VERSION:-${GITHUB_REF_NAME}}" \
+            --version "${client_version}" \
+            --minimum-version "${minimum_version}" \
             --checksums SHA256SUMS \
             --upstream-base-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" \
             --output client-manifest.json)

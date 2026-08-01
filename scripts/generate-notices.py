@@ -204,9 +204,10 @@ def build() -> str:
         "file implements.",
         "",
         "The npm section reflects the packages installed on the machine that",
-        "generated it. npm resolves platform-specific binaries (for example",
-        "`@img/sharp-libvips-*`), so regenerate on Linux x86_64 to match the",
-        "published container images.",
+        "generated it. Generate with `make notices`, which installs with",
+        "--omit=dev --omit=optional so the section matches what the runner image",
+        "actually ships: dev tooling is not distributed, and the optional sharp",
+        "image optimizer is excluded because the dashboard uses no next/image.",
         "",
     ]
 

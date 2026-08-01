@@ -1,6 +1,6 @@
 [package]
 name = "metrune"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,6 +16,7 @@ chrono.workspace = true
 clap.workspace = true
 dialoguer.workspace = true
 flate2.workspace = true
+hmac.workspace = true
 hex.workspace = true
 keyring.workspace = true
 metrune-core = { path = "../metrune-core" }

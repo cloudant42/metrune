@@ -111,15 +111,7 @@ impl Harness {
     }
 
     pub(crate) async fn request(&self, request: Request<Body>) -> (StatusCode, serde_json::Value) {
-        // Routes that rate-limit by client address extract `ConnectInfo`, which
-        // is only populated by `into_make_service_with_connect_info`. Without
-        // this the extractor fails and every such route answers 500.
-        let peer = SocketAddr::from(([127, 0, 0, 1], 54321));
-        let response: Response<Body> = router(self.state.clone())
-            .layer(MockConnectInfo(peer))
-            .oneshot(request)
-            .await
-            .expect("route the request");
+        let response = self.raw_response(request).await;
         let status = response.status();
         let bytes = response
             .into_body()
@@ -133,6 +125,18 @@ impl Harness {
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
         };
         (status, body)
+    }
+
+    pub(crate) async fn raw_response(&self, request: Request<Body>) -> Response<Body> {
+        // Routes that rate-limit by client address extract `ConnectInfo`, which
+        // is only populated by `into_make_service_with_connect_info`. Without
+        // this the extractor fails and every such route answers 500.
+        let peer = SocketAddr::from(([127, 0, 0, 1], 54321));
+        router(self.state.clone())
+            .layer(MockConnectInfo(peer))
+            .oneshot(request)
+            .await
+            .expect("route the request")
     }
 
     pub(crate) async fn get(
@@ -152,6 +156,55 @@ impl Harness {
     ) -> (StatusCode, serde_json::Value) {
         self.request(self.build(method, path, token, Some(body)))
             .await
+    }
+
+    pub(crate) async fn send_client(
+        &self,
+        path: &str,
+        token: &str,
+        client_version: Option<&str>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = self.build("POST", path, Some(token), Some(body));
+        if let Some(version) = client_version {
+            request.headers_mut().insert(
+                metrune_core::release::CLIENT_VERSION_HEADER,
+                version.parse().expect("valid client-version header"),
+            );
+        }
+        self.request(request).await
+    }
+
+    pub(crate) async fn send_form(
+        &self,
+        path: &str,
+        body: impl Into<String>,
+    ) -> (StatusCode, serde_json::Value) {
+        self.request(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body.into()))
+                .expect("build a form request"),
+        )
+        .await
+    }
+
+    pub(crate) async fn raw_form_response(
+        &self,
+        path: &str,
+        body: impl Into<String>,
+    ) -> Response<Body> {
+        self.raw_response(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body.into()))
+                .expect("build a form request"),
+        )
+        .await
     }
 
     fn build(
@@ -402,6 +455,12 @@ pub(crate) fn snapshot(session_key: &str, user_key: &str) -> metrune_core::Sessi
             },
         }],
         category: CategoryAssignment::default(),
+        turns: vec![],
+        classifier_usage: Default::default(),
+        signal_capabilities: vec![],
+        classified_token_coverage: 0.0,
+        classification_method_counts: vec![],
+        turn_detail_truncated: false,
         source_schema_version: None,
     }
 }

@@ -10,6 +10,58 @@ export type Overview = {
 export type TimeseriesPoint = { bucket: string; tokens: number; cost: number; sessions: number };
 export type Breakdown = { dimension: string; tokens: number; cost: number; sessions: number };
 export type CategoryModelBreakdown = { category: string; model: string; tokens: number; cost: number; sessions: number };
+export type WorkflowModelBreakdown = { signal: string; model: string; count: number; tokens: number; cost: number; sessions: number };
+export type ClassificationOverhead = {
+  provider: string;
+  model: string;
+  measurement: "reported" | "estimated" | "unavailable";
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  reasoningTokens: number;
+  requests: number;
+};
+export type TokenBreakdown = { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number };
+export type Cost = { amount: number; currency: string; kind: string };
+export type CategoryAssignment = {
+  categoryId: string;
+  confidence: number;
+  taxonomyVersion: string;
+  classifierId: string;
+  classificationStatus: string;
+};
+export type SessionDetail = {
+  schemaVersion: string;
+  sessionKey: string;
+  clientId: string;
+  projectAlias?: string | null;
+  category: CategoryAssignment;
+  classifierUsage: {
+    providerId: string;
+    modelId: string;
+    tokens: TokenBreakdown;
+    cost: Cost;
+    requestCount: number;
+    measurement: string;
+  };
+  signalCapabilities: { signal: string; supported: boolean }[];
+  turnDetailTruncated: boolean;
+  turns: {
+    sequence: number;
+    category: CategoryAssignment;
+    classificationMethod: "rule" | "semantic_model" | "inherited" | "none";
+    classificationCached: boolean;
+    workflowSignals: { signal: string; count: number; modelStepIndex?: number }[];
+    modelActivity: {
+      sequence: number;
+      providerId: string;
+      modelId: string;
+      tokens: TokenBreakdown;
+      cost: Cost;
+      callCount: number;
+    }[];
+  }[];
+};
 export type Session = {
   sessionKey: string;
   installationId: string;
@@ -32,6 +84,7 @@ export type Installation = {
   teamName: string | null;
   createdAt: string;
   lastSeenAt: string | null;
+  lastClientVersion: string | null;
   revoked: boolean;
 };
 export type OrgSettings = {
@@ -95,6 +148,7 @@ export type MyInstallation = {
   teamName: string | null;
   createdAt: string;
   lastSeenAt: string | null;
+  lastClientVersion: string | null;
   revoked: boolean;
 };
 export type MyUsage = {
@@ -126,7 +180,7 @@ export type Price = {
   updatedAt: string;
 };
 
-export type Source = "live" | "demo";
+export type Source = "live" | "demo" | "unavailable";
 export type Result<T> = { data: T; source: Source };
 
 const base = () => process.env.METRUNE_API_URL ?? "http://localhost:8080";
@@ -208,15 +262,11 @@ export async function getProfileData(installationId?: string): Promise<{
   user: CurrentUser;
   usage: MyUsage;
   installations: MyInstallation[];
-  teams: Team[];
 } | null> {
   const user = await getCurrentUser();
   if (!user) return null;
   try {
-    const [installations, teams] = await Promise.all([
-      api<MyInstallation[]>("/v1/me/installations"),
-      api<Team[]>("/v1/org/teams"),
-    ]);
+    const installations = await api<MyInstallation[]>("/v1/me/installations");
     const ownedInstallation = installationId
       ? installations.some(item => item.id === installationId)
       : false;
@@ -224,9 +274,17 @@ export async function getProfileData(installationId?: string): Promise<{
       ? new URLSearchParams({ installationId: installationId as string }).toString()
       : "";
     const usage = await api<MyUsage>("/v1/me/usage", usageQuery);
-    return { user, usage, installations, teams };
+    return { user, usage, installations };
   } catch {
     return null;
+  }
+}
+
+export async function getTeams(): Promise<Team[]> {
+  try {
+    return await api<Team[]>("/v1/org/teams");
+  } catch {
+    return [];
   }
 }
 
@@ -258,7 +316,7 @@ export type PageParams = Record<string, string | undefined>;
 
 export function resolveQuery(params: PageParams): URLSearchParams {
   const query = new URLSearchParams();
-  for (const key of ["team", "project", "category", "client", "status"]) {
+  for (const key of ["team", "project", "category", "client", "status", "workflow"]) {
     if (params[key]) query.set(key, params[key] as string);
   }
   const days = Number.parseInt(params.range ?? "30", 10);
@@ -271,11 +329,26 @@ export function resolveQuery(params: PageParams): URLSearchParams {
   return query;
 }
 
+async function demoFallbackAllowed(): Promise<boolean> {
+  // Demo fixtures are useful for an explicitly enabled local showcase, but a
+  // failed authenticated request must never turn into plausible-looking
+  // organization data. Production always fails closed, and a signed-in
+  // browser session never receives demo values even when a developer enabled
+  // the showcase mode.
+  if (process.env.METRUNE_ENV === "production" || process.env.METRUNE_ENABLE_DEMO_DATA !== "1") {
+    return false;
+  }
+  const store = await cookies();
+  return !store.get("metrune_session")?.value;
+}
+
 async function withFallback<T>(live: () => Promise<T>, demo: T): Promise<Result<T>> {
   try {
     return { data: await live(), source: "live" };
   } catch {
-    return { data: demo, source: "demo" };
+    return (await demoFallbackAllowed())
+      ? { data: demo, source: "demo" }
+      : { data: demo, source: "unavailable" };
   }
 }
 
@@ -312,6 +385,7 @@ export async function getUsageBreakdown(params: PageParams, dimension: string): 
 export type SessionsResult =
   | { kind: "live"; sessions: Session[]; hasMore: boolean; page: number }
   | { kind: "forbidden" }
+  | { kind: "unauthorized" }
   | { kind: "unavailable" };
 
 async function fetchSessions(path: string, query: URLSearchParams, page: number, pageSize: number): Promise<SessionsResult> {
@@ -321,6 +395,7 @@ async function fetchSessions(path: string, query: URLSearchParams, page: number,
     const rows = await api<Session[]>(path, query.toString());
     return { kind: "live", sessions: rows.slice(0, pageSize), hasMore: rows.length > pageSize, page };
   } catch (error) {
+    if (error instanceof Error && /\b401\b/.test(error.message)) return { kind: "unauthorized" };
     if (error instanceof Error && /\b403\b/.test(error.message)) return { kind: "forbidden" };
     return { kind: "unavailable" };
   }
@@ -339,20 +414,35 @@ export async function getMySessions(params: PageParams, page: number, sort: stri
   return fetchSessions("/v1/me/sessions", query, page, pageSize);
 }
 
-export type ModelsData = { categoryModels: CategoryModelBreakdown[]; providers: Breakdown[] };
+export type ModelsData = {
+  categoryModels: CategoryModelBreakdown[];
+  workflowModels: WorkflowModelBreakdown[];
+  classificationOverhead: ClassificationOverhead[];
+  providers: Breakdown[];
+};
 
 export async function getModelsData(params: PageParams): Promise<Result<ModelsData>> {
   const query = resolveQuery(params).toString();
   return withFallback(
     async () => {
-      const [categoryModels, providers] = await Promise.all([
+      const [categoryModels, workflowModels, classificationOverhead, providers] = await Promise.all([
         api<CategoryModelBreakdown[]>("/v1/analytics/category-model", query),
+        api<WorkflowModelBreakdown[]>("/v1/analytics/workflow-model", query),
+        api<ClassificationOverhead[]>("/v1/analytics/classification-overhead", query),
         api<Breakdown[]>("/v1/analytics/breakdowns", `${query}&dimension=provider`),
       ]);
-      return { categoryModels, providers };
+      return { categoryModels, workflowModels, classificationOverhead, providers };
     },
     demo.modelsData,
   );
+}
+
+export async function getSessionDetail(sessionKey: string): Promise<SessionDetail | null> {
+  try {
+    return await api<SessionDetail>(`/v1/analytics/sessions/${encodeURIComponent(sessionKey)}`);
+  } catch {
+    return null;
+  }
 }
 
 export async function getFacets(params: PageParams): Promise<Result<Facets>> {
@@ -446,6 +536,13 @@ const demo = {
       { category: "debugging", model: "openai/gpt-5-codex", tokens: 1500000, cost: 78.41, sessions: 68 },
       { category: "research", model: "google/gemini-2.5-pro", tokens: 1251440, cost: 66.21, sessions: 61 },
     ] as CategoryModelBreakdown[],
+    workflowModels: [
+      { signal: "edited", model: "openai/gpt-5-codex", count: 142, tokens: 2100000, cost: 112.44, sessions: 72 },
+      { signal: "searched", model: "anthropic/claude-sonnet-4", count: 118, tokens: 1750000, cost: 103.21, sessions: 64 },
+    ] as WorkflowModelBreakdown[],
+    classificationOverhead: [
+      { provider: "openai-compatible", model: "small-classifier", measurement: "reported", inputTokens: 88200, outputTokens: 9100, cacheReadTokens: 12400, reasoningTokens: 0, requests: 84 },
+    ] as ClassificationOverhead[],
     providers: [
       { dimension: "anthropic", tokens: 6831020, cost: 401.37, sessions: 302 },
       { dimension: "openai", tokens: 5087110, cost: 273.28, sessions: 239 },
@@ -464,8 +561,8 @@ const demo = {
       { id: "t2", name: "platform", installations: 4, createdAt: "2026-07-05T00:00:00Z" },
     ] as Team[],
     installations: [
-      { id: "i1", name: "dev-workstation-01", teamId: "t1", teamName: "engineering", createdAt: "2026-07-01T00:00:00Z", lastSeenAt: "2026-07-22T12:00:00Z", revoked: false },
-      { id: "i2", name: "ci-runner-03", teamId: null, teamName: null, createdAt: "2026-07-03T00:00:00Z", lastSeenAt: null, revoked: false },
+      { id: "i1", name: "dev-workstation-01", teamId: "t1", teamName: "engineering", createdAt: "2026-07-01T00:00:00Z", lastSeenAt: "2026-07-22T12:00:00Z", lastClientVersion: "0.1.0", revoked: false },
+      { id: "i2", name: "ci-runner-03", teamId: null, teamName: null, createdAt: "2026-07-03T00:00:00Z", lastSeenAt: null, lastClientVersion: null, revoked: false },
     ] as Installation[],
     settings: { organizationName: "Acme Engineering", retentionDays: 365, ssoEnforced: false, localLoginEnabled: true } as OrgSettings,
     members: [] as Member[],

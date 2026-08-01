@@ -3,6 +3,11 @@
 How the `metrune` client reaches a developer machine, and what makes the bytes
 that land there trustworthy.
 
+Client release tags and server/client compatibility are defined in
+[VERSIONING.md](VERSIONING.md). Every operating-system artifact in a client
+release is attached to one `client-vX.Y.Z` tag; server releases use their own
+`server-vX.Y.Z` tags.
+
 ## The split
 
 The GitHub release is **canonical**. It is what CI builds, checksums, attests
@@ -19,13 +24,15 @@ without moving the trust anchor.
 | Builds the artifacts | yes | never |
 | Signs the manifest | yes | never |
 | Serves artifacts | yes | when mirrored |
-| Decides the fleet's version floor | no | yes, via the manifest it publishes |
+| Relays the signed published minimum | publishes it | yes, via `minimumVersion` |
+| Enforces an upload floor | not applicable | yes, via `METRUNE_MINIMUM_CLIENT_VERSION` |
 | Works air-gapped | no | yes |
 
-Enterprises are expected to keep deploying the client through their normal
-endpoint-management tooling (Intune, Jamf, apt/rpm repositories, winget,
-Homebrew). Those pull from the canonical release; the mirror exists for
-developers installing by hand and for networks with no egress.
+The production beta does not require endpoint-management infrastructure.
+Developers can install and update by hand from their Metrune server. An
+organization can later distribute the same canonical artifacts through Intune,
+Jamf, apt/rpm repositories, winget, Homebrew, or similar tooling without
+changing the trust model.
 
 ## The manifest
 
@@ -35,10 +42,10 @@ it as an asset; a server serves it at `GET /v1/client/manifest`.
 ```json
 {
   "schemaVersion": 1,
-  "version": "v0.3.0",
-  "minimumVersion": "v0.2.0",
+  "version": "0.1.0",
+  "minimumVersion": "0.1.0",
   "releasedAt": "2026-07-28T10:00:00Z",
-  "upstreamBaseUrl": "https://github.com/metrune/metrune/releases/download/v0.3.0",
+  "upstreamBaseUrl": "https://github.com/cloudant42/metrune/releases/download/client-v0.1.0",
   "artifacts": [
     {
       "target": "linux-x86_64",
@@ -78,13 +85,15 @@ backdoored client to its own developers.
 |---|---|---|
 | Repository secret | `METRUNE_RELEASE_SIGNING_KEY` | base64 ed25519 private key, 32 bytes |
 | Repository variable | `METRUNE_RELEASE_PUBKEY` | matching base64 public key |
-| Repository variable | `MINIMUM_CLIENT_VERSION` | version floor published in the manifest |
+| Repository variable | `MINIMUM_CLIENT_VERSION` | signed minimum published in the manifest |
+| Server environment | `METRUNE_MINIMUM_CLIENT_VERSION` | optional minimum enforced by ingest |
 
 `METRUNE_RELEASE_PUBKEY` is compiled into the client. A build without it still
 reports available versions but refuses to self-install unless the operator
-passes `--allow-unsigned`. Rotating the key means publishing a release built
-with the new public key **before** signing with the new private key, or older
-clients will reject the manifest.
+passes `--allow-unsigned`; a build with a pinned key never bypasses a signature
+mismatch. Rotating the key means publishing a release built with the new public
+key **before** signing with the new private key, or older clients will reject
+the manifest.
 
 Generate a pair with any ed25519 tool; the signing step prints the matching
 public key so it can be pinned:
@@ -107,18 +116,25 @@ instead of failing.
 | `METRUNE_CLIENT_MANIFEST_PATH` | `<download dir>/client-manifest.json` | Manifest location, if it lives elsewhere |
 | `METRUNE_CLIENT_RELEASE_BASE_URL` | `<server>/v1/downloads` | Where the web app links downloads |
 
-The API image ships a manifest covering the Linux client built into it, so a
-fresh deployment mirrors one platform with no setup. To mirror everything:
+The API image ships a source-built Linux client and an unsigned
+`0.0.0-source` manifest, so a fresh development deployment can install and
+exercise one platform. Its example upstream URL is pinned to the explicit
+`client-v0.1.0` line rather than a moving `latest` release. It is not a
+canonical release: a client compiled with a pinned release public key will
+refuse to self-install it unless explicitly given `--allow-unsigned`.
+Production deployments must mount the canonical signed manifest and matching
+release artifacts. To mirror everything:
 
 ```
 mkdir -p /srv/metrune/downloads && cd /srv/metrune/downloads
-base=https://github.com/metrune/metrune/releases/download/v0.3.0
+base=https://github.com/cloudant42/metrune/releases/download/client-v0.1.0
 curl -fsSLO "$base/client-manifest.json"
+curl -fsSLO "$base/SHA256SUMS"
 for artifact in metrune-linux-x86_64 metrune-macos-arm64 \
                 metrune-macos-x86_64 metrune-windows-x86_64.exe; do
   curl -fsSLO "$base/$artifact"
 done
-sha256sum -c SHA256SUMS   # after fetching SHA256SUMS from the same release
+sha256sum -c SHA256SUMS
 ```
 
 Mount that directory as `METRUNE_CLIENT_DOWNLOAD_DIR`. For an air-gapped
@@ -140,6 +156,13 @@ installs to `/usr/local/bin` (override with `METRUNE_INSTALL_DIR`). Windows has
 no shell installer; download the `.exe` from the release or the mirror and check
 it against `SHA256SUMS`.
 
+The rendered shell helper is enabled only when the server has a configured
+release public key and verifies the manifest signature before rendering. It
+also verifies the downloaded bytes against the signed digest. A missing key or
+signature disables the endpoint; `--allow-unsigned` is not an installer
+override. For a hostile-server or high-assurance bootstrap, fetch the canonical
+manifest and verify it independently with the pinned release public key.
+
 ## Updating
 
 ```
@@ -153,15 +176,41 @@ publish, and the client never has to reach GitHub. It verifies the manifest
 signature against the pinned release key, verifies the downloaded artifact
 against the signed digest, and replaces the running executable atomically.
 
-The client reports when it is below `minimumVersion` so a developer sees the
-floor before uploads start being refused. See
-[RELEASING.md](RELEASING.md#client-compatibility) for the grace period that
-applies before a floor is enforced.
+`upload` and `watch` perform a lightweight, best-effort check at most once per
+24 hours. When the signed manifest publishes a newer client, or the server
+reports a higher minimum, the CLI prints one line to stderr with
+`metrune update` instructions. Set `METRUNE_NO_UPDATE_CHECK=1` to suppress this
+check in CI or another managed environment. The check never downloads,
+installs, replaces, or restarts anything.
+
+Every request to Metrune carries `X-Metrune-Client-Version` and a
+`metrune/<version>` user agent. A successful authenticated upload stores the
+reported version on the installation, and administrators can inspect the fleet
+on the Installations page before changing a floor.
+
+When `METRUNE_MINIMUM_CLIENT_VERSION` is set, ingest answers an older or
+unversioned client with HTTP 426 and the structured code `client_unsupported`.
+Unsupported upload schemas produce the same terminal response. The CLI exits
+instead of retrying that batch, prints the required minimum and update command,
+and leaves every snapshot queued. After the user runs `metrune update`, a new
+upload retries the preserved data.
+
+The manifest's `MINIMUM_CLIENT_VERSION` and the server's enforced
+`METRUNE_MINIMUM_CLIENT_VERSION` are separate rollout controls. Publish the new
+minimum first so clients receive a warning, deploy a server that accepts the
+old and new schemas, observe installation telemetry, and only then raise the
+server floor. Keep the two values equal once the rollout closes.
+
+The repository's tag-triggered release workflow defines Linux x86-64, Windows
+x86-64, Intel macOS, and Apple Silicon macOS artifacts. At the 2026-08-01
+verification point the remote had no tags, so no real release execution,
+signature, repository variable, or cross-platform artifact could be confirmed.
 
 ## Endpoints
 
 | Route | Auth | Purpose |
 |---|---|---|
+| `GET /v1/server/info` | none | Server version, accepted schema versions, and enforced minimum client version |
 | `GET /v1/client/manifest` | none | The release manifest, with mirrored artifacts rewritten to this server |
 | `GET /v1/client/install.sh` | none | Installer rendered from the manifest |
 | `GET /v1/downloads/{artifact}` | none | A mirrored artifact, served only when it matches the signed digest |

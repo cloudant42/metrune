@@ -26,7 +26,13 @@ PROJECT="${METRUNE_DRILL_PROJECT:-metrune-restore-drill}"
 # development deployment.
 export METRUNE_DRILL_API_PORT="${METRUNE_DRILL_API_PORT:-18080}"
 API_URL="${METRUNE_DRILL_API_URL:-http://localhost:$METRUNE_DRILL_API_PORT}"
-BACKUP_DIR="${METRUNE_DRILL_BACKUP_DIR:-$(mktemp -d)}"
+if [[ -n "${METRUNE_DRILL_BACKUP_DIR:-}" ]]; then
+  BACKUP_DIR="$METRUNE_DRILL_BACKUP_DIR"
+  BACKUP_DIR_IS_TEMP=0
+else
+  BACKUP_DIR="$(mktemp -d)"
+  BACKUP_DIR_IS_TEMP=1
+fi
 ADMIN_EMAIL="admin@test.com"
 ADMIN_PASSWORD="admin"
 CREDENTIAL_ID="drill-classifier"
@@ -47,7 +53,10 @@ cleanup() {
     return
   fi
   step "Tearing down the drill deployment"
-  compose down -v --remove-orphans >/dev/null 2>&1 || true
+  compose down -v --rmi local --remove-orphans >/dev/null 2>&1 || true
+  if [[ "$BACKUP_DIR_IS_TEMP" == "1" ]]; then
+    rm -rf "$BACKUP_DIR"
+  fi
 }
 trap cleanup EXIT
 

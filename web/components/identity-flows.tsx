@@ -28,7 +28,13 @@ function fragmentToken(storageKey: string): string {
   return fromFragment || sessionStorage.getItem(storageKey) || "";
 }
 
-export function AcceptInvitationForm() {
+export function AcceptInvitationForm({
+  ssoEnabled,
+  authConfigurationAvailable,
+}: {
+  ssoEnabled: boolean;
+  authConfigurationAvailable: boolean;
+}) {
   const router = useRouter();
   const [token, setToken] = useState("");
   const [invitation, setInvitation] = useState<InvitationInspection | null>(null);
@@ -37,6 +43,9 @@ export function AcceptInvitationForm() {
 
   useEffect(() => {
     const value = fragmentToken("metrune_invite_token");
+    // The token lives in the URL fragment, which is never sent to the server and
+    // is unreadable until after mount, so this cannot move into render.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setToken(value);
     if (!value) {
       setError("This invitation link is missing its secure token.");
@@ -87,6 +96,12 @@ export function AcceptInvitationForm() {
     await accept({ displayName: form.get("displayName"), password });
   }
 
+  async function createSsoAccount(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    await accept({ displayName: form.get("displayName") });
+  }
+
   return (
     <section className="auth-card">
       <AuthHeading title="Accept invitation" eyebrow="Workspace invitation" />
@@ -104,6 +119,23 @@ export function AcceptInvitationForm() {
                 {busy ? "Accepting…" : "Accept invitation"}
               </button>
             </div>
+          ) : !authConfigurationAvailable ? (
+            <p className="form-error auth-error" role="alert">
+              Sign-in settings could not be loaded. Check the Metrune API and try again.
+            </p>
+          ) : ssoEnabled ? (
+            <form className="auth-fields" onSubmit={createSsoAccount}>
+              <p className="auth-note">
+                Accept the invitation, then sign in through your organization’s identity provider.
+              </p>
+              <label className="field">
+                <span>Display name <small>(optional)</small></span>
+                <input name="displayName" autoComplete="name" maxLength={120} />
+              </label>
+              <button className="btn auth-submit" type="submit" disabled={busy}>
+                {busy ? "Accepting…" : "Accept invitation"}
+              </button>
+            </form>
           ) : (
             <form className="auth-fields" onSubmit={createAccount}>
               <label className="field">
@@ -188,6 +220,9 @@ export function ResetPasswordForm() {
 
   useEffect(() => {
     const value = fragmentToken("metrune_reset_token");
+    // The token lives in the URL fragment, which is never sent to the server and
+    // is unreadable until after mount, so this cannot move into render.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setToken(value);
     if (!value) setError("This reset link is missing its secure token.");
   }, []);

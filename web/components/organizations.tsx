@@ -5,14 +5,14 @@ import { useState, type FormEvent } from "react";
 import type { CurrentUser } from "@/lib/api";
 import { MarkIcon } from "./icons";
 
-export function WorkspaceChooser({ user }: { user: CurrentUser }) {
+export function WorkspaceChooser({ user, next = "/" }: { user: CurrentUser; next?: string }) {
   const router = useRouter();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function openWorkspace(organizationId: string) {
     if (organizationId === user.organizationId) {
-      router.replace("/");
+      router.replace(next);
       return;
     }
     setBusy(organizationId);
@@ -28,7 +28,7 @@ export function WorkspaceChooser({ user }: { user: CurrentUser }) {
       setError(payload.error ?? "Could not open that workspace.");
       return;
     }
-    router.replace("/");
+    router.replace(next);
     router.refresh();
   }
 
@@ -51,7 +51,7 @@ export function WorkspaceChooser({ user }: { user: CurrentUser }) {
       return;
     }
     form.reset();
-    router.replace("/");
+    router.replace(next);
     router.refresh();
   }
 

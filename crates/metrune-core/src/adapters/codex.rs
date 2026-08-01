@@ -1,8 +1,8 @@
 use super::{
-    common::{parse_usage_value, text_hint},
+    common::{parse_usage_value, text_hint, timestamp_at, workflow_signals},
     SourceAdapter,
 };
-use crate::UsageMessage;
+use crate::{UsageMessage, WorkflowSignal};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -42,6 +42,9 @@ impl SourceAdapter for CodexAdapter {
             .iter()
             .find(|record| record["type"] == "session_meta");
         let metadata = session_meta.and_then(|record| record.get("payload"));
+        let session_started_at = session_meta
+            .map(timestamp_at)
+            .or_else(|| records.first().map(timestamp_at));
         let session_id = metadata
             .and_then(|value| value.get("session_id"))
             .and_then(Value::as_str)
@@ -59,26 +62,48 @@ impl SourceAdapter for CodexAdapter {
             .and_then(|value| value.get("cli_version"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let model_id = records
-            .iter()
-            .filter_map(|record| record.get("payload"))
-            .find_map(|payload| payload.get("model").and_then(Value::as_str))
-            .unwrap_or("unknown");
-        let classification_text = records
-            .iter()
-            .filter_map(|record| record.get("payload"))
-            .filter_map(text_hint)
-            .take(12)
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        let mut total = TokenTotals::default();
-        let mut latest_timestamp = None;
+        let mut model_id = "unknown".to_string();
+        let mut previous = TokenTotals::default();
         let mut saw_token_count = false;
-        for record in &records {
+        let mut turn_sequence = 0_u32;
+        let mut activity_sequence = 0_u32;
+        let mut intent = None;
+        let mut pending_signals = Vec::new();
+        let mut messages = Vec::new();
+        for (index, record) in records.iter().enumerate() {
             let Some(payload) = record.get("payload") else {
                 continue;
             };
+            if let Some(model) = payload.get("model").and_then(Value::as_str) {
+                model_id = model.to_owned();
+            }
+            let payload_type = payload.get("type").and_then(Value::as_str);
+            let role = payload.get("role").and_then(Value::as_str);
+            if payload_type == Some("user_message") || role == Some("user") {
+                let is_tool_result = payload
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("tool_result")
+                        })
+                    });
+                if !is_tool_result {
+                    turn_sequence = turn_sequence.saturating_add(1);
+                    activity_sequence = 0;
+                    intent = payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| text_hint(payload));
+                    pending_signals.clear();
+                }
+            }
+            for signal in workflow_signals(payload) {
+                if !pending_signals.contains(&signal) {
+                    pending_signals.push(signal);
+                }
+            }
             if payload.get("type").and_then(Value::as_str) != Some("token_count") {
                 continue;
             }
@@ -89,44 +114,52 @@ impl SourceAdapter for CodexAdapter {
                 continue;
             };
             saw_token_count = true;
-            total.input = total.input.max(number_at(usage, "input_tokens"));
-            total.cache_read = total
-                .cache_read
-                .max(number_at(usage, "cached_input_tokens"));
-            total.output = total.output.max(number_at(usage, "output_tokens"));
-            total.reasoning = total
-                .reasoning
-                .max(number_at(usage, "reasoning_output_tokens"));
-            latest_timestamp = record.get("timestamp").cloned();
-        }
-
-        if saw_token_count && total.total() > 0 {
+            let current = TokenTotals {
+                input: number_at(usage, "input_tokens"),
+                output: number_at(usage, "output_tokens"),
+                cache_read: number_at(usage, "cached_input_tokens"),
+                reasoning: number_at(usage, "reasoning_output_tokens"),
+            };
+            let delta = current.delta_from(&previous);
+            previous = current;
+            if delta.total() == 0 {
+                continue;
+            }
             let value = json!({
-                "id": format!("{session_id}:token_count"),
+                "id": format!("{session_id}:token_count:{index}"),
                 "session_id": session_id,
                 "cwd": project_path,
                 "provider": provider_id,
                 "model": model_id,
                 "version": client_version,
-                "timestamp": latest_timestamp.unwrap_or_else(|| Value::String(chrono::Utc::now().to_rfc3339())),
+                "timestamp": record.get("timestamp").cloned().unwrap_or_else(|| Value::String(chrono::Utc::now().to_rfc3339())),
                 "usage": {
-                    "input_tokens": total.input,
-                    "output_tokens": total.output,
-                    "cache_read_input_tokens": total.cache_read,
-                    "reasoning_tokens": total.reasoning
+                    "input_tokens": delta.input,
+                    "output_tokens": delta.output,
+                    "cache_read_input_tokens": delta.cache_read,
+                    "reasoning_tokens": delta.reasoning
                 }
             });
-            let Some(mut message) = parse_usage_value(
+            if let Some(mut message) = parse_usage_value(
                 &value,
                 self.id(),
+                format!("{}:{index}", source.display()),
                 source.display().to_string(),
-                source.display().to_string(),
-            ) else {
-                return Ok(Vec::new());
-            };
-            message.classification_text =
-                (!classification_text.is_empty()).then_some(classification_text);
-            return Ok(vec![message]);
+            ) {
+                activity_sequence = activity_sequence.saturating_add(1);
+                message.turn_sequence = turn_sequence.max(1);
+                message.activity_sequence = activity_sequence;
+                message.session_started_at = session_started_at;
+                message.classification_text = intent.clone();
+                message.workflow_signals = pending_signals.clone();
+                message.signal_capabilities = WorkflowSignal::ALL.to_vec();
+                messages.push(message);
+                pending_signals.clear();
+            }
+        }
+
+        if saw_token_count {
+            return Ok(messages);
         }
 
         Ok(records
@@ -144,6 +177,13 @@ impl SourceAdapter for CodexAdapter {
                     format!("{}:{index}", source.display()),
                     source.display().to_string(),
                 )
+                .map(|mut message| {
+                    message.turn_sequence = index.saturating_add(1) as u32;
+                    message.activity_sequence = 1;
+                    message.session_started_at = session_started_at;
+                    message.signal_capabilities = WorkflowSignal::ALL.to_vec();
+                    message
+                })
             })
             .collect())
     }
@@ -160,6 +200,27 @@ struct TokenTotals {
 impl TokenTotals {
     fn total(&self) -> u64 {
         self.input + self.output + self.cache_read + self.reasoning
+    }
+
+    fn delta_from(&self, previous: &Self) -> Self {
+        let reset = self.input < previous.input
+            || self.output < previous.output
+            || self.cache_read < previous.cache_read
+            || self.reasoning < previous.reasoning;
+        if reset {
+            return Self {
+                input: self.input,
+                output: self.output,
+                cache_read: self.cache_read,
+                reasoning: self.reasoning,
+            };
+        }
+        Self {
+            input: self.input - previous.input,
+            output: self.output - previous.output,
+            cache_read: self.cache_read - previous.cache_read,
+            reasoning: self.reasoning - previous.reasoning,
+        }
     }
 }
 

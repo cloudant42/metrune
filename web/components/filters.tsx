@@ -7,6 +7,8 @@ const ranges = [
   { value: "90", label: "Last 90 days" },
 ];
 
+const workflowSignals = ["read", "searched", "edited", "tests_run", "tests_failed", "planned", "delegated", "git_used", "built", "deployed"];
+
 export function FilterBar({ params, facets }: { params: PageParams; facets: Facets }) {
   return (
     <form className="filter-bar" aria-label="Filters">
@@ -21,6 +23,7 @@ export function FilterBar({ params, facets }: { params: PageParams; facets: Face
       <FacetSelect name="category" title="Category" all="All categories" value={params.category} options={facets.categories} display={label} />
       <FacetSelect name="client" title="Client" all="All clients" value={params.client} options={facets.clients} />
       <FacetSelect name="status" title="Semantic status" all="Any status" value={params.status} options={facets.statuses} display={label} />
+      <FacetSelect name="workflow" title="Workflow" all="Any workflow" value={params.workflow} options={workflowSignals} display={label} />
       <div className="filter-actions">
         <button type="submit" className="btn">Apply</button>
         <a className="btn ghost" href="?">Reset</a>

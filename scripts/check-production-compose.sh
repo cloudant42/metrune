@@ -7,6 +7,9 @@ export DATABASE_URL="postgres://metrune:compose-check-postgres@postgres:5432/met
 export METRUNE_API_IMAGE="ghcr.io/example/metrune-api@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 export METRUNE_WEB_IMAGE="ghcr.io/example/metrune-web@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 export METRUNE_PUBLIC_API_URL="https://metrune.example"
+export METRUNE_PUBLIC_WEB_URL="https://metrune.example"
+export METRUNE_RELEASE_PUBKEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+export METRUNE_CLIENT_RELEASE_DIR="/tmp/metrune-client-release"
 export METRUNE_SMTP_HOST="smtp.example"
 export METRUNE_SMTP_PORT="587"
 export METRUNE_SMTP_USERNAME="compose-check"
@@ -40,6 +43,26 @@ fi
 
 if grep -q 'host_ip: 0.0.0.0' "$rendered"; then
   echo "production Compose exposes a service on all interfaces" >&2
+  exit 1
+fi
+
+if grep -Eq '^[[:space:]]+METRUNE_OIDC_CLIENT_SECRET:' "$rendered"; then
+  echo "production Compose must not expose the OIDC client secret in the environment" >&2
+  exit 1
+fi
+
+if ! grep -q 'target: /run/secrets/metrune-oidc-client-secret' "$rendered"; then
+  echo "production Compose is missing the OIDC client-secret file mount" >&2
+  exit 1
+fi
+
+postgres_config="$(awk '
+  /^  postgres:$/ { in_postgres = 1; next }
+  in_postgres && /^  [[:alnum:]_-]+:$/ { exit }
+  in_postgres { print }
+' "$rendered")"
+if grep -q '/docker-entrypoint-initdb.d' <<<"$postgres_config"; then
+  echo "PostgreSQL migrations must be owned by the API, not run a second time by the image entrypoint" >&2
   exit 1
 fi
 

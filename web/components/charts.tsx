@@ -1,5 +1,6 @@
 import type { Breakdown, CategoryModelBreakdown } from "@/lib/api";
 import { formatCompact, formatMoney, label, shortModel } from "@/lib/format";
+import { semanticCategory } from "@/lib/semantic-categories";
 
 export { TrendChart } from "./trend-chart";
 
@@ -59,7 +60,10 @@ export function ModelHeatmap({ values }: { values: CategoryModelBreakdown[] }) {
               const rowTotal = categoryTotals.get(category) ?? 0;
               return (
                 <tr key={category}>
-                  <th scope="row"><span>{label(category)}</span><small>{formatCompact(rowTotal)} tokens</small></th>
+                  <th scope="row" title={semanticCategory(category)?.description}>
+                    <span>{label(category)}</span>
+                    <small>{formatCompact(rowTotal)} tokens</small>
+                  </th>
                   {models.map(model => {
                     const cell = cells.get(`${category}\0${model}`);
                     const share = cell && rowTotal > 0 ? cell.tokens / rowTotal : 0;

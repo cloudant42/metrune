@@ -29,6 +29,7 @@ use crate::app::AppState;
 /// A manifest is a few kilobytes; anything larger is a misconfiguration and is
 /// refused rather than read into memory.
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 const DEFAULT_DOWNLOAD_DIR: &str = "/usr/share/metrune/downloads";
 const MANIFEST_FILE_NAME: &str = "client-manifest.json";
@@ -47,6 +48,7 @@ pub(crate) struct ClientDistribution {
     manifest_path: PathBuf,
     download_dir: PathBuf,
     public_base_url: Option<String>,
+    release_public_key: Option<String>,
     legacy_paths: BTreeMap<String, PathBuf>,
 }
 
@@ -72,6 +74,10 @@ impl ClientDistribution {
             public_base_url: env::var("METRUNE_PUBLIC_API_URL")
                 .ok()
                 .map(|value| value.trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty()),
+            release_public_key: env::var("METRUNE_RELEASE_PUBKEY")
+                .ok()
+                .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             legacy_paths,
         }
@@ -103,6 +109,10 @@ impl ClientDistribution {
         })?;
         let mut manifest: ClientReleaseManifest = serde_json::from_slice(&raw).map_err(|error| {
             tracing::error!(error = %error, path = %self.manifest_path.display(), "the client release manifest is not valid JSON");
+            ApiError::not_found("the client release manifest on this server is not usable")
+        })?;
+        manifest.validate().map_err(|error| {
+            tracing::error!(error = %error, path = %self.manifest_path.display(), "the client release manifest failed validation");
             ApiError::not_found("the client release manifest on this server is not usable")
         })?;
         for artifact in &mut manifest.artifacts {
@@ -155,6 +165,26 @@ pub(crate) async fn download_client(
         .artifact_named(&artifact)
         .ok_or_else(|| ApiError::not_found("Unknown client artifact"))?;
     let path = state.distribution.artifact_path(&entry.artifact);
+    let metadata = tokio::fs::metadata(&path).await.map_err(|_| {
+        ApiError::not_found(format!(
+            "{} is not mirrored by this server; download it from {}",
+            entry.artifact, entry.url
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiError::not_found("Unknown client artifact"));
+    }
+    if metadata.len() > MAX_ARTIFACT_BYTES {
+        tracing::error!(
+            artifact = %entry.artifact,
+            path = %path.display(),
+            bytes = metadata.len(),
+            "mirrored client artifact exceeds the configured size limit"
+        );
+        return Err(ApiError::payload_too_large(
+            "the mirrored client artifact exceeds the configured size limit",
+        ));
+    }
     let binary = tokio::fs::read(&path).await.map_err(|_| {
         ApiError::not_found(format!(
             "{} is not mirrored by this server; download it from {}",
@@ -205,6 +235,17 @@ pub(crate) async fn download_client(
 /// parser on the workstation and still verifies what it downloads.
 pub(crate) async fn install_script(State(state): State<AppState>) -> Result<Response, ApiError> {
     let manifest = state.distribution.manifest().await?;
+    let Some(public_key) = state.distribution.release_public_key.as_deref() else {
+        return Err(ApiError::service_unavailable(
+            "the server has no release public key configured; the shell installer is disabled",
+        ));
+    };
+    manifest.verify_signature(public_key).map_err(|error| {
+        tracing::error!(error = %error, "refusing to render an installer for an untrusted release manifest");
+        ApiError::service_unavailable(
+            "the server release manifest is not signed by the configured release key",
+        )
+    })?;
     let script = render_install_script(&manifest);
     Ok((
         [
@@ -232,8 +273,9 @@ fn render_install_script(manifest: &ClientReleaseManifest) -> String {
             _ => continue,
         };
         cases.push_str(&format!(
-            "  {uname_os}:{uname_arch}) url='{}'; sha='{}' ;;\n",
-            artifact.url, artifact.sha256
+            "  {uname_os}:{uname_arch}) url={}; sha={} ;;\n",
+            shell_quote(&artifact.url),
+            shell_quote(&artifact.sha256),
         ));
     }
     format!(
@@ -273,16 +315,32 @@ else
   sudo install "$tmp/metrune" "$target/metrune"
 fi
 echo "metrune: installed {version} to $target/metrune"
-echo "metrune: enroll it with 'metrune enroll --server <url> --token <code>'"
+echo "metrune: enroll it with 'metrune enroll --server <url>' and approve the device in your browser"
 "#,
         version = manifest.version,
         cases = cases,
     )
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_download_dir(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "metrune-distribution-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create test download directory");
+        path
+    }
 
     fn manifest() -> ClientReleaseManifest {
         let digests = BTreeMap::from([
@@ -327,5 +385,73 @@ mod tests {
     fn install_script_pins_the_version_it_was_rendered_for() {
         let script = render_install_script(&manifest());
         assert!(script.contains("downloading v0.3.0"));
+    }
+
+    #[tokio::test]
+    async fn a_mirror_rewrites_only_artifacts_it_actually_holds() {
+        let download_dir = temp_download_dir("rewrite");
+        let manifest_path = download_dir.join(MANIFEST_FILE_NAME);
+        let linux_bytes = b"verified linux client";
+        let mut release = manifest();
+        release.signature = Some("release-signature".into());
+        release
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.target == "linux-x86_64")
+            .expect("linux artifact")
+            .sha256 = sha256_hex(linux_bytes);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&release).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        std::fs::write(download_dir.join("metrune-linux-x86_64"), linux_bytes)
+            .expect("write mirrored client");
+        let distribution = ClientDistribution {
+            manifest_path,
+            download_dir: download_dir.clone(),
+            public_base_url: Some("https://metrune.example.test".into()),
+            release_public_key: None,
+            legacy_paths: BTreeMap::new(),
+        };
+
+        let rewritten = distribution.manifest().await.expect("read manifest");
+        let linux = rewritten.artifact_for("linux-x86_64").expect("linux");
+        assert_eq!(linux.source, ArtifactSource::Mirror);
+        assert_eq!(
+            linux.url,
+            "https://metrune.example.test/v1/downloads/metrune-linux-x86_64"
+        );
+        let mac = rewritten.artifact_for("macos-arm64").expect("mac");
+        assert_eq!(mac.source, ArtifactSource::Upstream);
+        assert!(mac.url.starts_with("https://github.test/"));
+        assert_eq!(rewritten.signature.as_deref(), Some("release-signature"));
+
+        std::fs::remove_dir_all(download_dir).expect("remove test download directory");
+    }
+
+    #[tokio::test]
+    async fn unusable_manifests_fail_closed_without_leaking_file_errors() {
+        for (label, bytes) in [
+            ("malformed", b"{not-json".to_vec()),
+            ("oversized", vec![b'x'; MAX_MANIFEST_BYTES as usize + 1]),
+        ] {
+            let download_dir = temp_download_dir(label);
+            let manifest_path = download_dir.join(MANIFEST_FILE_NAME);
+            std::fs::write(&manifest_path, bytes).expect("write unusable manifest");
+            let distribution = ClientDistribution {
+                manifest_path,
+                download_dir: download_dir.clone(),
+                public_base_url: None,
+                release_public_key: None,
+                legacy_paths: BTreeMap::new(),
+            };
+            let error = distribution
+                .manifest()
+                .await
+                .expect_err("an unusable manifest must not be served");
+            assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
+            std::fs::remove_dir_all(download_dir).expect("remove test download directory");
+        }
     }
 }

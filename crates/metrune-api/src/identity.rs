@@ -9,7 +9,7 @@ use argon2::{
 };
 use axum::{
     extract::{ConnectInfo, Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode},
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -351,9 +351,15 @@ pub(crate) async fn accept_invitation(
 ) -> Result<StatusCode, ApiError> {
     limit_public_identity_request(&state, &headers, peer, "invitation")?;
     let digest = invitation_digest(&request.token)?;
-    let password_hash = match request.password {
-        Some(password) => Some(hash_password(password).await?),
-        None => None,
+    let password_hash = match (state.oidc.is_some(), request.password) {
+        (true, Some(_)) => {
+            return Err(ApiError::bad_request(
+                "passwords are unavailable while single sign-on is configured",
+            ));
+        }
+        (true, None) => None,
+        (false, Some(password)) => Some(hash_password(password).await?),
+        (false, None) => None,
     };
     let mut transaction = state.postgres.begin().await?;
     let invitation = sqlx::query_as::<_, (Uuid, Uuid, String, String, String)>(
@@ -384,13 +390,22 @@ pub(crate) async fn accept_invitation(
                 .display_name
                 .as_deref()
                 .map(str::trim)
-                .filter(|value| !value.is_empty() && value.chars().count() <= 120)
-                .ok_or(ApiError::bad_request(
+                .filter(|value| !value.is_empty());
+            if display_name.is_some_and(|value| value.chars().count() > 120) {
+                return Err(ApiError::bad_request(
                     "display name must be between 1 and 120 characters",
-                ))?;
-            let password_hash = password_hash.ok_or(ApiError::bad_request(
-                "a password is required for a new account",
-            ))?;
+                ));
+            }
+            if state.oidc.is_none() && display_name.is_none() {
+                return Err(ApiError::bad_request(
+                    "display name must be between 1 and 120 characters",
+                ));
+            }
+            if state.oidc.is_none() && password_hash.is_none() {
+                return Err(ApiError::bad_request(
+                    "a password is required for a new account",
+                ));
+            }
             sqlx::query_scalar::<_, Uuid>(
                 "INSERT INTO users(
                    organization_id, email, display_name, password_hash, role
@@ -464,13 +479,18 @@ pub(crate) async fn request_password_reset(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<PasswordResetRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<(HeaderMap, StatusCode), ApiError> {
+    if state.oidc.is_some() {
+        return Err(ApiError::not_found(
+            "password reset is unavailable while single sign-on is configured",
+        ));
+    }
     limit_public_identity_request(&state, &headers, peer, "password_reset")?;
     let Ok(email) = crate::mailer::normalize_email(&request.email) else {
-        return Ok(StatusCode::ACCEPTED);
+        return Ok((no_store_headers(), StatusCode::ACCEPTED));
     };
     let Some(mailer) = state.mailer.clone() else {
-        return Ok(StatusCode::ACCEPTED);
+        return Ok((no_store_headers(), StatusCode::ACCEPTED));
     };
     let users = sqlx::query_as::<_, (Uuid, String)>(
         "SELECT id, email FROM users
@@ -481,7 +501,7 @@ pub(crate) async fn request_password_reset(
     .fetch_all(&state.postgres)
     .await?;
     let [user] = users.as_slice() else {
-        return Ok(StatusCode::ACCEPTED);
+        return Ok((no_store_headers(), StatusCode::ACCEPTED));
     };
     let (token, digest) = generate_token("mtr_");
     let mut transaction = state.postgres.begin().await?;
@@ -528,7 +548,7 @@ pub(crate) async fn request_password_reset(
             .await?;
         }
     }
-    Ok(StatusCode::ACCEPTED)
+    Ok((no_store_headers(), StatusCode::ACCEPTED))
 }
 
 #[derive(Deserialize)]
@@ -543,7 +563,12 @@ pub(crate) async fn complete_password_reset(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CompletePasswordResetRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<(HeaderMap, StatusCode), ApiError> {
+    if state.oidc.is_some() {
+        return Err(ApiError::not_found(
+            "password reset is unavailable while single sign-on is configured",
+        ));
+    }
     limit_public_identity_request(&state, &headers, peer, "password_reset")?;
     let digest = reset_digest(&request.token)?;
     let password_hash = hash_password(request.new_password).await?;
@@ -583,7 +608,13 @@ pub(crate) async fn complete_password_reset(
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok((no_store_headers(), StatusCode::NO_CONTENT))
+}
+
+fn no_store_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers
 }
 
 async fn mark_invitation_delivery(

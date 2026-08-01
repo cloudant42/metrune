@@ -10,15 +10,16 @@
 ignore = [
     # RUSTSEC-2023-0071 — Marvin Attack, a timing sidechannel in `rsa`.
     #
-    # `rsa` reaches Cargo.lock solely through `sqlx-mysql`. Metrune enables
-    # sqlx with `default-features = false` and only the `postgres` driver, so
-    # `sqlx-mysql` is never built and `rsa` is never compiled into any binary.
-    # `cargo tree` confirms this: the crate is absent from the graph for every
-    # target.
+    # `rsa` is compiled solely through `openidconnect`. Production Metrune uses
+    # the identity provider's public JWKS to verify ID-token signatures; it
+    # neither loads an RSA private key nor performs an RSA signing/decryption
+    # operation. The advisory leaks private keys through the timing of those
+    # private-key operations, so public-key verification is outside its impact.
+    # The signed mock provider does use a test-only private fixture.
     #
     # There is no fixed release to upgrade to, so this cannot be resolved by
-    # bumping. The `rust-audit` job re-checks that `rsa` is still outside the
-    # compiled graph, and fails if that ever stops being true — enabling the
-    # MySQL driver must not silently inherit this suppression.
+    # bumping. The `rust-audit` job fails if another compiled dependency starts
+    # using `rsa`, or if production OIDC code starts using a private-key API.
+    # Either change invalidates this narrowly scoped suppression.
     "RUSTSEC-2023-0071",
 ]

@@ -30,6 +30,7 @@ fn estimates_unknown_cost_with_versioned_custom_pricebook() {
         client_version: None,
         provider_id: "openai".into(),
         model_id: "gpt-5".into(),
+        session_started_at: None,
         observed_at: Utc::now(),
         tokens: TokenBreakdown {
             input: 1_000_000,
@@ -37,6 +38,10 @@ fn estimates_unknown_cost_with_versioned_custom_pricebook() {
             ..TokenBreakdown::default()
         },
         cost: Cost::default(),
+        turn_sequence: 1,
+        activity_sequence: 1,
+        workflow_signals: vec![],
+        signal_capabilities: vec![],
         classification_text: None,
     };
     assert!(book.estimate(&mut message));
@@ -58,12 +63,17 @@ fn organization_override_wins_over_openrouter_entry() {
         client_version: None,
         provider_id: "openrouter".into(),
         model_id: "moonshotai/kimi-k3".into(),
+        session_started_at: None,
         observed_at: Utc::now(),
         tokens: TokenBreakdown {
             input: 1_000_000,
             ..TokenBreakdown::default()
         },
         cost: Cost::default(),
+        turn_sequence: 1,
+        activity_sequence: 1,
+        workflow_signals: vec![],
+        signal_capabilities: vec![],
         classification_text: None,
     };
     let catalog = PriceCatalog {

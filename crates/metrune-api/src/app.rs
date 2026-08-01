@@ -1,11 +1,12 @@
 #[cfg(test)]
 use crate::limits::{RateLimit, MAX_LOGIN_FAILURES_PER_WINDOW};
 use crate::{
+    device_auth,
     distribution::{self, ClientDistribution},
     error::{bearer, token_hash, ApiError},
     identity,
     limits::{client_address, LoginAttemptLimiter, RateLimiter, RateLimits},
-    mailer,
+    mailer, oidc,
 };
 
 use aes_gcm::{
@@ -32,19 +33,26 @@ use clickhouse::Row;
 use hkdf::Hkdf;
 use metrune_core::{
     canonical_model_id,
-    classifier::{OpenAiCompatibleClassifier, ResponseMode},
+    classifier::{
+        BatchClassification, ClassifierBackend, OpenAiCompatibleClassifier, ResponseMode,
+    },
     pricing::{ModelPrice, PriceCatalog},
-    BatchEnvelope, CostKind, IngestAck, SessionSnapshot, SCHEMA_VERSION,
+    release::{
+        is_valid_version, version_is_older, versions_share_major, ServerInfo, CLIENT_VERSION_HEADER,
+    },
+    BatchEnvelope, CostKind, IngestAck, SessionSnapshot, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::{
+    collections::BTreeMap,
     env,
     fs::{self, OpenOptions},
     io::Write as _,
     net::SocketAddr,
     path::Path as StdPath,
+    sync::OnceLock,
     time::Duration as StdDuration,
 };
 use tower_http::{
@@ -69,12 +77,23 @@ pub(crate) struct AppState {
     pub(crate) trust_proxy_headers: bool,
     pub(crate) mailer: Option<mailer::Mailer>,
     pub(crate) distribution: ClientDistribution,
+    pub(crate) public_web_url: String,
+    pub(crate) oidc: Option<oidc::OidcRuntime>,
+    minimum_client_version: Option<String>,
 }
 
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BATCH_SNAPSHOTS: usize = 1_000;
 const MAX_CLASSIFICATION_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SESSION_PAGE_OFFSET: u32 = 100_000;
+const MAX_SNAPSHOT_TEXT_BYTES: usize = 512;
+const MAX_USAGE_SLICES: usize = 256;
+const MAX_TURNS: usize = 4_096;
+const MAX_MODEL_ACTIVITY_STEPS: usize = 128;
+const MAX_WORKFLOW_SIGNALS: usize = 32;
+const MAX_CLASSIFICATION_METHODS: usize = 16;
+const MAX_SNAPSHOT_TOKENS: u64 = 1_000_000_000_000;
+const MAX_SNAPSHOT_COST: f64 = 1_000_000_000.0;
 /// HKDF context separating credential keys from any other future use of the
 /// master key. Changing it invalidates every stored credential.
 const CREDENTIAL_KEY_INFO: &[u8] = b"metrune/provider-credential/v1";
@@ -97,6 +116,24 @@ struct SecretVault {
     created: bool,
 }
 
+fn ensure_private_secret_file(path: &StdPath) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "secret vault key file {} must not be readable or writable by other users (mode {:o})",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 impl SecretVault {
     fn load_or_create() -> anyhow::Result<Self> {
         let path = env::var("METRUNE_SECRETS_KEY_FILE")
@@ -106,7 +143,10 @@ impl SecretVault {
             fs::create_dir_all(parent)?;
         }
         let (encoded, created) = match fs::read_to_string(path) {
-            Ok(value) => (value, false),
+            Ok(value) => {
+                ensure_private_secret_file(path)?;
+                (value, false)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut key = [0_u8; 32];
                 OsRng.fill_bytes(&mut key);
@@ -331,7 +371,15 @@ impl AppState {
             trust_proxy_headers: false,
             mailer: None,
             distribution: ClientDistribution::from_env(),
+            public_web_url: "https://metrune.example".into(),
+            oidc: None,
+            minimum_client_version: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_minimum_client_version(&mut self, version: Option<&str>) {
+        self.minimum_client_version = version.map(str::to_string);
     }
 }
 
@@ -349,14 +397,22 @@ pub async fn run() -> anyhow::Result<()> {
     let bootstrap_password = env::var("METRUNE_BOOTSTRAP_PASSWORD").ok();
     let database_url = env::var("DATABASE_URL")?;
     let clickhouse_password = env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
+    let public_api_url = env::var("METRUNE_PUBLIC_API_URL").ok();
+    let public_web_url =
+        env::var("METRUNE_PUBLIC_WEB_URL").unwrap_or_else(|_| "http://localhost:3001".into());
+    let minimum_client_version = configured_minimum_client_version()?;
     validate_production_configuration(
         &environment,
-        env::var("METRUNE_PUBLIC_API_URL").ok().as_deref(),
+        public_api_url.as_deref(),
+        Some(&public_web_url),
         &database_url,
         &clickhouse_password,
         bootstrap_email.as_deref(),
         bootstrap_password.as_deref(),
     )?;
+    let oidc =
+        oidc::OidcRuntime::from_env(&environment, public_api_url.as_deref(), &public_web_url)
+            .await?;
     let postgres = PgPool::connect(&database_url).await?;
     sqlx::migrate!("../../migrations/postgres")
         .run(&postgres)
@@ -383,6 +439,9 @@ pub async fn run() -> anyhow::Result<()> {
             .is_ok_and(|value| value.trim().eq_ignore_ascii_case("true")),
         mailer: mailer::Mailer::from_env(&environment)?,
         distribution: ClientDistribution::from_env(),
+        public_web_url,
+        oidc,
+        minimum_client_version,
     };
     let credentials_exist: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM provider_credentials)")
@@ -409,6 +468,7 @@ pub async fn run() -> anyhow::Result<()> {
         .await?;
     ensure_deduplicated_session_table(&state.clickhouse).await?;
     bootstrap_local_user(&state).await?;
+    reconcile_authentication_mode(&state.postgres, state.oidc.is_some()).await?;
     import_default_price_catalog(&state).await?;
     reprice_unknown_history(&state).await?;
     rewrap_legacy_credentials(&state).await?;
@@ -443,7 +503,19 @@ pub(crate) fn router(state: AppState) -> Router {
             "/v1/analytics/category-model",
             get(analytics_category_model),
         )
+        .route(
+            "/v1/analytics/workflow-model",
+            get(analytics_workflow_model),
+        )
+        .route(
+            "/v1/analytics/classification-overhead",
+            get(analytics_classification_overhead),
+        )
         .route("/v1/analytics/sessions", get(analytics_sessions))
+        .route(
+            "/v1/analytics/sessions/{session_key}",
+            get(analytics_session_detail),
+        )
         .route("/v1/analytics/facets", get(analytics_facets))
         .route("/v1/me/usage", get(my_usage))
         .route("/v1/me/sessions", get(my_sessions))
@@ -454,6 +526,7 @@ pub(crate) fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/v1/healthz", get(health))
+        .route("/v1/server/info", get(server_info))
         .route("/v1/readyz", get(ready))
         .route(
             "/v1/downloads/{artifact}",
@@ -462,6 +535,9 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/v1/client/manifest", get(distribution::client_manifest))
         .route("/v1/client/install.sh", get(distribution::install_script))
         .route("/v1/auth/login", post(login))
+        .route("/v1/auth/methods", get(oidc::auth_methods))
+        .route("/v1/auth/sso/start", get(oidc::start))
+        .route("/v1/auth/sso/callback", get(oidc::callback))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/auth/me", get(current_user))
         .route("/v1/auth/organization", post(switch_organization))
@@ -484,12 +560,29 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/v1/organizations", post(create_organization))
         .route("/v1/enroll", post(enroll))
         .route(
+            "/v1/oauth/device/authorization",
+            post(device_auth::authorize_device),
+        )
+        .route(
+            "/v1/oauth/device/verification",
+            post(device_auth::inspect_device),
+        )
+        .route(
+            "/v1/oauth/device/approval",
+            post(device_auth::approve_device),
+        )
+        .route("/v1/oauth/token", post(device_auth::exchange_device_code))
+        .route(
             "/v1/installation/classifier/provision",
             post(provision_classifier),
         )
         .route(
             "/v1/installation/classifier/classify",
             post(managed_classify),
+        )
+        .route(
+            "/v1/installation/classifier/classify-batch",
+            post(managed_classify_batch),
         )
         .route("/v1/org/members", get(list_members).post(add_member))
         .route(
@@ -622,9 +715,48 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok","service":"metrune-api","schemaVersion":SCHEMA_VERSION}))
 }
 
+async fn server_info(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(ServerInfo {
+            server_version: env!("CARGO_PKG_VERSION").into(),
+            supported_schema_versions: vec![LEGACY_SCHEMA_VERSION.into(), SCHEMA_VERSION.into()],
+            minimum_client_version: state.minimum_client_version,
+        }),
+    )
+}
+
+fn no_store_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers
+}
+
+fn configured_minimum_client_version() -> anyhow::Result<Option<String>> {
+    let Some(version) = env::var("METRUNE_MINIMUM_CLIENT_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !is_valid_version(&version) {
+        anyhow::bail!(
+            "METRUNE_MINIMUM_CLIENT_VERSION must be a complete semantic version such as 0.2.0"
+        );
+    }
+    if !versions_share_major(&version, env!("CARGO_PKG_VERSION")) {
+        anyhow::bail!(
+            "METRUNE_MINIMUM_CLIENT_VERSION must stay on the server's major compatibility line"
+        );
+    }
+    Ok(Some(version))
+}
+
 fn validate_production_configuration(
     environment: &str,
     public_api_url: Option<&str>,
+    public_web_url: Option<&str>,
     database_url: &str,
     clickhouse_password: &str,
     bootstrap_email: Option<&str>,
@@ -636,8 +768,14 @@ fn validate_production_configuration(
     let public_api_url = public_api_url
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("METRUNE_PUBLIC_API_URL is required in production"))?;
-    if !public_api_url.starts_with("https://") {
+    if !valid_public_https_url(public_api_url) {
         anyhow::bail!("METRUNE_PUBLIC_API_URL must use HTTPS in production");
+    }
+    let public_web_url = public_web_url
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("METRUNE_PUBLIC_WEB_URL is required in production"))?;
+    if !valid_public_https_url(public_web_url) {
+        anyhow::bail!("METRUNE_PUBLIC_WEB_URL must use HTTPS in production");
     }
     if database_url.contains(":metrune-dev@") || clickhouse_password == "metrune-dev" {
         anyhow::bail!("development database credentials are not allowed in production");
@@ -658,6 +796,16 @@ fn validate_production_configuration(
         anyhow::bail!("a development bootstrap password is not allowed in production");
     }
     Ok(())
+}
+
+fn valid_public_https_url(value: &str) -> bool {
+    reqwest::Url::parse(value.trim()).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 async fn ensure_development_seed_data(postgres: &PgPool) -> anyhow::Result<()> {
@@ -730,6 +878,41 @@ async fn ensure_production_database_is_clean(postgres: &PgPool) -> anyhow::Resul
     Ok(())
 }
 
+fn active_authentication_method(state: &AppState) -> &'static str {
+    if state.oidc.is_some() {
+        "oidc"
+    } else {
+        "local"
+    }
+}
+
+async fn reconcile_authentication_mode(
+    postgres: &PgPool,
+    oidc_enabled: bool,
+) -> anyhow::Result<()> {
+    let active_method = if oidc_enabled { "oidc" } else { "local" };
+    let mut transaction = postgres.begin().await?;
+    sqlx::query(
+        "UPDATE organizations
+         SET sso_enforced = $1, local_login_enabled = $2
+         WHERE sso_enforced IS DISTINCT FROM $1
+            OR local_login_enabled IS DISTINCT FROM $2",
+    )
+    .bind(oidc_enabled)
+    .bind(!oidc_enabled)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE web_sessions SET revoked_at = NOW()
+         WHERE revoked_at IS NULL AND authentication_method <> $1",
+    )
+    .bind(active_method)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     let postgres_ready = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.postgres)
@@ -760,6 +943,7 @@ async fn bootstrap_local_user(state: &AppState) -> anyhow::Result<()> {
         .ok()
         .filter(|value| !value.is_empty());
     let environment = env::var("METRUNE_ENV").unwrap_or_else(|_| "development".into());
+    let sso_enabled = state.oidc.is_some();
     if environment == "production" {
         let existing_users = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
             .fetch_one(&state.postgres)
@@ -770,22 +954,42 @@ async fn bootstrap_local_user(state: &AppState) -> anyhow::Result<()> {
                  creating the first administrator"
             );
         }
-        if existing_users == 0 && (email.is_none() || password.is_none()) {
-            anyhow::bail!(
-                "METRUNE_BOOTSTRAP_EMAIL and METRUNE_BOOTSTRAP_PASSWORD are required \
-                 to create the first production administrator"
-            );
+        if existing_users == 0 {
+            if email.is_none() {
+                anyhow::bail!(
+                    "METRUNE_BOOTSTRAP_EMAIL is required to create the first production administrator"
+                );
+            }
+            if !sso_enabled && password.is_none() {
+                anyhow::bail!("METRUNE_BOOTSTRAP_PASSWORD is required when OIDC is not configured");
+            }
         }
     }
-    let (Some(email), Some(password)) = (email, password) else {
+    let Some(email) = email else {
         return Ok(());
     };
+    if sso_enabled && password.is_some() {
+        anyhow::bail!(
+            "remove METRUNE_BOOTSTRAP_PASSWORD when OIDC is configured; SSO-only accounts do not use local passwords"
+        );
+    }
     let email = mailer::normalize_email(&email)
         .map_err(|_| anyhow::anyhow!("METRUNE_BOOTSTRAP_EMAIL must be a valid email address"))?;
-    let password_chars = password.chars().count();
-    if !(12..=128).contains(&password_chars) && environment == "production" {
-        anyhow::bail!("METRUNE_BOOTSTRAP_PASSWORD must be between 12 and 128 characters");
-    }
+    let password_hash = match password {
+        Some(password) => {
+            let password_chars = password.chars().count();
+            if !(12..=128).contains(&password_chars) && environment == "production" {
+                anyhow::bail!("METRUNE_BOOTSTRAP_PASSWORD must be between 12 and 128 characters");
+            }
+            Some(
+                Argon2::default()
+                    .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+                    .map_err(|error| anyhow::anyhow!("hash bootstrap password: {error}"))?
+                    .to_string(),
+            )
+        }
+        None => None,
+    };
     let organization_id = match sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM organizations ORDER BY created_at LIMIT 1",
     )
@@ -800,17 +1004,16 @@ async fn bootstrap_local_user(state: &AppState) -> anyhow::Result<()> {
                 .filter(|value| !value.is_empty() && value.chars().count() <= 120)
                 .unwrap_or_else(|| "Metrune Workspace".into());
             sqlx::query_scalar::<_, Uuid>(
-                "INSERT INTO organizations(name) VALUES ($1) RETURNING id",
+                "INSERT INTO organizations(name, sso_enforced, local_login_enabled)
+                 VALUES ($1,$2,$3) RETURNING id",
             )
             .bind(name)
+            .bind(sso_enabled)
+            .bind(!sso_enabled)
             .fetch_one(&state.postgres)
             .await?
         }
     };
-    let password_hash = Argon2::default()
-        .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
-        .map_err(|error| anyhow::anyhow!("hash bootstrap password: {error}"))?
-        .to_string();
     let user_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO users(organization_id, email, display_name, password_hash, role)
          VALUES ($1,$2,'Metrune Admin',$3,'admin')
@@ -1000,6 +1203,21 @@ fn failed_login(state: &AppState, email: &str) -> ApiError {
     ApiError::unauthorized("invalid email or password")
 }
 
+fn dummy_login_password_hash() -> String {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        // Generate one valid Argon2 hash once so unknown accounts take the
+        // same password-verification path as known accounts. The random salt
+        // is process-local and the value is never used as a real credential.
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(b"metrune-invalid-login", &salt)
+            .expect("the dummy login password hash must be generated")
+            .to_string()
+    })
+    .clone()
+}
+
 async fn organization_memberships(
     state: &AppState,
     user_id: Uuid,
@@ -1058,7 +1276,7 @@ async fn current_user_response(
 pub(crate) struct UserSessionAuth {
     session_id: Uuid,
     pub(crate) user_id: Uuid,
-    active_organization_id: Option<Uuid>,
+    pub(crate) active_organization_id: Option<Uuid>,
 }
 
 pub(crate) async fn user_session_auth(
@@ -1071,9 +1289,11 @@ pub(crate) async fn user_session_auth(
          FROM web_sessions s
          JOIN users u ON u.id = s.user_id
          WHERE s.token_hash = $1 AND s.revoked_at IS NULL
-           AND s.expires_at > NOW() AND u.disabled_at IS NULL",
+           AND s.expires_at > NOW() AND u.disabled_at IS NULL
+           AND s.authentication_method = $2",
     )
     .bind(digest)
+    .bind(active_authentication_method(state))
     .fetch_optional(&state.postgres)
     .await?
     .ok_or(ApiError::unauthorized("invalid or expired session"))?;
@@ -1089,7 +1309,12 @@ async fn login(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
-) -> Result<Json<LoginResponse>, ApiError> {
+) -> Result<(HeaderMap, Json<LoginResponse>), ApiError> {
+    if state.oidc.is_some() {
+        return Err(ApiError::forbidden(
+            "password sign-in is unavailable while single sign-on is configured",
+        ));
+    }
     let address = client_address(&headers, peer, state.trust_proxy_headers);
     state
         .rate_limiter
@@ -1113,13 +1338,10 @@ async fn login(
     .bind(&email)
     .fetch_all(&state.postgres)
     .await?;
-    if rows.len() != 1 {
-        return Err(failed_login(&state, &email));
-    }
-    let row = &rows[0];
-    let password_hash = row.3.clone().ok_or(ApiError::unauthorized(
-        "local password login is unavailable",
-    ))?;
+    let password_hash = rows
+        .first()
+        .and_then(|row| row.3.clone())
+        .unwrap_or_else(dummy_login_password_hash);
     let password = request.password.clone();
     let password_valid = tokio::task::spawn_blocking(move || {
         PasswordHash::new(&password_hash).is_ok_and(|parsed| {
@@ -1129,9 +1351,10 @@ async fn login(
         })
     })
     .await?;
-    if !password_valid {
+    if rows.len() != 1 || !password_valid {
         return Err(failed_login(&state, &email));
     }
+    let row = &rows[0];
     state.login_limiter.reset(&email);
     let organizations = organization_memberships(&state, row.0).await?;
     if organizations.is_empty() {
@@ -1157,37 +1380,44 @@ async fn login(
         .bind(row.0)
         .execute(&state.postgres)
         .await?;
-    Ok(Json(LoginResponse {
-        session_token,
-        expires_at,
-        user: CurrentUserResponse {
-            id: row.0,
-            organization_id: active_organization_id,
-            organization_name: active_organization_id.map(|_| organizations[0].name.clone()),
-            email: row.1.clone(),
-            display_name: row.2.clone(),
-            role: active_organization_id.map(|_| organizations[0].role.clone()),
-            organizations,
-        },
-    }))
+    Ok((
+        no_store_headers(),
+        Json(LoginResponse {
+            session_token,
+            expires_at,
+            user: CurrentUserResponse {
+                id: row.0,
+                organization_id: active_organization_id,
+                organization_name: active_organization_id.map(|_| organizations[0].name.clone()),
+                email: row.1.clone(),
+                display_name: row.2.clone(),
+                role: active_organization_id.map(|_| organizations[0].role.clone()),
+                organizations,
+            },
+        }),
+    ))
 }
 
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, StatusCode), ApiError> {
     let token = bearer(&headers)?;
     sqlx::query("UPDATE web_sessions SET revoked_at = NOW() WHERE token_hash = $1")
         .bind(token_hash(token))
         .execute(&state.postgres)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok((no_store_headers(), StatusCode::NO_CONTENT))
 }
 
 async fn current_user(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<CurrentUserResponse>, ApiError> {
+) -> Result<(HeaderMap, Json<CurrentUserResponse>), ApiError> {
     let session = user_session_auth(&state, &headers).await?;
-    Ok(Json(
-        current_user_response(&state, session.user_id, session.active_organization_id).await?,
+    Ok((
+        no_store_headers(),
+        Json(current_user_response(&state, session.user_id, session.active_organization_id).await?),
     ))
 }
 
@@ -1201,7 +1431,7 @@ async fn switch_organization(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<SwitchOrganizationRequest>,
-) -> Result<Json<CurrentUserResponse>, ApiError> {
+) -> Result<(HeaderMap, Json<CurrentUserResponse>), ApiError> {
     let session = user_session_auth(&state, &headers).await?;
     let updated = sqlx::query(
         "UPDATE web_sessions
@@ -1222,8 +1452,9 @@ async fn switch_organization(
             "you are not an active member of that organization",
         ));
     }
-    Ok(Json(
-        current_user_response(&state, session.user_id, Some(request.organization_id)).await?,
+    Ok((
+        no_store_headers(),
+        Json(current_user_response(&state, session.user_id, Some(request.organization_id)).await?),
     ))
 }
 
@@ -1250,11 +1481,15 @@ async fn create_organization(
         ));
     }
     let mut transaction = state.postgres.begin().await?;
-    let organization_id =
-        sqlx::query_scalar::<_, Uuid>("INSERT INTO organizations(name) VALUES ($1) RETURNING id")
-            .bind(name)
-            .fetch_one(&mut *transaction)
-            .await?;
+    let organization_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO organizations(name, sso_enforced, local_login_enabled)
+             VALUES ($1,$2,$3) RETURNING id",
+    )
+    .bind(name)
+    .bind(state.oidc.is_some())
+    .bind(state.oidc.is_none())
+    .fetch_one(&mut *transaction)
+    .await?;
     sqlx::query(
         "INSERT INTO organization_memberships(organization_id, user_id, role)
          VALUES ($1,$2,'admin')",
@@ -1286,12 +1521,12 @@ struct EnrollRequest {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct EnrollResponse {
-    installation_id: Uuid,
-    installation_token: String,
-    pseudonym_key: String,
-    organization_id: Uuid,
-    team_key: Option<String>,
+pub(crate) struct EnrollResponse {
+    pub(crate) installation_id: Uuid,
+    pub(crate) installation_token: String,
+    pub(crate) pseudonym_key: String,
+    pub(crate) organization_id: Uuid,
+    pub(crate) team_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1351,7 +1586,7 @@ const SUPPORTED_PLATFORMS: [&str; 5] = ["linux", "wsl", "windows", "macos", "oth
 /// Installation names are chosen by whoever holds an enrollment secret and are
 /// rendered back to organization admins, so they are bounded at the edge rather
 /// than trusted because the caller authenticated.
-fn validate_installation_name(name: &str) -> Result<&str, ApiError> {
+pub(crate) fn validate_installation_name(name: &str) -> Result<&str, ApiError> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 120 {
         return Err(ApiError::bad_request(
@@ -1366,7 +1601,7 @@ fn validate_installation_name(name: &str) -> Result<&str, ApiError> {
     Ok(name)
 }
 
-fn validate_platform(platform: &str) -> Result<&str, ApiError> {
+pub(crate) fn validate_platform(platform: &str) -> Result<&str, ApiError> {
     if SUPPORTED_PLATFORMS.contains(&platform) {
         return Ok(platform);
     }
@@ -1378,7 +1613,7 @@ async fn enroll(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<EnrollRequest>,
-) -> Result<Json<EnrollResponse>, ApiError> {
+) -> Result<(HeaderMap, Json<EnrollResponse>), ApiError> {
     let address = client_address(&headers, peer, state.trust_proxy_headers);
     state
         .rate_limiter
@@ -1426,13 +1661,16 @@ async fn enroll(
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
-        return Ok(Json(EnrollResponse {
-            installation_id,
-            installation_token,
-            pseudonym_key,
-            organization_id,
-            team_key: team_name,
-        }));
+        return Ok((
+            no_store_headers(),
+            Json(EnrollResponse {
+                installation_id,
+                installation_token,
+                pseudonym_key,
+                organization_id,
+                team_key: team_name,
+            }),
+        ));
     }
     transaction.rollback().await?;
     let row = sqlx::query_as::<_, (Uuid, Option<String>, Option<Uuid>, Option<String>)>(
@@ -1448,13 +1686,16 @@ async fn enroll(
         .bind(token_hash(&installation_token)).bind(team_key.clone()).bind(row.2)
         .bind(requested_platform.as_deref().unwrap_or("other"))
         .execute(&state.postgres).await?;
-    Ok(Json(EnrollResponse {
-        installation_id,
-        installation_token,
-        pseudonym_key,
-        organization_id: row.0,
-        team_key,
-    }))
+    Ok((
+        no_store_headers(),
+        Json(EnrollResponse {
+            installation_id,
+            installation_token,
+            pseudonym_key,
+            organization_id: row.0,
+            team_key,
+        }),
+    ))
 }
 
 async fn provision_classifier(
@@ -1590,6 +1831,11 @@ struct ManagedClassifyRequest {
     text: String,
 }
 
+#[derive(Deserialize)]
+struct ManagedClassifyBatchRequest {
+    texts: Vec<String>,
+}
+
 fn validate_managed_classification_text(text: &str) -> Result<&str, ApiError> {
     let text = text.trim();
     if text.is_empty() {
@@ -1615,6 +1861,65 @@ async fn managed_classify(
         state.rate_limits.classify,
     )?;
     let text = validate_managed_classification_text(&request.text)?;
+    let classifier = managed_classifier(&state, &auth).await?;
+    let diagnostic = classifier
+        .classify_with_diagnostics(text)
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                organization_id = %auth.organization_id,
+                installation_id = %auth.installation_id,
+                "managed classifier request failed"
+            );
+            ApiError::bad_gateway("managed classifier request failed")
+        })?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((response_headers, Json(diagnostic.assignment)))
+}
+
+async fn managed_classify_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ManagedClassifyBatchRequest>,
+) -> Result<(HeaderMap, Json<BatchClassification>), ApiError> {
+    let auth = installation_auth(&state, &headers).await?;
+    state.rate_limiter.check(
+        "classifier-managed",
+        &auth.installation_id.to_string(),
+        state.rate_limits.classify,
+    )?;
+    if request.texts.is_empty() || request.texts.len() > 12 {
+        return Err(ApiError::bad_request(
+            "classification batch must contain between 1 and 12 turns",
+        ));
+    }
+    let mut bytes = 0_usize;
+    let mut texts = Vec::with_capacity(request.texts.len());
+    for text in &request.texts {
+        let text = validate_managed_classification_text(text)?;
+        bytes = bytes.saturating_add(text.len());
+        texts.push(text.to_owned());
+    }
+    if bytes > 16 * 1024 {
+        return Err(ApiError::payload_too_large(
+            "classification batch cannot exceed 16384 text bytes",
+        ));
+    }
+    let classifier = managed_classifier(&state, &auth).await?;
+    let result = classifier
+        .classify_batch(&texts)
+        .await
+        .map_err(|_| ApiError::bad_gateway("managed classifier batch request failed"))?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((response_headers, Json(result)))
+}
+
+async fn managed_classifier(
+    state: &AppState,
+    auth: &InstallationAuth,
+) -> Result<OpenAiCompatibleClassifier, ApiError> {
     let organization =
         sqlx::query_as::<_, (bool, bool, String, String, String, String, String, String)>(
             "SELECT classifier_configured, classifier_enabled, classifier_execution_mode,
@@ -1660,7 +1965,7 @@ async fn managed_classify(
         ));
     }
     let (stored_credential, _) =
-        active_classifier_credential(&state, auth.organization_id, &credential_id).await?;
+        active_classifier_credential(state, auth.organization_id, &credential_id).await?;
     let credential = stored_credential.or_else(|| {
         state
             .classifier
@@ -1673,22 +1978,8 @@ async fn managed_classify(
             "the managed classifier credential is unavailable",
         ));
     }
-    let classifier = OpenAiCompatibleClassifier::new(endpoint, model, credential, response_mode)
-        .map_err(|_| ApiError::bad_gateway("managed classifier is unavailable"))?;
-    let diagnostic = classifier
-        .classify_with_diagnostics(text)
-        .await
-        .map_err(|_| {
-            tracing::warn!(
-                organization_id = %auth.organization_id,
-                installation_id = %auth.installation_id,
-                "managed classifier request failed"
-            );
-            ApiError::bad_gateway("managed classifier request failed")
-        })?;
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok((response_headers, Json(diagnostic.assignment)))
+    OpenAiCompatibleClassifier::new(endpoint, model, credential, response_mode)
+        .map_err(|_| ApiError::bad_gateway("managed classifier is unavailable"))
 }
 
 async fn ingest_sessions(
@@ -1702,6 +1993,48 @@ async fn ingest_sessions(
         &auth.installation_id.to_string(),
         state.rate_limits.ingest,
     )?;
+    let client_version = reported_client_version(&headers);
+    if let Some(version) = &client_version {
+        sqlx::query("UPDATE installations SET last_client_version = $2 WHERE id = $1")
+            .bind(auth.installation_id)
+            .bind(version)
+            .execute(&state.postgres)
+            .await?;
+        if !versions_share_major(version, env!("CARGO_PKG_VERSION")) {
+            return Err(ApiError::client_unsupported(
+                format!(
+                    "client major version {version} is incompatible with server {}",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                state.minimum_client_version.clone(),
+            ));
+        }
+    }
+    if state
+        .minimum_client_version
+        .as_deref()
+        .is_some_and(|minimum| {
+            client_version
+                .as_deref()
+                .is_none_or(|current| version_is_older(current, minimum))
+        })
+    {
+        return Err(ApiError::client_unsupported(
+            "this server does not support the reported Metrune client version",
+            state.minimum_client_version.clone(),
+        ));
+    }
+    if batch.schema_version != SCHEMA_VERSION && batch.schema_version != LEGACY_SCHEMA_VERSION
+        || batch.snapshots.iter().any(|snapshot| {
+            snapshot.schema_version != SCHEMA_VERSION
+                && snapshot.schema_version != LEGACY_SCHEMA_VERSION
+        })
+    {
+        return Err(ApiError::client_unsupported(
+            "this server does not support the uploaded schema",
+            state.minimum_client_version.clone(),
+        ));
+    }
     let snapshot_count = batch.snapshots.len();
     if batch.batch_id.trim().is_empty() || batch.batch_id.len() > 128 {
         return Err(ApiError::bad_request(
@@ -1721,12 +2054,15 @@ async fn ingest_sessions(
     .fetch_one(&state.postgres)
     .await?;
     if completed {
+        mark_installation_seen(&state.postgres, auth.installation_id).await?;
         return Ok(Json(IngestAck {
             batch_id: batch.batch_id,
             accepted: 0,
             duplicates: snapshot_count,
             rejected: 0,
             errors: vec![],
+            accepted_session_keys: vec![],
+            rejected_session_keys: vec![],
         }));
     }
     let mut ack = IngestAck {
@@ -1735,13 +2071,9 @@ async fn ingest_sessions(
         duplicates: 0,
         rejected: 0,
         errors: vec![],
+        accepted_session_keys: vec![],
+        rejected_session_keys: vec![],
     };
-    if batch.schema_version != SCHEMA_VERSION {
-        return Err(ApiError::bad_request(format!(
-            "unsupported batch schema {}",
-            batch.schema_version
-        )));
-    }
     let mut insert = state
         .clickhouse
         .insert::<SnapshotRow>("session_snapshots_dedup")?;
@@ -1749,29 +2081,52 @@ async fn ingest_sessions(
         match validate_snapshot(&snapshot) {
             Ok(()) => {
                 apply_server_prices(&state, auth.organization_id, &mut snapshot).await?;
+                validate_snapshot(&snapshot).map_err(ApiError::bad_request)?;
+                let session_key = snapshot.session_key.clone();
                 insert.write(&SnapshotRow::new(&auth, snapshot)?).await?;
                 ack.accepted += 1;
+                ack.accepted_session_keys.push(session_key);
             }
             Err(error) => {
                 ack.rejected += 1;
                 ack.errors.push(error);
+                ack.rejected_session_keys.push(snapshot.session_key);
             }
         }
     }
     insert.end().await?;
-    sqlx::query(
-        "INSERT INTO ingest_batches(installation_id, batch_id, snapshot_count, completed_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT DO NOTHING",
-    )
-    .bind(auth.installation_id)
-    .bind(&batch.batch_id)
-    .bind(snapshot_count as i32)
-    .execute(&state.postgres)
-    .await?;
-    sqlx::query("UPDATE installations SET last_seen_at = NOW() WHERE id = $1")
+    // A partial acknowledgement is not completion. The client acknowledges
+    // only the explicit accepted/rejected keys and retries the remaining
+    // queue; the batch id therefore stays open until every row is handled.
+    if ack.rejected == 0 {
+        sqlx::query(
+            "INSERT INTO ingest_batches(installation_id, batch_id, snapshot_count, completed_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT DO NOTHING",
+        )
         .bind(auth.installation_id)
+        .bind(&batch.batch_id)
+        .bind(snapshot_count as i32)
         .execute(&state.postgres)
         .await?;
+    }
+    mark_installation_seen(&state.postgres, auth.installation_id).await?;
     Ok(Json(ack))
+}
+
+fn reported_client_version(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CLIENT_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 64 && is_valid_version(value))
+        .map(str::to_string)
+}
+
+async fn mark_installation_seen(postgres: &PgPool, installation_id: Uuid) -> Result<(), ApiError> {
+    sqlx::query("UPDATE installations SET last_seen_at = NOW() WHERE id = $1")
+        .bind(installation_id)
+        .execute(postgres)
+        .await?;
+    Ok(())
 }
 
 struct InstallationAuth {
@@ -1801,11 +2156,37 @@ async fn installation_auth(
 }
 
 fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), String> {
-    if snapshot.schema_version != SCHEMA_VERSION {
+    if snapshot.schema_version != SCHEMA_VERSION && snapshot.schema_version != LEGACY_SCHEMA_VERSION
+    {
         return Err("unsupported snapshot schema".into());
     }
     if snapshot.session_key.len() < 32 || snapshot.user_key.len() < 32 {
         return Err("identifiers are not pseudonymous".into());
+    }
+    for (field, value) in [
+        ("session_key", snapshot.session_key.as_str()),
+        ("user_key", snapshot.user_key.as_str()),
+        ("client_id", snapshot.client_id.as_str()),
+        (
+            "category classifier_id",
+            snapshot.category.classifier_id.as_str(),
+        ),
+    ] {
+        validate_snapshot_text(field, value)?;
+    }
+    for (field, value) in [
+        ("project_key", snapshot.project_key.as_deref()),
+        ("project_alias", snapshot.project_alias.as_deref()),
+        ("team_key", snapshot.team_key.as_deref()),
+        ("client_version", snapshot.client_version.as_deref()),
+        (
+            "source_schema_version",
+            snapshot.source_schema_version.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_snapshot_text(field, value)?;
+        }
     }
     if snapshot.ended_at < snapshot.started_at {
         return Err("session ended before it started".into());
@@ -1813,7 +2194,158 @@ fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), String> {
     if snapshot.usage_by_model.is_empty() {
         return Err("snapshot contains no usage".into());
     }
+    if snapshot.usage_by_model.len() > MAX_USAGE_SLICES {
+        return Err(format!(
+            "snapshot contains more than {MAX_USAGE_SLICES} usage slices"
+        ));
+    }
+    if snapshot.turns.len() > MAX_TURNS {
+        return Err(format!("snapshot contains more than {MAX_TURNS} turns"));
+    }
+    if snapshot.classification_method_counts.len() > MAX_CLASSIFICATION_METHODS {
+        return Err(format!(
+            "snapshot contains more than {MAX_CLASSIFICATION_METHODS} classification methods"
+        ));
+    }
+    if !snapshot.category.confidence.is_finite()
+        || !(0.0..=1.0).contains(&snapshot.category.confidence)
+    {
+        return Err("category confidence must be finite and between 0 and 1".into());
+    }
+    if !snapshot.classified_token_coverage.is_finite()
+        || !(0.0..=1.0).contains(&snapshot.classified_token_coverage)
+    {
+        return Err("classified token coverage must be finite and between 0 and 1".into());
+    }
+    if snapshot.total_tokens() > MAX_SNAPSHOT_TOKENS {
+        return Err("snapshot token total exceeds the allowed bound".into());
+    }
+    if !snapshot.total_cost().is_finite()
+        || snapshot.total_cost() < 0.0
+        || snapshot.total_cost() > MAX_SNAPSHOT_COST
+    {
+        return Err("snapshot cost must be finite and within the allowed bound".into());
+    }
+    for slice in &snapshot.usage_by_model {
+        validate_snapshot_text("provider_id", &slice.provider_id)?;
+        validate_snapshot_text("model_id", &slice.model_id)?;
+        validate_snapshot_cost(&slice.cost)?;
+    }
+    validate_classifier_usage(&snapshot.classifier_usage)?;
+    if snapshot.turns.iter().any(|turn| {
+        turn.model_activity.len() > MAX_MODEL_ACTIVITY_STEPS
+            || turn.workflow_signals.len() > MAX_WORKFLOW_SIGNALS
+    }) {
+        return Err("turn activity or workflow signals exceed the allowed bound".into());
+    }
+    for turn in &snapshot.turns {
+        validate_snapshot_text("turn classifier_id", &turn.category.classifier_id)?;
+        if !turn.category.confidence.is_finite() || !(0.0..=1.0).contains(&turn.category.confidence)
+        {
+            return Err("turn category confidence must be finite and between 0 and 1".into());
+        }
+        for step in &turn.model_activity {
+            validate_snapshot_text("activity provider_id", &step.provider_id)?;
+            validate_snapshot_text("activity model_id", &step.model_id)?;
+            validate_snapshot_cost(&step.cost)?;
+        }
+    }
+    if snapshot.schema_version == SCHEMA_VERSION && !snapshot.turns.is_empty() {
+        let turn_tokens = snapshot
+            .turns
+            .iter()
+            .map(metrune_core::TurnSnapshot::total_tokens)
+            .sum::<u64>();
+        if turn_tokens != snapshot.total_tokens() {
+            return Err("turn token totals do not reconcile with session usage".into());
+        }
+        let turn_cost = snapshot
+            .turns
+            .iter()
+            .map(metrune_core::TurnSnapshot::total_cost)
+            .sum::<f64>();
+        if (turn_cost - snapshot.total_cost()).abs() > 0.000_001 {
+            return Err("turn cost totals do not reconcile with session usage".into());
+        }
+        if snapshot
+            .turns
+            .windows(2)
+            .any(|pair| pair[0].sequence >= pair[1].sequence)
+        {
+            return Err("turn sequences must be strictly increasing".into());
+        }
+        if snapshot.turns.iter().any(|turn| {
+            turn.model_activity
+                .windows(2)
+                .any(|pair| pair[0].sequence >= pair[1].sequence)
+        }) {
+            return Err("model activity sequences must be strictly increasing".into());
+        }
+        let mut turn_models =
+            BTreeMap::<(String, String), (metrune_core::TokenBreakdown, f64)>::new();
+        for step in snapshot
+            .turns
+            .iter()
+            .flat_map(|turn| turn.model_activity.iter())
+        {
+            let key = (
+                step.provider_id.trim().to_ascii_lowercase(),
+                canonical_model_id(&step.model_id),
+            );
+            let entry = turn_models.entry(key).or_default();
+            entry.0.add_assign(&step.tokens);
+            entry.1 += step.cost.amount;
+        }
+        for slice in &snapshot.usage_by_model {
+            let key = (
+                slice.provider_id.trim().to_ascii_lowercase(),
+                canonical_model_id(&slice.model_id),
+            );
+            let Some((tokens, cost)) = turn_models.remove(&key) else {
+                return Err("session model usage is missing from turn activity".into());
+            };
+            if tokens != slice.tokens || (cost - slice.cost.amount).abs() > 0.000_001 {
+                return Err("turn model totals do not reconcile with session usage".into());
+            }
+        }
+        if !turn_models.is_empty() {
+            return Err("turn activity contains model usage missing from session totals".into());
+        }
+    }
     Ok(())
+}
+
+fn validate_snapshot_text(field: &str, value: &str) -> Result<(), String> {
+    if value.len() > MAX_SNAPSHOT_TEXT_BYTES {
+        return Err(format!("{field} exceeds {MAX_SNAPSHOT_TEXT_BYTES} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} contains control characters"));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_cost(cost: &metrune_core::Cost) -> Result<(), String> {
+    if !cost.amount.is_finite() || cost.amount < 0.0 || cost.amount > MAX_SNAPSHOT_COST {
+        return Err("cost amount must be finite and within the allowed bound".into());
+    }
+    validate_snapshot_text("cost currency", &cost.currency)?;
+    if cost.currency.chars().count() != 3 {
+        return Err("cost currency must be a three-letter code".into());
+    }
+    if let Some(version) = cost.pricebook_version.as_deref() {
+        validate_snapshot_text("pricebook_version", version)?;
+    }
+    if let Some(source) = cost.price_source.as_deref() {
+        validate_snapshot_text("price_source", source)?;
+    }
+    Ok(())
+}
+
+fn validate_classifier_usage(usage: &metrune_core::ClassifierUsage) -> Result<(), String> {
+    validate_snapshot_text("classifier provider_id", &usage.provider_id)?;
+    validate_snapshot_text("classifier model_id", &usage.model_id)?;
+    validate_snapshot_cost(&usage.cost)
 }
 
 #[derive(Row, Serialize, Deserialize)]
@@ -1878,7 +2410,7 @@ impl SnapshotRow {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct AnalyticsQuery {
     from: Option<String>,
     to: Option<String>,
@@ -1887,6 +2419,7 @@ struct AnalyticsQuery {
     category: Option<String>,
     client: Option<String>,
     status: Option<String>,
+    workflow: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Row)]
@@ -1957,15 +2490,86 @@ async fn analytics_category_model(
     Query(query): Query<AnalyticsQuery>,
 ) -> Result<Json<Vec<CategoryModelRow>>, ApiError> {
     let auth = analytics_auth(&state, &headers).await?;
-    let base = "SELECT category_id category, concat(JSONExtractString(usage_slice, 'providerId'), '/', JSONExtractString(usage_slice, 'modelId')) model, toUInt64(sum(JSONExtractUInt(usage_slice, 'tokens', 'input') + JSONExtractUInt(usage_slice, 'tokens', 'output') + JSONExtractUInt(usage_slice, 'tokens', 'cacheRead') + JSONExtractUInt(usage_slice, 'tokens', 'cacheWrite') + JSONExtractUInt(usage_slice, 'tokens', 'reasoning'))) tokens, sum(JSONExtractFloat(usage_slice, 'cost', 'amount')) cost, toUInt64(uniqExact(session_key)) sessions FROM session_snapshots_dedup FINAL ARRAY JOIN JSONExtractArrayRaw(snapshot_json, 'usageByModel') AS usage_slice";
-    let (mut sql, params) = filtered_query(base, &query, &auth.organization_id);
-    sql.push_str(" AND classification_status = 'classified'");
-    sql.push_str(" GROUP BY category, model ORDER BY category, tokens DESC LIMIT 500");
+    let v2 = "SELECT JSONExtractString(turn, 'category', 'categoryId') category, concat(JSONExtractString(step, 'providerId'), '/', JSONExtractString(step, 'modelId')) model, JSONExtractUInt(step, 'tokens', 'input') + JSONExtractUInt(step, 'tokens', 'output') + JSONExtractUInt(step, 'tokens', 'cacheRead') + JSONExtractUInt(step, 'tokens', 'cacheWrite') + JSONExtractUInt(step, 'tokens', 'reasoning') tokens, JSONExtractFloat(step, 'cost', 'amount') cost, session_key FROM (SELECT *, arrayJoin(JSONExtractArrayRaw(snapshot_json, 'turns')) AS turn FROM session_snapshots_dedup FINAL) ARRAY JOIN JSONExtractArrayRaw(turn, 'modelActivity') AS step";
+    let v1 = "SELECT category_id category, concat(JSONExtractString(usage_slice, 'providerId'), '/', JSONExtractString(usage_slice, 'modelId')) model, JSONExtractUInt(usage_slice, 'tokens', 'input') + JSONExtractUInt(usage_slice, 'tokens', 'output') + JSONExtractUInt(usage_slice, 'tokens', 'cacheRead') + JSONExtractUInt(usage_slice, 'tokens', 'cacheWrite') + JSONExtractUInt(usage_slice, 'tokens', 'reasoning') tokens, JSONExtractFloat(usage_slice, 'cost', 'amount') cost, session_key FROM session_snapshots_dedup FINAL ARRAY JOIN JSONExtractArrayRaw(snapshot_json, 'usageByModel') AS usage_slice";
+    let mut v2_query = query.clone();
+    let category = v2_query.category.take();
+    let (mut v2_sql, mut v2_params) = filtered_query(v2, &v2_query, &auth.organization_id);
+    v2_sql.push_str(" AND length(JSONExtractArrayRaw(snapshot_json, 'turns')) > 0 AND JSONExtractString(turn, 'category', 'classificationStatus') = 'classified'");
+    if let Some(category) = category {
+        v2_sql.push_str(" AND JSONExtractString(turn, 'category', 'categoryId') = ?");
+        v2_params.push(category);
+    }
+    let (mut v1_sql, v1_params) = filtered_query(v1, &query, &auth.organization_id);
+    v1_sql.push_str(" AND length(JSONExtractArrayRaw(snapshot_json, 'turns')) = 0 AND classification_status = 'classified'");
+    let sql = format!(
+        "SELECT category, model, toUInt64(sum(tokens)) tokens, sum(cost) cost, toUInt64(uniqExact(session_key)) sessions FROM ({v2_sql} UNION ALL {v1_sql}) GROUP BY category, model ORDER BY category, tokens DESC LIMIT 500"
+    );
+    let mut q = state.clickhouse.query(&sql);
+    for param in v2_params.into_iter().chain(v1_params) {
+        q = q.bind(param);
+    }
+    Ok(Json(q.fetch_all::<CategoryModelRow>().await?))
+}
+
+#[derive(Deserialize, Serialize, Row)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowModelRow {
+    signal: String,
+    model: String,
+    count: u64,
+    tokens: u64,
+    cost: f64,
+    sessions: u64,
+}
+
+async fn analytics_workflow_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AnalyticsQuery>,
+) -> Result<Json<Vec<WorkflowModelRow>>, ApiError> {
+    let auth = analytics_auth(&state, &headers).await?;
+    let base = "SELECT JSONExtractString(signal, 'signal') signal, if(JSONHas(signal, 'modelStepIndex'), concat(JSONExtractString(arrayElement(JSONExtractArrayRaw(turn, 'modelActivity'), JSONExtractUInt(signal, 'modelStepIndex') + 1), 'providerId'), '/', JSONExtractString(arrayElement(JSONExtractArrayRaw(turn, 'modelActivity'), JSONExtractUInt(signal, 'modelStepIndex') + 1), 'modelId')), 'Unattributed') model, toUInt64(sum(JSONExtractUInt(signal, 'count'))) count, toUInt64(sum(if(JSONHas(signal, 'modelStepIndex'), JSONExtractUInt(arrayElement(JSONExtractArrayRaw(turn, 'modelActivity'), JSONExtractUInt(signal, 'modelStepIndex') + 1), 'tokens', 'input') + JSONExtractUInt(arrayElement(JSONExtractArrayRaw(turn, 'modelActivity'), JSONExtractUInt(signal, 'modelStepIndex') + 1), 'tokens', 'output') + JSONExtractUInt(arrayElement(JSONExtractArrayRaw(turn, 'modelActivity'), JSONExtractUInt(signal, 'modelStepIndex') + 1), 'tokens', 'cacheRead') + JSONExtractUInt(arrayElement(JSONExtractArrayRaw(turn, 'modelActivity'), JSONExtractUInt(signal, 'modelStepIndex') + 1), 'tokens', 'cacheWrite') + JSONExtractUInt(arrayElement(JSONExtractArrayRaw(turn, 'modelActivity'), JSONExtractUInt(signal, 'modelStepIndex') + 1), 'tokens', 'reasoning'), 0))) tokens, sum(if(JSONHas(signal, 'modelStepIndex'), JSONExtractFloat(arrayElement(JSONExtractArrayRaw(turn, 'modelActivity'), JSONExtractUInt(signal, 'modelStepIndex') + 1), 'cost', 'amount'), 0)) cost, toUInt64(uniqExact(session_key)) sessions FROM (SELECT *, arrayJoin(JSONExtractArrayRaw(snapshot_json, 'turns')) AS turn FROM session_snapshots_dedup FINAL) ARRAY JOIN JSONExtractArrayRaw(turn, 'workflowSignals') AS signal";
+    let (mut sql, mut params) = filtered_query(base, &query, &auth.organization_id);
+    if let Some(workflow) = &query.workflow {
+        sql.push_str(" AND JSONExtractString(signal, 'signal') = ?");
+        params.push(workflow.clone());
+    }
+    sql.push_str(" GROUP BY signal, model ORDER BY signal, count DESC LIMIT 500");
     let mut q = state.clickhouse.query(&sql);
     for param in params {
         q = q.bind(param);
     }
-    Ok(Json(q.fetch_all::<CategoryModelRow>().await?))
+    Ok(Json(q.fetch_all::<WorkflowModelRow>().await?))
+}
+
+#[derive(Deserialize, Serialize, Row)]
+#[serde(rename_all = "camelCase")]
+struct ClassificationOverheadRow {
+    provider: String,
+    model: String,
+    measurement: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    reasoning_tokens: u64,
+    requests: u64,
+}
+
+async fn analytics_classification_overhead(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AnalyticsQuery>,
+) -> Result<Json<Vec<ClassificationOverheadRow>>, ApiError> {
+    let auth = analytics_auth(&state, &headers).await?;
+    let base = "SELECT JSONExtractString(snapshot_json, 'classifierUsage', 'providerId') provider, JSONExtractString(snapshot_json, 'classifierUsage', 'modelId') model, JSONExtractString(snapshot_json, 'classifierUsage', 'measurement') measurement, toUInt64(sum(JSONExtractUInt(snapshot_json, 'classifierUsage', 'tokens', 'input'))) input_tokens, toUInt64(sum(JSONExtractUInt(snapshot_json, 'classifierUsage', 'tokens', 'output'))) output_tokens, toUInt64(sum(JSONExtractUInt(snapshot_json, 'classifierUsage', 'tokens', 'cacheRead'))) cache_read_tokens, toUInt64(sum(JSONExtractUInt(snapshot_json, 'classifierUsage', 'tokens', 'reasoning'))) reasoning_tokens, toUInt64(sum(JSONExtractUInt(snapshot_json, 'classifierUsage', 'requestCount'))) requests FROM session_snapshots_dedup FINAL";
+    let (mut sql, params) = filtered_query(base, &query, &auth.organization_id);
+    sql.push_str(" AND JSONExtractUInt(snapshot_json, 'classifierUsage', 'requestCount') > 0 GROUP BY provider, model, measurement ORDER BY requests DESC");
+    let mut q = state.clickhouse.query(&sql);
+    for param in params {
+        q = q.bind(param);
+    }
+    Ok(Json(q.fetch_all::<ClassificationOverheadRow>().await?))
 }
 
 #[derive(Deserialize, Serialize, Row)]
@@ -1987,6 +2591,7 @@ struct BreakdownQuery {
     category: Option<String>,
     client: Option<String>,
     status: Option<String>,
+    workflow: Option<String>,
 }
 
 async fn analytics_breakdowns(
@@ -2013,6 +2618,12 @@ async fn analytics_breakdowns(
             "ARRAY JOIN JSONExtractArrayRaw(snapshot_json, 'usageByModel') AS usage_slice",
         ),
         "status" => ("classification_status", "total_tokens", "total_cost", ""),
+        "workflow" => (
+            "JSONExtractString(signal, 'signal')",
+            "arraySum(step -> JSONExtractUInt(step, 'tokens', 'input') + JSONExtractUInt(step, 'tokens', 'output') + JSONExtractUInt(step, 'tokens', 'cacheRead') + JSONExtractUInt(step, 'tokens', 'cacheWrite') + JSONExtractUInt(step, 'tokens', 'reasoning'), JSONExtractArrayRaw(turn, 'modelActivity'))",
+            "arraySum(step -> JSONExtractFloat(step, 'cost', 'amount'), JSONExtractArrayRaw(turn, 'modelActivity'))",
+            "ARRAY JOIN JSONExtractArrayRaw(turn, 'workflowSignals') AS signal",
+        ),
         _ => return Err(ApiError::bad_request("unsupported breakdown dimension")),
     };
     let filters = AnalyticsQuery {
@@ -2023,11 +2634,47 @@ async fn analytics_breakdowns(
         category: query.category,
         client: query.client,
         status: query.status,
+        workflow: query.workflow,
     };
-    let base = format!("SELECT {dimension} dimension, toUInt64(sum({tokens})) tokens, sum({cost}) cost, toUInt64(uniqExact(session_key)) sessions FROM session_snapshots_dedup FINAL {array_join}");
-    let (mut sql, params) = filtered_query(&base, &filters, &auth.organization_id);
+    if query.dimension.as_deref().unwrap_or("category") == "category" {
+        let mut v2_filters = filters.clone();
+        let category = v2_filters.category.take();
+        let v2 = "SELECT JSONExtractString(turn, 'category', 'categoryId') dimension, arraySum(step -> JSONExtractUInt(step, 'tokens', 'input') + JSONExtractUInt(step, 'tokens', 'output') + JSONExtractUInt(step, 'tokens', 'cacheRead') + JSONExtractUInt(step, 'tokens', 'cacheWrite') + JSONExtractUInt(step, 'tokens', 'reasoning'), JSONExtractArrayRaw(turn, 'modelActivity')) tokens, arraySum(step -> JSONExtractFloat(step, 'cost', 'amount'), JSONExtractArrayRaw(turn, 'modelActivity')) cost, session_key FROM (SELECT *, arrayJoin(JSONExtractArrayRaw(snapshot_json, 'turns')) AS turn FROM session_snapshots_dedup FINAL)";
+        let (mut v2_sql, mut v2_params) = filtered_query(v2, &v2_filters, &auth.organization_id);
+        v2_sql.push_str(
+            " AND JSONExtractString(turn, 'category', 'classificationStatus') = 'classified'",
+        );
+        if let Some(category) = category {
+            v2_sql.push_str(" AND JSONExtractString(turn, 'category', 'categoryId') = ?");
+            v2_params.push(category);
+        }
+        let v1 = "SELECT category_id dimension, total_tokens tokens, total_cost cost, session_key FROM session_snapshots_dedup FINAL";
+        let (mut v1_sql, v1_params) = filtered_query(v1, &filters, &auth.organization_id);
+        v1_sql.push_str(" AND length(JSONExtractArrayRaw(snapshot_json, 'turns')) = 0 AND classification_status = 'classified'");
+        let sql = format!(
+            "SELECT dimension, toUInt64(sum(tokens)) tokens, sum(cost) cost, toUInt64(uniqExact(session_key)) sessions FROM ({v2_sql} UNION ALL {v1_sql}) GROUP BY dimension ORDER BY cost DESC LIMIT 50"
+        );
+        let mut q = state.clickhouse.query(&sql);
+        for param in v2_params.into_iter().chain(v1_params) {
+            q = q.bind(param);
+        }
+        return Ok(Json(q.fetch_all::<BreakdownRow>().await?));
+    }
+    let source = if query.dimension.as_deref() == Some("workflow") {
+        "FROM (SELECT *, arrayJoin(JSONExtractArrayRaw(snapshot_json, 'turns')) AS turn FROM session_snapshots_dedup FINAL) ARRAY JOIN JSONExtractArrayRaw(turn, 'workflowSignals') AS signal".to_string()
+    } else {
+        format!("FROM session_snapshots_dedup FINAL {array_join}")
+    };
+    let base = format!("SELECT {dimension} dimension, toUInt64(sum({tokens})) tokens, sum({cost}) cost, toUInt64(uniqExact(session_key)) sessions {source}");
+    let (mut sql, mut params) = filtered_query(&base, &filters, &auth.organization_id);
     if query.dimension.as_deref().unwrap_or("category") == "category" {
         sql.push_str(" AND classification_status = 'classified'");
+    }
+    if query.dimension.as_deref() == Some("workflow") {
+        if let Some(workflow) = &filters.workflow {
+            sql.push_str(" AND JSONExtractString(signal, 'signal') = ?");
+            params.push(workflow.clone());
+        }
     }
     sql.push_str(" GROUP BY dimension ORDER BY cost DESC LIMIT 50");
     let mut q = state.clickhouse.query(&sql);
@@ -2061,6 +2708,7 @@ struct SessionsQuery {
     category: Option<String>,
     client: Option<String>,
     status: Option<String>,
+    workflow: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
     sort: Option<String>,
@@ -2100,6 +2748,7 @@ async fn analytics_sessions(
         category: query.category,
         client: query.client,
         status: query.status,
+        workflow: query.workflow,
     };
     let base = "SELECT session_key, installation_id, client_id, project_alias, category_id, category_confidence, classification_status, total_tokens, total_cost, ended_at_ms FROM session_snapshots_dedup FINAL";
     let (mut sql, params) = filtered_query(base, &filters, &auth.organization_id);
@@ -2109,6 +2758,46 @@ async fn analytics_sessions(
         q = q.bind(param);
     }
     Ok(Json(q.fetch_all::<SessionRow>().await?))
+}
+
+#[derive(Deserialize, Row)]
+struct SnapshotJsonRow {
+    snapshot_json: String,
+}
+
+async fn analytics_session_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_key): Path<String>,
+) -> Result<Json<SessionSnapshot>, ApiError> {
+    let auth = analytics_auth(&state, &headers).await?;
+    if session_key.len() < 32 || session_key.len() > 128 {
+        return Err(ApiError::bad_request("invalid session key"));
+    }
+    let mut sql = "SELECT snapshot_json FROM session_snapshots_dedup FINAL WHERE organization_id = ? AND session_key = ?".to_string();
+    if auth.user_id.is_some() {
+        sql.push_str(" AND owner_user_id = ?");
+    } else if auth.role == "viewer" {
+        return Err(ApiError::forbidden(
+            "session drilldown requires analyst or admin role",
+        ));
+    }
+    sql.push_str(" LIMIT 1");
+    let mut query = state
+        .clickhouse
+        .query(&sql)
+        .bind(&auth.organization_id)
+        .bind(&session_key);
+    if let Some(user_id) = auth.user_id {
+        query = query.bind(user_id.to_string());
+    }
+    let row = query
+        .fetch_optional::<SnapshotJsonRow>()
+        .await?
+        .ok_or(ApiError::not_found("session not found"))?;
+    let snapshot = serde_json::from_str(&row.snapshot_json)
+        .map_err(|_| ApiError::bad_gateway("stored session detail is invalid"))?;
+    Ok(Json(snapshot))
 }
 
 #[derive(Serialize)]
@@ -2212,6 +2901,13 @@ fn filtered_query(
             params.push(value.clone());
         }
     }
+    if let Some(workflow) = &query.workflow {
+        clauses.push(
+            "arrayExists(turn -> arrayExists(signal -> JSONExtractString(signal, 'signal') = ?, JSONExtractArrayRaw(turn, 'workflowSignals')), JSONExtractArrayRaw(snapshot_json, 'turns'))"
+                .into(),
+        );
+        params.push(workflow.clone());
+    }
     (format!("{base} WHERE {}", clauses.join(" AND ")), params)
 }
 
@@ -2268,9 +2964,11 @@ pub(crate) async fn dashboard_auth(
            ON m.user_id = s.user_id
           AND m.organization_id = s.active_organization_id
          WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > NOW()
-           AND u.disabled_at IS NULL AND m.disabled_at IS NULL",
+           AND u.disabled_at IS NULL AND m.disabled_at IS NULL
+           AND s.authentication_method = $2",
     )
     .bind(&digest)
+    .bind(active_authentication_method(state))
     .fetch_optional(&state.postgres)
     .await?
     .ok_or(ApiError::unauthorized(
@@ -2324,27 +3022,44 @@ async fn expired_session_reaper(pool: PgPool) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
     loop {
         interval.tick().await;
-        let result = sqlx::query(
-            "WITH deleted_sessions AS (
-               DELETE FROM web_sessions
-               WHERE expires_at < NOW() OR revoked_at < NOW() - INTERVAL '7 days'
-             ), deleted_invitations AS (
-               DELETE FROM workspace_invitations
-               WHERE expires_at < NOW() - INTERVAL '7 days'
-                  OR revoked_at < NOW() - INTERVAL '7 days'
-                  OR accepted_at < NOW() - INTERVAL '7 days'
-             )
-             DELETE FROM password_reset_tokens
-             WHERE expires_at < NOW() - INTERVAL '7 days'
-                OR revoked_at < NOW() - INTERVAL '7 days'
-                OR consumed_at < NOW() - INTERVAL '7 days'",
-        )
-        .execute(&pool)
-        .await;
-        if let Err(error) = result {
+        if let Err(error) = reap_expired_identity_records(&pool).await {
             tracing::warn!(%error, "expired session reaper failed");
         }
     }
+}
+
+/// Performs one cleanup pass for the hourly identity-record reaper.
+///
+/// Kept as a separate operation so the retention contract can be exercised
+/// against PostgreSQL without waiting for a background timer.
+pub(crate) async fn reap_expired_identity_records(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "WITH deleted_sessions AS (
+           DELETE FROM web_sessions
+           WHERE expires_at < NOW() OR revoked_at < NOW() - INTERVAL '7 days'
+         ), deleted_invitations AS (
+           DELETE FROM workspace_invitations
+           WHERE expires_at < NOW() - INTERVAL '7 days'
+              OR revoked_at < NOW() - INTERVAL '7 days'
+              OR accepted_at < NOW() - INTERVAL '7 days'
+         ), deleted_device_authorizations AS (
+           DELETE FROM device_enrollment_authorizations
+           WHERE expires_at < NOW() - INTERVAL '7 days'
+              OR denied_at < NOW() - INTERVAL '7 days'
+              OR consumed_at < NOW() - INTERVAL '7 days'
+         ), deleted_oidc_authorizations AS (
+           DELETE FROM oidc_authorization_attempts
+           WHERE expires_at < NOW() - INTERVAL '7 days'
+              OR consumed_at < NOW() - INTERVAL '7 days'
+         )
+         DELETE FROM password_reset_tokens
+         WHERE expires_at < NOW() - INTERVAL '7 days'
+            OR revoked_at < NOW() - INTERVAL '7 days'
+            OR consumed_at < NOW() - INTERVAL '7 days'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2476,33 +3191,33 @@ struct UpdateMemberRequest {
 }
 
 async fn ensure_another_admin(
-    state: &AppState,
+    transaction: &mut Transaction<'_, Postgres>,
     organization_id: Uuid,
     target_user_id: Uuid,
 ) -> Result<(), ApiError> {
-    let target_is_admin = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-           SELECT 1 FROM organization_memberships
-           WHERE organization_id = $1 AND user_id = $2
-             AND role = 'admin' AND disabled_at IS NULL
-         )",
+    // Lock all active memberships for this organization before checking the
+    // final-admin invariant. Without this, two concurrent demotions/removals
+    // can both observe the same second admin and leave the organization with
+    // none.
+    let memberships = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT user_id, role
+         FROM organization_memberships
+         WHERE organization_id = $1 AND disabled_at IS NULL
+         FOR UPDATE",
     )
     .bind(organization_id)
-    .bind(target_user_id)
-    .fetch_one(&state.postgres)
+    .fetch_all(&mut **transaction)
     .await?;
+    let target_is_admin = memberships
+        .iter()
+        .any(|(user_id, role)| *user_id == target_user_id && role == "admin");
     if !target_is_admin {
         return Ok(());
     }
-    let other_admins = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM organization_memberships
-         WHERE organization_id = $1 AND user_id <> $2
-           AND role = 'admin' AND disabled_at IS NULL",
-    )
-    .bind(organization_id)
-    .bind(target_user_id)
-    .fetch_one(&state.postgres)
-    .await?;
+    let other_admins = memberships
+        .iter()
+        .filter(|(user_id, role)| *user_id != target_user_id && role == "admin")
+        .count();
     if other_admins == 0 {
         return Err(ApiError::conflict(
             "the final organization admin cannot be removed or demoted",
@@ -2521,8 +3236,9 @@ async fn update_member(
     auth.require_admin()?;
     let role = validate_member_role(request.role.trim())?;
     let organization_id = auth.organization_uuid()?;
+    let mut transaction = state.postgres.begin().await?;
     if role != "admin" {
-        ensure_another_admin(&state, organization_id, user_id).await?;
+        ensure_another_admin(&mut transaction, organization_id, user_id).await?;
     }
     let updated = sqlx::query(
         "UPDATE organization_memberships
@@ -2532,11 +3248,13 @@ async fn update_member(
     .bind(organization_id)
     .bind(user_id)
     .bind(role)
-    .execute(&state.postgres)
+    .execute(&mut *transaction)
     .await?;
     if updated.rows_affected() == 0 {
+        transaction.rollback().await.ok();
         return Err(ApiError::not_found("organization member not found"));
     }
+    transaction.commit().await?;
     audit(
         &state,
         organization_id,
@@ -2558,8 +3276,8 @@ async fn remove_member(
     let auth = dashboard_auth(&state, &headers).await?;
     auth.require_admin()?;
     let organization_id = auth.organization_uuid()?;
-    ensure_another_admin(&state, organization_id, user_id).await?;
     let mut transaction = state.postgres.begin().await?;
+    ensure_another_admin(&mut transaction, organization_id, user_id).await?;
     sqlx::query(
         "UPDATE web_sessions SET active_organization_id = NULL
          WHERE user_id = $1 AND active_organization_id = $2",
@@ -2745,18 +3463,33 @@ async fn delete_team(
     let auth = dashboard_auth(&state, &headers).await?;
     auth.require_admin()?;
     let organization_id = auth.organization_uuid()?;
-    sqlx::query("UPDATE installations SET team_key = NULL WHERE team_id = $1")
-        .bind(id)
-        .execute(&state.postgres)
-        .await?;
-    let deleted = sqlx::query("DELETE FROM teams WHERE id = $1 AND organization_id = $2")
-        .bind(id)
-        .bind(organization_id)
-        .execute(&state.postgres)
-        .await?;
-    if deleted.rows_affected() == 0 {
+    let mut transaction = state.postgres.begin().await?;
+    let owned = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM teams
+         WHERE id = $1 AND organization_id = $2
+         FOR UPDATE",
+    )
+    .bind(id)
+    .bind(organization_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if owned.is_none() {
         return Err(ApiError::not_found("team not found"));
     }
+    sqlx::query(
+        "UPDATE installations SET team_key = NULL
+         WHERE team_id = $1 AND organization_id = $2",
+    )
+    .bind(id)
+    .bind(organization_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("DELETE FROM teams WHERE id = $1 AND organization_id = $2")
+        .bind(id)
+        .bind(organization_id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
     audit(
         &state,
         organization_id,
@@ -2779,6 +3512,7 @@ struct InstallationResponse {
     team_name: Option<String>,
     created_at: chrono::DateTime<Utc>,
     last_seen_at: Option<chrono::DateTime<Utc>>,
+    last_client_version: Option<String>,
     revoked: bool,
 }
 
@@ -2797,10 +3531,14 @@ async fn list_installations(
             Option<String>,
             chrono::DateTime<Utc>,
             Option<chrono::DateTime<Utc>>,
+            Option<String>,
             bool,
         ),
     >(
-        "SELECT i.id, i.name, i.team_id, t.name, i.created_at, i.last_seen_at, i.revoked_at IS NOT NULL FROM installations i LEFT JOIN teams t ON t.id = i.team_id WHERE i.organization_id = $1 ORDER BY i.created_at DESC LIMIT 500",
+        "SELECT i.id, i.name, i.team_id, t.name, i.created_at, i.last_seen_at,
+                i.last_client_version, i.revoked_at IS NOT NULL
+         FROM installations i LEFT JOIN teams t ON t.id = i.team_id
+         WHERE i.organization_id = $1 ORDER BY i.created_at DESC LIMIT 500",
     )
     .bind(auth.organization_uuid()?)
     .fetch_all(&state.postgres)
@@ -2808,7 +3546,16 @@ async fn list_installations(
     Ok(Json(
         rows.into_iter()
             .map(
-                |(id, name, team_id, team_name, created_at, last_seen_at, revoked)| {
+                |(
+                    id,
+                    name,
+                    team_id,
+                    team_name,
+                    created_at,
+                    last_seen_at,
+                    last_client_version,
+                    revoked,
+                )| {
                     InstallationResponse {
                         id,
                         name,
@@ -2816,6 +3563,7 @@ async fn list_installations(
                         team_name,
                         created_at,
                         last_seen_at,
+                        last_client_version,
                         revoked,
                     }
                 },
@@ -2891,8 +3639,8 @@ async fn get_settings(
     headers: HeaderMap,
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
-    let row = sqlx::query_as::<_, (String, i32, bool, bool)>(
-        "SELECT name, retention_days, sso_enforced, local_login_enabled FROM organizations WHERE id = $1",
+    let row = sqlx::query_as::<_, (String, i32)>(
+        "SELECT name, retention_days FROM organizations WHERE id = $1",
     )
     .bind(auth.organization_uuid()?)
     .fetch_one(&state.postgres)
@@ -2900,8 +3648,8 @@ async fn get_settings(
     Ok(Json(SettingsResponse {
         organization_name: row.0,
         retention_days: row.1,
-        sso_enforced: row.2,
-        local_login_enabled: row.3,
+        sso_enforced: state.oidc.is_some(),
+        local_login_enabled: state.oidc.is_none(),
     }))
 }
 
@@ -3601,7 +4349,7 @@ async fn revoke_credential(
 
 #[derive(Deserialize)]
 struct RecoveryRequest {
-    password: String,
+    password: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3614,7 +4362,7 @@ async fn export_recovery_key(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<RecoveryRequest>,
-) -> Result<Json<RecoveryResponse>, ApiError> {
+) -> Result<(HeaderMap, Json<RecoveryResponse>), ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
     auth.require_admin()?;
     let user_id = auth
@@ -3626,23 +4374,52 @@ async fn export_recovery_key(
         state.rate_limits.vault_recovery,
     )?;
     let organization_id = auth.organization_uuid()?;
-    let password_hash = sqlx::query_scalar::<_, String>(
-        "SELECT password_hash FROM users WHERE id = $1 AND disabled_at IS NULL",
-    )
-    .bind(user_id)
-    .fetch_one(&state.postgres)
-    .await?;
-    let password = request.password.clone();
-    let password_valid = tokio::task::spawn_blocking(move || {
-        PasswordHash::new(&password_hash).is_ok_and(|parsed| {
-            Argon2::default()
-                .verify_password(password.as_bytes(), &parsed)
-                .is_ok()
+    if state.oidc.is_some() {
+        if request.password.is_some() {
+            return Err(ApiError::bad_request(
+                "password reauthentication is unavailable while single sign-on is configured",
+            ));
+        }
+        let session = user_session_auth(&state, &headers).await?;
+        let recently_authenticated = sqlx::query_scalar::<_, bool>(
+            "SELECT authentication_method = 'oidc'
+                    AND created_at > NOW() - INTERVAL '10 minutes'
+             FROM web_sessions
+             WHERE id = $1 AND user_id = $2",
+        )
+        .bind(session.session_id)
+        .bind(user_id)
+        .fetch_one(&state.postgres)
+        .await?;
+        if !recently_authenticated {
+            return Err(ApiError::unauthorized(
+                "a recent single sign-on is required to export the recovery key",
+            ));
+        }
+    } else {
+        let password_hash = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT password_hash FROM users WHERE id = $1 AND disabled_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&state.postgres)
+        .await?
+        .ok_or(ApiError::unauthorized(
+            "local password verification is unavailable",
+        ))?;
+        let password = request.password.clone().ok_or(ApiError::bad_request(
+            "password is required for local reauthentication",
+        ))?;
+        let password_valid = tokio::task::spawn_blocking(move || {
+            PasswordHash::new(&password_hash).is_ok_and(|parsed| {
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
+            })
         })
-    })
-    .await?;
-    if !password_valid {
-        return Err(ApiError::unauthorized("password verification failed"));
+        .await?;
+        if !password_valid {
+            return Err(ApiError::unauthorized("password verification failed"));
+        }
     }
     let inserted = sqlx::query(
         "INSERT INTO vault_recovery_exports(organization_id, exported_by, key_derivation)
@@ -3668,9 +4445,12 @@ async fn export_recovery_key(
         serde_json::json!({"scope": "organization"}),
     )
     .await;
-    Ok(Json(RecoveryResponse {
-        recovery_key: state.vault.recovery_key(organization_id),
-    }))
+    Ok((
+        no_store_headers(),
+        Json(RecoveryResponse {
+            recovery_key: state.vault.recovery_key(organization_id),
+        }),
+    ))
 }
 
 async fn apply_server_prices(
@@ -3725,6 +4505,35 @@ async fn apply_server_prices(
         slice.cost.kind = CostKind::Estimated;
         slice.cost.price_source = Some(price.6);
         slice.cost.pricebook_version = Some(price.7);
+    }
+    for slice in &snapshot.usage_by_model {
+        let mut matching = snapshot
+            .turns
+            .iter_mut()
+            .flat_map(|turn| turn.model_activity.iter_mut())
+            .filter(|step| {
+                step.provider_id.eq_ignore_ascii_case(&slice.provider_id)
+                    && canonical_model_id(&step.model_id) == canonical_model_id(&slice.model_id)
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() || slice.cost.kind == CostKind::Reported {
+            continue;
+        }
+        let total_tokens = matching.iter().map(|step| step.tokens.total()).sum::<u64>();
+        let mut assigned = 0.0;
+        let last = matching.len().saturating_sub(1);
+        for (index, step) in matching.iter_mut().enumerate() {
+            let amount = if index == last {
+                (slice.cost.amount - assigned).max(0.0)
+            } else if total_tokens == 0 {
+                0.0
+            } else {
+                slice.cost.amount * step.tokens.total() as f64 / total_tokens as f64
+            };
+            assigned += amount;
+            step.cost = slice.cost.clone();
+            step.cost.amount = amount;
+        }
     }
     Ok(())
 }
@@ -3947,11 +4756,45 @@ async fn insert_org_price(
         .user_id
         .ok_or(ApiError::forbidden("user session required to edit pricing"))?;
     let organization_id = auth.organization_uuid()?;
-    let provider_id = request.provider_id.trim().to_ascii_lowercase();
-    let model_id = canonical_model_id(request.model_id.trim());
     let now = Utc::now();
     let catalog_version = format!("org-{}", Uuid::new_v4().simple());
     let mut transaction = state.postgres.begin().await?;
+    let response = insert_org_price_in_transaction(
+        &mut transaction,
+        organization_id,
+        user_id,
+        request,
+        now,
+        catalog_version,
+    )
+    .await?;
+    transaction.commit().await?;
+    audit(
+        state,
+        organization_id,
+        &auth.name,
+        "pricing.upsert",
+        "model_price",
+        response.id.to_string(),
+        serde_json::json!({
+            "providerId": response.provider_id,
+            "modelId": response.model_id
+        }),
+    )
+    .await;
+    Ok(response)
+}
+
+async fn insert_org_price_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    user_id: Uuid,
+    request: &PriceRequest,
+    now: chrono::DateTime<Utc>,
+    catalog_version: String,
+) -> Result<PriceResponse, ApiError> {
+    let provider_id = request.provider_id.trim().to_ascii_lowercase();
+    let model_id = canonical_model_id(request.model_id.trim());
     sqlx::query(
         "UPDATE model_prices SET effective_until = $4, updated_at = $4
          WHERE organization_id = $1 AND provider_id = $2 AND model_id = $3
@@ -3961,7 +4804,7 @@ async fn insert_org_price(
     .bind(&provider_id)
     .bind(&model_id)
     .bind(now)
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await?;
     let row = sqlx::query_as::<_, (Uuid, chrono::DateTime<Utc>, chrono::DateTime<Utc>)>(
         "INSERT INTO model_prices(
@@ -3988,19 +4831,8 @@ async fn insert_org_price(
     .bind(&catalog_version)
     .bind(now)
     .bind(user_id)
-    .fetch_one(&mut *transaction)
+    .fetch_one(&mut **transaction)
     .await?;
-    transaction.commit().await?;
-    audit(
-        state,
-        organization_id,
-        &auth.name,
-        "pricing.upsert",
-        "model_price",
-        row.0.to_string(),
-        serde_json::json!({"providerId": provider_id, "modelId": model_id}),
-    )
-    .await;
     Ok(PriceResponse {
         id: row.0,
         scope: "organization".into(),
@@ -4044,15 +4876,25 @@ async fn update_price(
 ) -> Result<Json<PriceResponse>, ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
     auth.require_admin()?;
+    validate_price_request(&request)?;
+    let user_id = auth
+        .user_id
+        .ok_or(ApiError::forbidden("user session required to edit pricing"))?;
     let organization_id = auth.organization_uuid()?;
-    let owned = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM model_prices WHERE id = $1 AND organization_id = $2)",
+    let now = Utc::now();
+    let catalog_version = format!("org-{}", Uuid::new_v4().simple());
+    let mut transaction = state.postgres.begin().await?;
+    let owned = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM model_prices
+         WHERE id = $1 AND organization_id = $2 AND effective_until IS NULL
+         FOR UPDATE",
     )
     .bind(id)
     .bind(organization_id)
-    .fetch_one(&state.postgres)
+    .fetch_optional(&mut *transaction)
     .await?;
-    if !owned {
+    if owned.is_none() {
+        transaction.rollback().await.ok();
         return Err(ApiError::not_found("organization price not found"));
     }
     sqlx::query(
@@ -4061,9 +4903,33 @@ async fn update_price(
     )
     .bind(id)
     .bind(organization_id)
-    .execute(&state.postgres)
+    .execute(&mut *transaction)
     .await?;
-    Ok(Json(insert_org_price(&state, &auth, &request).await?))
+    let response = insert_org_price_in_transaction(
+        &mut transaction,
+        organization_id,
+        user_id,
+        &request,
+        now,
+        catalog_version,
+    )
+    .await?;
+    transaction.commit().await?;
+    audit(
+        &state,
+        organization_id,
+        &auth.name,
+        "pricing.upsert",
+        "model_price",
+        response.id.to_string(),
+        serde_json::json!({
+            "providerId": response.provider_id,
+            "modelId": response.model_id,
+            "replacedId": id
+        }),
+    )
+    .await;
+    Ok(Json(response))
 }
 
 async fn delete_price(
@@ -4163,6 +5029,7 @@ struct MySessionsQuery {
     client: Option<String>,
     project: Option<String>,
     status: Option<String>,
+    workflow: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
     sort: Option<String>,
@@ -4213,6 +5080,9 @@ async fn my_sessions(
             sql.push_str(&format!(" AND {column} = ?"));
         }
     }
+    if query.workflow.is_some() {
+        sql.push_str(" AND arrayExists(turn -> arrayExists(signal -> JSONExtractString(signal, 'signal') = ?, JSONExtractArrayRaw(turn, 'workflowSignals')), JSONExtractArrayRaw(snapshot_json, 'turns'))");
+    }
     sql.push_str(&format!(" ORDER BY {order} LIMIT {limit} OFFSET {offset}"));
     let mut q = state
         .clickhouse
@@ -4234,6 +5104,9 @@ async fn my_sessions(
     .flatten()
     {
         q = q.bind(value);
+    }
+    if let Some(workflow) = &query.workflow {
+        q = q.bind(workflow);
     }
     Ok(Json(q.fetch_all::<SessionRow>().await?))
 }
@@ -4337,6 +5210,7 @@ struct MyInstallationResponse {
     team_name: Option<String>,
     created_at: chrono::DateTime<Utc>,
     last_seen_at: Option<chrono::DateTime<Utc>>,
+    last_client_version: Option<String>,
     revoked: bool,
 }
 
@@ -4357,11 +5231,12 @@ async fn my_installations(
             Option<String>,
             chrono::DateTime<Utc>,
             Option<chrono::DateTime<Utc>>,
+            Option<String>,
             bool,
         ),
     >(
         "SELECT i.id, i.name, i.platform, t.name, i.created_at, i.last_seen_at,
-                i.revoked_at IS NOT NULL
+                i.last_client_version, i.revoked_at IS NOT NULL
          FROM installations i LEFT JOIN teams t ON t.id = i.team_id
          WHERE i.owner_user_id = $1 AND i.organization_id = $2::uuid
          ORDER BY i.created_at DESC",
@@ -4379,7 +5254,8 @@ async fn my_installations(
                 team_name: row.3,
                 created_at: row.4,
                 last_seen_at: row.5,
-                revoked: row.6,
+                last_client_version: row.6,
+                revoked: row.7,
             })
             .collect(),
     ))
@@ -4431,7 +5307,7 @@ async fn create_enrollment_code(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<EnrollmentCodeRequest>,
-) -> Result<(StatusCode, Json<EnrollmentCodeResponse>), ApiError> {
+) -> Result<(StatusCode, HeaderMap, Json<EnrollmentCodeResponse>), ApiError> {
     let auth = dashboard_auth(&state, &headers).await?;
     let user_id = auth
         .user_id
@@ -4477,6 +5353,7 @@ async fn create_enrollment_code(
     .await?;
     Ok((
         StatusCode::CREATED,
+        no_store_headers(),
         Json(EnrollmentCodeResponse {
             code,
             expires_at,
@@ -4646,7 +5523,10 @@ mod tests {
         assert_eq!(client_address(&headers, peer, false), "10.0.0.1");
         assert_eq!(client_address(&HeaderMap::new(), peer, true), "10.0.0.1");
     }
-    use metrune_core::{CategoryAssignment, Cost, TokenBreakdown, UsageSlice};
+    use metrune_core::{
+        CategoryAssignment, ClassificationMethod, Cost, ModelActivityStep, TokenBreakdown,
+        TurnSnapshot, UsageSlice,
+    };
 
     #[test]
     fn analytics_queries_are_always_organization_scoped() {
@@ -4658,6 +5538,7 @@ mod tests {
             category: None,
             client: None,
             status: None,
+            workflow: None,
         };
         let (sql, params) =
             filtered_query("SELECT count() FROM session_snapshots", &query, "org-a");
@@ -4676,6 +5557,7 @@ mod tests {
             category: None,
             client: None,
             status: Some("failed".into()),
+            workflow: None,
         };
         let (sql, params) = filtered_query(
             "SELECT count() FROM session_snapshots_dedup",
@@ -4722,9 +5604,122 @@ mod tests {
                 cost: Cost::default(),
             }],
             category: CategoryAssignment::default(),
+            turns: vec![],
+            classifier_usage: Default::default(),
+            signal_capabilities: vec![],
+            classified_token_coverage: 0.0,
+            classification_method_counts: vec![],
+            turn_detail_truncated: false,
             source_schema_version: None,
         };
         assert!(validate_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn v2_ingest_requires_turn_and_session_model_totals_to_reconcile() {
+        let tokens = TokenBreakdown {
+            input: 10,
+            output: 2,
+            ..TokenBreakdown::default()
+        };
+        let mut snapshot = SessionSnapshot {
+            schema_version: SCHEMA_VERSION.into(),
+            session_key: "s".repeat(64),
+            revision: 1,
+            user_key: "u".repeat(64),
+            project_key: None,
+            project_alias: None,
+            team_key: None,
+            client_id: "codex".into(),
+            client_version: None,
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            usage_by_model: vec![UsageSlice {
+                provider_id: "openai".into(),
+                model_id: "gpt-5".into(),
+                tokens: tokens.clone(),
+                cost: Cost::default(),
+            }],
+            category: CategoryAssignment::default(),
+            turns: vec![TurnSnapshot {
+                sequence: 1,
+                category: CategoryAssignment::default(),
+                classification_method: ClassificationMethod::None,
+                classification_cached: false,
+                model_activity: vec![ModelActivityStep {
+                    sequence: 0,
+                    provider_id: "openai".into(),
+                    model_id: "gpt-5".into(),
+                    tokens,
+                    cost: Cost::default(),
+                    call_count: 1,
+                }],
+                workflow_signals: vec![],
+            }],
+            classifier_usage: Default::default(),
+            signal_capabilities: vec![],
+            classified_token_coverage: 0.0,
+            classification_method_counts: vec![],
+            turn_detail_truncated: false,
+            source_schema_version: None,
+        };
+        assert!(validate_snapshot(&snapshot).is_ok());
+        let mut legacy = snapshot.clone();
+        legacy.schema_version = LEGACY_SCHEMA_VERSION.into();
+        legacy.turns.clear();
+        assert!(validate_snapshot(&legacy).is_ok());
+        snapshot.turns[0].model_activity[0].model_id = "another-model".into();
+        assert!(validate_snapshot(&snapshot)
+            .unwrap_err()
+            .contains("model usage"));
+    }
+
+    #[test]
+    fn ingest_contract_rejects_unbounded_or_non_finite_snapshot_values() {
+        let mut snapshot = SessionSnapshot {
+            schema_version: SCHEMA_VERSION.into(),
+            session_key: "s".repeat(64),
+            revision: 1,
+            user_key: "u".repeat(64),
+            project_key: None,
+            project_alias: None,
+            team_key: None,
+            client_id: "codex".into(),
+            client_version: None,
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            usage_by_model: vec![UsageSlice {
+                provider_id: "openai".into(),
+                model_id: "gpt-5".into(),
+                tokens: TokenBreakdown {
+                    input: 1,
+                    ..TokenBreakdown::default()
+                },
+                cost: Cost::default(),
+            }],
+            category: CategoryAssignment::default(),
+            turns: vec![],
+            classifier_usage: Default::default(),
+            signal_capabilities: vec![],
+            classified_token_coverage: 0.0,
+            classification_method_counts: vec![],
+            turn_detail_truncated: false,
+            source_schema_version: None,
+        };
+        snapshot.client_id = "x".repeat(MAX_SNAPSHOT_TEXT_BYTES + 1);
+        assert!(validate_snapshot(&snapshot)
+            .unwrap_err()
+            .contains("client_id"));
+
+        snapshot.client_id = "codex".into();
+        snapshot.category.confidence = f32::NAN;
+        assert!(validate_snapshot(&snapshot)
+            .unwrap_err()
+            .contains("confidence"));
+
+        snapshot.category.confidence = 0.0;
+        snapshot.usage_by_model[0].cost.amount = f64::INFINITY;
+        assert!(validate_snapshot(&snapshot).unwrap_err().contains("cost"));
     }
 
     #[test]
@@ -4842,6 +5837,7 @@ mod tests {
         assert!(validate_production_configuration(
             "production",
             Some("http://metrune.example.com"),
+            Some("https://metrune.example.com"),
             "postgres://metrune:strong@example/postgres",
             "strong",
             Some("admin@example.com"),
@@ -4850,6 +5846,7 @@ mod tests {
         .is_err());
         assert!(validate_production_configuration(
             "production",
+            Some("https://metrune.example.com"),
             Some("https://metrune.example.com"),
             "postgres://metrune:metrune-dev@example/postgres",
             "strong",
@@ -4860,6 +5857,7 @@ mod tests {
         assert!(validate_production_configuration(
             "production",
             Some("https://metrune.example.com"),
+            Some("https://metrune.example.com"),
             "postgres://metrune:strong@example/postgres",
             "strong",
             Some("admin@example.com"),
@@ -4869,9 +5867,20 @@ mod tests {
         assert!(validate_production_configuration(
             "production",
             Some("https://metrune.example.com"),
+            Some("https://metrune.example.com"),
             "postgres://metrune:strong@example/postgres",
             "strong",
             Some(DEVELOPMENT_BOOTSTRAP_EMAIL),
+            Some("a-long-random-password")
+        )
+        .is_err());
+        assert!(validate_production_configuration(
+            "production",
+            Some("https://api.metrune.example.com"),
+            Some("http://metrune.example.com"),
+            "postgres://metrune:strong@example/postgres",
+            "strong",
+            Some("admin@example.com"),
             Some("a-long-random-password")
         )
         .is_err());
@@ -4882,14 +5891,20 @@ mod tests {
         assert!(validate_production_configuration(
             "production",
             Some("https://metrune.example.com"),
+            Some("https://metrune.example.com"),
             "postgres://metrune:strong@example/postgres",
             "another-strong-password",
             Some("admin@example.com"),
             Some("a-long-random-bootstrap-password")
         )
         .is_ok());
+        assert!(!valid_public_https_url("https://"));
+        assert!(!valid_public_https_url("https://user:pass@metrune.example"));
+        assert!(!valid_public_https_url("https://metrune.example/#fragment"));
+        assert!(valid_public_https_url("https://metrune.example/api"));
         assert!(validate_production_configuration(
             "development",
+            None,
             None,
             "postgres://metrune:metrune-dev@postgres/metrune",
             "metrune-dev",

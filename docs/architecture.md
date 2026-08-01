@@ -1,5 +1,43 @@
 # Architecture
 
+Metrune has one deliberately small privacy boundary: the client reads local
+agent stores and the normal upload sends only pseudonymized usage metadata to
+the self-hosted server. An explicitly enabled managed-classification request
+is the bounded exception. The diagram is the short version; the sections below
+document the security, storage, and deployment contracts in detail.
+
+## At a glance
+
+```mermaid
+flowchart LR
+    subgraph workstation["Developer workstation"]
+        stores["Coding-agent stores"]
+        cli["Metrune CLI: scan, classify, upload"]
+        outbox[("SQLite outbox")]
+        stores -->|read locally| cli
+        cli -->|pseudonymize + queue| outbox
+    end
+
+    subgraph server["Self-hosted Metrune server"]
+        edge["HTTPS reverse proxy"]
+        web["Next.js dashboard"]
+        api["Rust API"]
+        pg[("PostgreSQL control plane")]
+        ch[("ClickHouse analytics")]
+        edge --> web
+        edge --> api
+        web -->|server-side proxy| api
+        api --> pg
+        api --> ch
+    end
+
+    outbox -->|metadata-only HTTPS upload| edge
+    cli -.->|optional bounded classification text| api
+```
+
+The dashed path is opt-in managed classification and is bounded and
+installation-authenticated; it is not part of the normal upload envelope.
+
 ## Client pipeline
 
 Each source adapter reads a known local coding-agent store and converts records
@@ -9,8 +47,9 @@ local-only in the Rust type system and cannot be serialized.
 
 Messages become revisioned session snapshots. Raw user, project, and session
 identifiers are HMAC-pseudonymized before entering the SQLite outbox. The
-outbox retains failed uploads and removes a revision only after server
-acknowledgement.
+outbox retains failed uploads, marks accepted or permanently rejected rows
+after an ingest response, and prunes acknowledged/quarantined rows after the
+local retention window.
 
 ## Classification
 
@@ -32,9 +71,31 @@ and encrypted provider credentials. ClickHouse owns revisioned usage snapshots
 and analytical queries. The browser communicates through the Next.js
 server-side proxy and never connects directly to either database.
 
-The API authenticates a web session, service token, installation token, or
-one-time enrollment credential. Organization scope is derived from that
-credential rather than accepted from the request.
+The web proxy forwards only the signed-in session (or a development-only
+dashboard token) to the API. Production and signed-in requests fail closed when
+the API cannot answer: they render an unavailable state rather than substituting
+fixture organization data. Explicit local showcase fixtures require
+`METRUNE_ENABLE_DEMO_DATA=1` and are never used for a browser session. UI role
+visibility is least-privilege only; the API repeats every authorization check.
+
+Organization session exports remain admin/analyst-only, preserve the dashboard
+filters, use `Cache-Control: no-store`, and neutralize spreadsheet formula
+prefixes before CSV quoting. Redirect continuations are restricted to
+same-origin relative paths by a shared validator.
+
+The API authenticates a web session, service token, or installation token.
+Web sessions come from either deployment-wide OIDC or local passwords, never
+both at once. OIDC uses discovery, authorization code plus PKCE, and verified
+issuer/audience/expiry/nonce/email claims; Metrune still owns authorization and
+organization roles.
+
+Native clients use a short-lived OAuth device authorization: a browser session
+approves the named machine and the one-time exchange mints its installation
+token. The IdP token and browser session never reach the native client. Its
+installation token is stored in the OS keyring or a private fallback file.
+Legacy one-time enrollment credentials remain available for controlled
+automation. Organization scope is derived from the authenticated or approved
+principal rather than accepted from the request.
 
 ## Deployment
 
@@ -55,6 +116,11 @@ endpoints until an observability contract is defined.
 
 ## Compatibility
 
+- Server and client versions share a compatibility line by major version:
+  matching majors are supported together, while a different major is rejected
+  with structured HTTP 426. Minor releases add compatible features; patch
+  releases contain fixes and security updates. See [VERSIONING.md](VERSIONING.md)
+  for the release and rollout contract.
 - `schemaVersion` versions the upload envelope and snapshots.
 - Session revisions increase monotonically; ClickHouse replacement semantics
   keep the latest accepted revision.

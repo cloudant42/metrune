@@ -19,6 +19,11 @@ key, encrypted provider credentials cannot be recovered from PostgreSQL. Store
 the key in a separate access-controlled secret backup and never commit or log
 it.
 
+For an SSO deployment, also preserve the private OIDC client secret, client
+registration details, exact issuer, redirect URI, provisioning mode, and IdP
+administrator recovery procedure. They are deployment configuration rather
+than database state, but a database restore is not usable without them.
+
 ## PostgreSQL backup
 
 For the development Compose stack, create a custom-format dump while the API
@@ -68,6 +73,11 @@ master key. It lets that organization decrypt its own credentials out of band.
 It is not a deployment backup and cannot be used to restore the server — back
 up `METRUNE_SECRETS_KEY_FILE` for that.
 
+Local mode asks the administrator to re-enter their password before the
+one-time export. OIDC mode requires a provider sign-in completed in the
+previous ten minutes. Test that reauthentication before an incident; an
+already-open older SSO session is intentionally insufficient.
+
 Credentials written before this scheme carry `key_derivation = 0` in
 `provider_credentials` and stay readable under the master key. The API re-seals
 them under their organization's key on the next start; a row that fails to
@@ -81,11 +91,13 @@ decrypt is logged and left untouched rather than dropped.
    ClickHouse version.
 3. Restore the exact vault master key at `METRUNE_SECRETS_KEY_FILE` with file
    permissions restricted to the API user.
-4. Start one API instance so migrations and ClickHouse compatibility checks
+4. Restore OIDC client configuration/secret when SSO is enabled and confirm the
+   registered callback still matches the public URL.
+5. Start one API instance so migrations and ClickHouse compatibility checks
    complete, then verify `/v1/readyz`.
-5. Start the web service and validate login, analytics, ingestion, and vault
+6. Start the web service and validate login, analytics, ingestion, and vault
    credential resolution with a test account.
-6. Keep the original backups untouched until the restored deployment passes a
+7. Keep the original backups untouched until the restored deployment passes a
    representative dashboard and client upload check.
 
 ## Retention and deletion
@@ -106,16 +118,20 @@ legal records as required by the organization's policy.
 ## Upgrades and rollback
 
 Back up PostgreSQL, ClickHouse, and the vault key before every release. The API
-currently runs embedded PostgreSQL migrations during startup and applies
-ClickHouse compatibility changes during startup. For the supported Compose
-deployment, stop the old API, start the new API, verify readiness, and only
-then recreate the web service.
+runs embedded SQLx migrations for PostgreSQL and applies idempotent ClickHouse
+compatibility changes during startup. ClickHouse does not yet have an
+independent migration ledger, so keep the migration directory from the same
+`server-vX.Y.Z` release as the API image. Client artifacts are released
+separately under `client-vX.Y.Z`; changing that mirror does not change the
+server migration set. For the supported Compose deployment, stop the old API,
+start the new API, verify readiness, and only then recreate the web service.
+See [VERSIONING.md](VERSIONING.md) for the release-line compatibility rule.
 
 Migrations may be forward-only. Do not roll back the application binary across
 an unapplied or partially applied schema change unless the release notes
 explicitly document compatibility. If a migration fails, preserve logs and the
 database backup, fix the migration or restore to a new instance, and do not
-delete the migration history table.
+delete PostgreSQL's `_sqlx_migrations` history table.
 
 ## Recovery drill
 

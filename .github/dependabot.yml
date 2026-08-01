@@ -1,0 +1,50 @@
+version: 2
+
+# Grouped, monthly updates keep the review load proportional to a single
+# maintainer while security.yml continues to gate on cargo-audit and npm audit
+# between runs. Keep one grouped PR per ecosystem to limit Actions consumption;
+# security updates are not affected by the grouping or schedule.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    groups:
+      cargo:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    groups:
+      npm:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Workflows pin third-party actions by commit SHA; this keeps those pins
+  # current without giving up the pinning.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    groups:
+      actions:
+        patterns:
+          - "*"

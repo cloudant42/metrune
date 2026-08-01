@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env,
@@ -17,47 +18,118 @@ struct FallbackCredentials {
 
 pub struct CredentialStore {
     fallback_path: PathBuf,
+    use_keyring: bool,
 }
 
 impl Default for CredentialStore {
     fn default() -> Self {
         Self {
             fallback_path: default_fallback_path(),
+            use_keyring: true,
         }
     }
 }
 
 impl CredentialStore {
-    pub fn get(&self, credential_id: &str) -> Result<Option<String>> {
-        if let Ok(entry) = keyring_entry(credential_id) {
-            if let Ok(value) = entry.get_password() {
-                return Ok(Some(value));
-            }
+    #[cfg(test)]
+    pub(crate) fn for_tests(fallback_path: PathBuf) -> Self {
+        Self {
+            fallback_path,
+            use_keyring: false,
         }
-        Ok(self.read_fallback()?.values.get(credential_id).cloned())
     }
 
-    pub fn set(&self, credential_id: &str, value: &str) -> Result<&'static str> {
-        if let Ok(entry) = keyring_entry(credential_id) {
-            if entry.set_password(value).is_ok() {
-                self.remove_from_fallback(credential_id)?;
-                return Ok("system keyring");
+    /// Classifier credentials are scoped to the server that provisioned them.
+    /// Provider IDs such as `openrouter` are not globally unique, and reusing
+    /// one key across two servers can silently send semantic text to the
+    /// wrong provider account.
+    pub fn get_for_server(&self, server_url: &str, credential_id: &str) -> Result<Option<String>> {
+        let scoped = scoped_classifier_id(server_url, credential_id);
+        self.get_scoped("classifier", &scoped, &format!("classifier:{scoped}"))
+    }
+
+    pub fn set_for_server(
+        &self,
+        server_url: &str,
+        credential_id: &str,
+        value: &str,
+    ) -> Result<&'static str> {
+        let scoped = scoped_classifier_id(server_url, credential_id);
+        self.set_scoped(
+            "classifier",
+            &scoped,
+            &format!("classifier:{scoped}"),
+            value,
+        )
+    }
+
+    pub fn delete_for_server(&self, server_url: &str, credential_id: &str) -> Result<()> {
+        let scoped = scoped_classifier_id(server_url, credential_id);
+        self.delete_scoped("classifier", &scoped, &format!("classifier:{scoped}"))
+    }
+
+    pub fn get_installation(&self, credential_id: &str) -> Result<Option<String>> {
+        let fallback_key = format!("installation:{credential_id}");
+        self.get_scoped("installation", credential_id, &fallback_key)
+    }
+
+    pub fn set_installation(&self, credential_id: &str, value: &str) -> Result<&'static str> {
+        let fallback_key = format!("installation:{credential_id}");
+        self.set_scoped("installation", credential_id, &fallback_key, value)
+    }
+
+    pub fn delete_installation(&self, credential_id: &str) -> Result<()> {
+        let fallback_key = format!("installation:{credential_id}");
+        self.delete_scoped("installation", credential_id, &fallback_key)
+    }
+
+    fn get_scoped(
+        &self,
+        scope: &str,
+        credential_id: &str,
+        fallback_key: &str,
+    ) -> Result<Option<String>> {
+        if self.use_keyring {
+            if let Ok(entry) = keyring_entry(scope, credential_id) {
+                if let Ok(value) = entry.get_password() {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(self.read_fallback()?.values.get(fallback_key).cloned())
+    }
+
+    fn set_scoped(
+        &self,
+        scope: &str,
+        credential_id: &str,
+        fallback_key: &str,
+        value: &str,
+    ) -> Result<&'static str> {
+        if self.use_keyring {
+            if let Ok(entry) = keyring_entry(scope, credential_id) {
+                if entry.set_password(value).is_ok() {
+                    self.remove_from_fallback(fallback_key)?;
+                    return Ok("system keyring");
+                }
             }
         }
 
         let mut credentials = self.read_fallback()?;
         credentials
             .values
-            .insert(credential_id.to_string(), value.to_string());
+            .insert(fallback_key.to_string(), value.to_string());
         self.write_fallback(&credentials)?;
         Ok("0600 fallback file")
     }
 
-    pub fn delete(&self, credential_id: &str) -> Result<()> {
-        if let Ok(entry) = keyring_entry(credential_id) {
-            let _ = entry.delete_credential();
+    fn delete_scoped(&self, scope: &str, credential_id: &str, fallback_key: &str) -> Result<()> {
+        if self.use_keyring {
+            if let Ok(entry) = keyring_entry(scope, credential_id) {
+                let _ = entry.delete_credential();
+            }
         }
-        self.remove_from_fallback(credential_id)
+        self.remove_from_fallback(fallback_key)
     }
 
     fn read_fallback(&self) -> Result<FallbackCredentials> {
@@ -106,9 +178,15 @@ impl CredentialStore {
     }
 }
 
-fn keyring_entry(credential_id: &str) -> Result<Entry> {
-    Entry::new(KEYRING_SERVICE, &format!("classifier:{credential_id}"))
+fn keyring_entry(scope: &str, credential_id: &str) -> Result<Entry> {
+    Entry::new(KEYRING_SERVICE, &format!("{scope}:{credential_id}"))
         .context("create system keyring entry")
+}
+
+fn scoped_classifier_id(server_url: &str, credential_id: &str) -> String {
+    let normalized = server_url.trim().trim_end_matches('/');
+    let digest = Sha256::digest(format!("{normalized}\0{credential_id}").as_bytes());
+    format!("{}-{}", credential_id, &hex::encode(digest)[..16])
 }
 
 fn default_fallback_path() -> PathBuf {
@@ -135,4 +213,149 @@ pub(crate) fn set_private_permissions(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_path(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "metrune-credentials-{label}-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn fallback_credentials_round_trip_in_a_private_file_and_delete_cleanly() {
+        let path = test_path("roundtrip");
+        let store = CredentialStore::for_tests(path.clone());
+        let credentials = FallbackCredentials {
+            values: BTreeMap::from([("provider-key".into(), "super-secret".into())]),
+        };
+
+        store
+            .write_fallback(&credentials)
+            .expect("write fallback credentials");
+        assert_eq!(
+            store
+                .read_fallback()
+                .expect("read fallback credentials")
+                .values
+                .get("provider-key")
+                .map(String::as_str),
+            Some("super-secret")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("credential metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        store
+            .remove_from_fallback("provider-key")
+            .expect("delete fallback credential");
+        assert!(store
+            .read_fallback()
+            .expect("read emptied fallback")
+            .values
+            .is_empty());
+        std::fs::remove_file(path).expect("remove test credential file");
+    }
+
+    #[test]
+    fn malformed_fallback_credentials_fail_closed() {
+        let path = test_path("malformed");
+        std::fs::write(&path, b"{not-json").expect("write malformed fallback");
+        let store = CredentialStore::for_tests(path.clone());
+        let error = store
+            .read_fallback()
+            .expect_err("malformed credentials must not look empty");
+        assert!(format!("{error:#}").contains("parse credential fallback"));
+        std::fs::remove_file(path).expect("remove malformed fallback");
+    }
+
+    #[test]
+    fn installation_and_classifier_fallback_keys_cannot_collide() {
+        let path = test_path("scopes");
+        let store = CredentialStore::for_tests(path.clone());
+        let mut credentials = FallbackCredentials::default();
+        credentials
+            .values
+            .insert("shared-id".into(), "classifier-secret".into());
+        credentials.values.insert(
+            "installation:shared-id".into(),
+            "installation-secret".into(),
+        );
+        store
+            .write_fallback(&credentials)
+            .expect("write scoped credentials");
+        assert_eq!(
+            store
+                .read_fallback()
+                .expect("read scoped credentials")
+                .values
+                .get("shared-id")
+                .map(String::as_str),
+            Some("classifier-secret")
+        );
+        assert_eq!(
+            store
+                .read_fallback()
+                .expect("read scoped credentials")
+                .values
+                .get("installation:shared-id")
+                .map(String::as_str),
+            Some("installation-secret")
+        );
+        std::fs::remove_file(path).expect("remove scoped fallback");
+    }
+
+    #[test]
+    fn classifier_credentials_are_isolated_per_server() {
+        let path = test_path("server-scope");
+        let store = CredentialStore::for_tests(path.clone());
+        store
+            .set_for_server("https://one.example/", "openrouter", "one-secret")
+            .expect("store first server credential");
+        store
+            .set_for_server("https://two.example", "openrouter", "two-secret")
+            .expect("store second server credential");
+        assert_eq!(
+            store
+                .get_for_server("https://one.example", "openrouter")
+                .expect("read first server credential")
+                .as_deref(),
+            Some("one-secret")
+        );
+        assert_eq!(
+            store
+                .get_for_server("https://two.example/", "openrouter")
+                .expect("read second server credential")
+                .as_deref(),
+            Some("two-secret")
+        );
+        store
+            .delete_for_server("https://one.example", "openrouter")
+            .expect("delete first server credential");
+        assert!(store
+            .get_for_server("https://one.example", "openrouter")
+            .expect("read deleted credential")
+            .is_none());
+        assert!(store
+            .get_for_server("https://two.example", "openrouter")
+            .expect("read retained credential")
+            .is_some());
+        std::fs::remove_file(path).expect("remove server-scoped fallback");
+    }
 }

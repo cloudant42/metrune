@@ -1,16 +1,30 @@
 # Classifier provisioning
 
-Metrune uses the server as a configuration and provisioning control plane. It
-does not proxy client classification requests.
+Metrune supports two explicit semantic-classification modes. The server is the
+configuration and provisioning control plane for both modes, and is also the
+inference router in managed mode.
 
 ## Server configuration
 
-The admin classifier panel provides four intentionally small choices:
+The admin classifier panel selects an execution mode and one of four provider
+types:
 
 - OpenRouter
 - OpenAI
 - Ollama/local
 - Custom OpenAI-compatible
+
+In **managed** mode, the client sends bounded classification text to Metrune
+using its installation credential. Metrune loads the provider credential from
+the encrypted organization vault, calls the provider, and returns only the
+category assignment. Neither the provider endpoint nor its credential is
+returned to the client.
+
+In **local/private** mode, the client calls the provider directly. An
+organization may provision the approved endpoint, model, and provider
+credential, or a developer may configure an independent OpenAI-compatible
+endpoint and their own `METRUNE_CLASSIFIER_API_KEY`. Ollama on localhost does
+not normally need a key.
 
 Known providers supply their endpoint and protocol automatically. Custom
 providers require an HTTPS endpoint, or HTTP on localhost. The admin chooses a
@@ -20,6 +34,7 @@ fixed synthetic text.
 Environment variables remain available for unattended deployments:
 
 ```text
+METRUNE_CLASSIFIER_EXECUTION_MODE=managed
 METRUNE_CLASSIFIER_PROVIDER_ID=openrouter
 METRUNE_CLASSIFIER_CREDENTIAL_ID=openrouter
 METRUNE_CLASSIFIER_ENDPOINT=https://openrouter.ai/api/v1/chat/completions
@@ -31,8 +46,16 @@ METRUNE_CLASSIFIER_RESPONSE_MODE=auto
 
 Credentials entered in `/admin` are encrypted with AES-256-GCM in PostgreSQL;
 the automatically generated master key remains in the protected persistent
-server volume. Environment secrets can still come from Docker Secrets,
-Kubernetes Secrets, Vault, or the platform secret manager.
+server volume. Environment secrets can still come from Docker Secrets, Vault,
+or the platform secret manager.
+
+The current database, development Compose, and environment fallback default is
+`local`. Managed execution must be selected explicitly. Non-interactive
+enrollment uses the organization classifier when one is enabled, otherwise it
+disables classification. Making managed execution the ordinary deployment
+default is therefore a product/configuration change that has not yet been
+made; it must be paired with disclosure that selected semantic text is sent to
+Metrune and the configured model provider.
 
 ## Client installation
 
@@ -43,12 +66,18 @@ refresh it manually, run:
 metrune classifier provision
 ```
 
-The authenticated client request returns the classifier URL, model, credential ID, and credential. The response is marked `no-store`. The client writes only the non-secret profile to its Metrune config and stores the credential in the native system keyring. If the keyring is unavailable, it uses `~/.config/metrune/credentials.json` with Unix mode `0600`.
+The response is marked `no-store`. In managed mode it contains only the
+non-secret profile; classification calls use the existing installation token.
+In local/private mode it may also contain the approved endpoint and provider
+credential. The client stores that credential in the native system keyring. If
+the keyring is unavailable, it uses
+`~/.config/metrune/credentials.json` with Unix mode `0600`.
 
-The watch process refreshes organization-managed profiles before scanning. Normal
-uploads do not retrieve or transmit the credential. `metrune classifier
-logout` removes the local profile and credential; rerunning `provision`
-obtains the current server configuration.
+The watch process refreshes every server-provisioned profile every 15 minutes
+before scanning, including custom providers in either execution mode. Normal
+uploads do not retrieve or transmit provider credentials. `metrune classifier
+logout` removes the local profile and any local credential; rerunning
+`provision` obtains the current server configuration.
 
 ## Response handling
 
@@ -62,10 +91,18 @@ category. These outcomes never block usage accounting.
 
 ## Privacy boundary
 
-The classifier request is sent directly from the client to the configured
-endpoint. The Metrune API receives neither the classifier text nor the
-provider response. The admin test uses only a fixed synthetic sentence. The
-server controls the approved endpoint and model, while the client retains the
-execution and session-content boundary.
+The normal usage upload remains metadata-only in both modes: it cannot contain
+prompts, model responses, source code, paths, or classification text. Managed
+classification is a separate request containing only the selected, bounded
+text assembled for semantic classification; model outputs are not sent. That
+text is not stored in the outbox, PostgreSQL, ClickHouse, or analytics payloads.
+Local/private mode sends it only to the client-selected provider.
 
-OAuth for Metrune can replace the development enrollment token later. It should authenticate the user and installation to Metrune; it should remain separate from the locally stored provider credential.
+Native enrollment now uses Metrune's browser-assisted OAuth device grant. A
+signed-in person confirms the terminal code, client identity, workspace, and
+team before the server mints the existing revocable installation credential.
+The long-running `watch` process authenticates uploads with that installation
+credential and never stores a person's web access or refresh tokens. Browser
+OIDC sign-in is supported: when configured, it is the only way to authenticate
+the approval page, without changing the CLI grant. Provider credentials remain
+a separate concern in local/private mode.

@@ -1,12 +1,13 @@
 import Link from "next/link";
+import { CategoryGuide } from "@/components/category-guide";
 import { FilterBar } from "@/components/filters";
 import { getFacets, getUsageBreakdown, type PageParams } from "@/lib/api";
 import { formatCompact, formatMoney, label, shortModel } from "@/lib/format";
-import { DemoBanner, toParams } from "../page";
+import { DemoBanner, toParams, UnavailablePanel } from "../page";
 
 type PageProps = { searchParams: Promise<Record<string, string | string[] | undefined>> };
 
-const dimensions = ["category", "status", "client", "model", "provider", "team", "project"] as const;
+const dimensions = ["category", "workflow", "status", "client", "model", "provider", "team", "project"] as const;
 
 function buildHref(params: PageParams, patch: Record<string, string | undefined>): string {
   const merged = { ...params, ...patch };
@@ -19,6 +20,7 @@ export default async function UsagePage({ searchParams }: PageProps) {
   const params = await toParams(await searchParams);
   const dimension = dimensions.includes(params.dimension as never) ? (params.dimension as string) : "category";
   const [{ data: values, source }, facets] = await Promise.all([getUsageBreakdown(params, dimension), getFacets(params)]);
+  if (source === "unavailable" || facets.source === "unavailable") return <UnavailablePanel />;
   const totalCost = values.reduce((sum, value) => sum + value.cost, 0);
   const format = dimension === "model" ? shortModel : label;
   return (
@@ -32,11 +34,21 @@ export default async function UsagePage({ searchParams }: PageProps) {
           </Link>
         ))}
       </nav>
+      {dimension === "category" && <CategoryGuide />}
       <section className="panel" aria-label={`Usage by ${dimension}`}>
+        {dimension === "workflow" && (
+          <div className="panel-header">
+            <div>
+              <p className="muted">Token and cost values describe turns where each signal occurred. Do not sum rows into a usage total.</p>
+              <p className="eyebrow">A turn can carry more than one workflow signal</p>
+              <h2>Workflow context is non-additive</h2>
+            </div>
+          </div>
+        )}
         <div className="table-scroll">
           <table>
             <thead>
-              <tr><th>{label(dimension)}</th><th className="num">Cost</th><th className="num">Tokens</th><th className="num">Sessions</th><th className="share-col">Share of cost</th></tr>
+              <tr><th>{label(dimension)}</th><th className="num">{dimension === "workflow" ? "Cost context" : "Cost"}</th><th className="num">{dimension === "workflow" ? "Token context" : "Tokens"}</th><th className="num">Sessions</th>{dimension !== "workflow" && <th className="share-col">Share of cost</th>}</tr>
             </thead>
             <tbody>
               {values.map(value => (
@@ -45,15 +57,17 @@ export default async function UsagePage({ searchParams }: PageProps) {
                   <td className="num">{formatMoney(value.cost)}</td>
                   <td className="num">{formatCompact(value.tokens)}</td>
                   <td className="num">{value.sessions}</td>
-                  <td className="share-col">
-                    <div className="share-track" aria-label={`${format(value.dimension)}: ${totalCost > 0 ? Math.round(value.cost / totalCost * 100) : 0}% of cost`}>
-                      <span style={{ width: `${totalCost > 0 ? Math.max(2, value.cost / totalCost * 100) : 0}%` }} />
-                    </div>
-                    <small>{totalCost > 0 ? `${Math.round(value.cost / totalCost * 100)}%` : "—"}</small>
-                  </td>
+                  {dimension !== "workflow" && (
+                    <td className="share-col">
+                      <div className="share-track" aria-label={`${format(value.dimension)}: ${totalCost > 0 ? Math.round(value.cost / totalCost * 100) : 0}% of cost`}>
+                        <span style={{ width: `${totalCost > 0 ? Math.max(2, value.cost / totalCost * 100) : 0}%` }} />
+                      </div>
+                      <small>{totalCost > 0 ? `${Math.round(value.cost / totalCost * 100)}%` : "—"}</small>
+                    </td>
+                  )}
                 </tr>
               ))}
-              {values.length === 0 && <tr><td colSpan={5} className="empty">No usage in this range.</td></tr>}
+              {values.length === 0 && <tr><td colSpan={dimension === "workflow" ? 4 : 5} className="empty">No usage in this range.</td></tr>}
             </tbody>
           </table>
         </div>

@@ -25,6 +25,10 @@ export function ThemeSwitch() {
 
   useEffect(() => {
     const stored = localStorage.getItem(storageKey);
+    // localStorage does not exist during server render, so the stored theme can
+    // only be adopted after mount. ThemeScript already stamped <html>, so this
+    // syncs React state to the DOM rather than causing a visible re-paint.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (stored === "light" || stored === "dark") setTheme(stored);
   }, []);
 

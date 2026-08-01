@@ -3,18 +3,31 @@
 metrune.example.com {
 	encode zstd gzip
 
+	# The API trusts the client address only when this proxy overwrites (rather
+	# than appends) X-Forwarded-For. Keep this block aligned with
+	# METRUNE_TRUST_PROXY_HEADERS=true in the production environment. The
+	# production default remains false until an operator explicitly installs a
+	# proxy with this overwrite contract.
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+
 	@api path /v1 /v1/*
 	handle @api {
-		reverse_proxy 127.0.0.1:8080
+		reverse_proxy 127.0.0.1:8080 {
+			header_up -X-Request-ID
+			header_up X-Forwarded-For {http.request.remote.host}
+			header_up X-Forwarded-Proto {http.request.scheme}
+		}
 	}
 
 	handle {
 		reverse_proxy 127.0.0.1:3001
 	}
 
-	header {
-		Referrer-Policy "no-referrer"
-		X-Content-Type-Options "nosniff"
-		X-Frame-Options "DENY"
-	}
 }

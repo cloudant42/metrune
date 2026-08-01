@@ -2,11 +2,11 @@ name: Release server images
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["server-v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag to build (defaults to the current ref name)"
+        description: "Server version or server-vX.Y.Z tag (defaults to the current ref name)"
         required: false
         type: string
 
@@ -17,7 +17,22 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Wait for the release commit's CI and security checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/verify-release-checks.py
+
   images:
+    needs: gate
     strategy:
       fail-fast: false
       matrix:
@@ -44,10 +59,23 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          version="${INPUT_VERSION}"
-          if [ -z "$version" ]; then version="${GITHUB_REF_NAME}"; fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}-${{ matrix.component }}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          raw="${INPUT_VERSION}"
+          if [ -z "$raw" ]; then raw="${GITHUB_REF_NAME}"; fi
+          if [[ "$raw" == server-v* ]]; then
+            tag="$raw"
+          else
+            tag="server-v${raw#v}"
+          fi
+          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          version="$(bash scripts/check-release-version.sh server "$tag" "$package_version")"
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}-${{ matrix.component }}"
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "image=${image}"
+            echo "candidate=${image}:${version}-candidate-${GITHUB_SHA}"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -57,16 +85,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `latest` is deliberately excluded: deployments pin an immutable digest,
-      # and a moving tag makes a rollback ambiguous.
-      - name: Build and push
+      # Build under a temporary tag first. The production version tag is only
+      # promoted after the exact pushed digest passes Trivy.
+      - name: Build and push candidate
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          # The release manifest only needs the explicit digest artifacts below;
+          # do not upload an additional build-record artifact for every image.
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
-          tags: ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+          tags: ${{ steps.version.outputs.candidate }}
           labels: |
             org.opencontainers.image.title=metrune-${{ matrix.component }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
@@ -78,14 +110,21 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
 
-      - name: Scan the published image
+      - name: Scan the candidate image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ steps.version.outputs.image }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ steps.version.outputs.candidate }}@${{ steps.build.outputs.digest }}
           scanners: vuln,secret,misconfig
           ignore-unfixed: true
           severity: HIGH,CRITICAL
           exit-code: 1
+
+      - name: Promote the scanned digest to the release tag
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker buildx imagetools create --tag "${IMAGE}:${VERSION}" "${IMAGE}@${DIGEST}"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
@@ -118,13 +157,22 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: digests
+          pattern: image-digest-*
           merge-multiple: true
 
       # Operators pin these digests in compose.production.yaml before rollout.
       - name: Build the server image manifest
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
+          raw="${INPUT_VERSION}"
+          if [ -z "$raw" ]; then raw="${GITHUB_REF_NAME}"; fi
+          if [[ "$raw" == server-v* ]]; then tag="$raw"; else tag="server-v${raw#v}"; fi
+          version="${tag#server-v}"
           {
-            echo "version: ${GITHUB_REF_NAME}"
+            echo "version: ${version}"
+            echo "tag: ${tag}"
             echo "commit: ${GITHUB_SHA}"
             echo "images:"
             sed 's/^/  - /' digests/*.txt

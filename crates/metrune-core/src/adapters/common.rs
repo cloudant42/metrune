@@ -1,4 +1,4 @@
-use crate::{Cost, CostKind, TokenBreakdown, UsageMessage};
+use crate::{Cost, CostKind, TokenBreakdown, UsageMessage, WorkflowSignal};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 
@@ -25,7 +25,7 @@ fn string_at(value: &Value, paths: &[&[&str]]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn timestamp_at(value: &Value) -> DateTime<Utc> {
+pub(crate) fn timestamp_at(value: &Value) -> DateTime<Utc> {
     let raw = value_at(
         value,
         &[
@@ -76,6 +76,132 @@ pub(crate) fn text_hint(value: &Value) -> Option<String> {
         _ => None,
     })
     .filter(|text| !text.trim().is_empty())
+}
+
+pub(crate) fn workflow_signals(value: &Value) -> Vec<WorkflowSignal> {
+    let tool = value_at(
+        value,
+        &[
+            &["tool_name"],
+            &["toolName"],
+            &["name"],
+            &["message", "name"],
+            &["payload", "name"],
+        ],
+    )
+    .and_then(Value::as_str)
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    let command = value_at(
+        value,
+        &[
+            &["command"],
+            &["input", "command"],
+            &["arguments", "command"],
+            &["payload", "command"],
+        ],
+    )
+    .and_then(Value::as_str)
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    let part_tools = value
+        .pointer("/message/content")
+        .or_else(|| value.get("content"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|part| {
+            [
+                part.get("name").and_then(Value::as_str),
+                part.pointer("/input/command").and_then(Value::as_str),
+                part.get("type").and_then(Value::as_str),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let combined = format!("{tool} {command} {part_tools}");
+    let mut signals = Vec::new();
+    if ["read", "view", "open_file", "cat"]
+        .iter()
+        .any(|needle| combined.contains(needle))
+    {
+        push_signal(&mut signals, WorkflowSignal::Read);
+    }
+    if ["search", "grep", "rg ", "find", "glob"]
+        .iter()
+        .any(|needle| combined.contains(needle))
+    {
+        push_signal(&mut signals, WorkflowSignal::Searched);
+    }
+    if ["edit", "write", "patch", "replace", "create_file"]
+        .iter()
+        .any(|needle| combined.contains(needle))
+    {
+        push_signal(&mut signals, WorkflowSignal::Edited);
+    }
+    if ["test", "pytest", "cargo test", "npm test", "vitest", "jest"]
+        .iter()
+        .any(|needle| combined.contains(needle))
+    {
+        push_signal(&mut signals, WorkflowSignal::TestsRun);
+    }
+    if ["plan", "todo_write", "update_plan"]
+        .iter()
+        .any(|needle| combined.contains(needle))
+    {
+        push_signal(&mut signals, WorkflowSignal::Planned);
+    }
+    if ["delegate", "spawn_agent", "task"]
+        .iter()
+        .any(|needle| combined.contains(needle))
+    {
+        push_signal(&mut signals, WorkflowSignal::Delegated);
+    }
+    if combined.contains("git ") || tool == "git" {
+        push_signal(&mut signals, WorkflowSignal::GitUsed);
+    }
+    if ["build", "cargo check", "npm run build", "make"]
+        .iter()
+        .any(|needle| combined.contains(needle))
+    {
+        push_signal(&mut signals, WorkflowSignal::Built);
+    }
+    if ["deploy", "kubectl", "terraform apply", "flyctl", "vercel"]
+        .iter()
+        .any(|needle| combined.contains(needle))
+    {
+        push_signal(&mut signals, WorkflowSignal::Deployed);
+    }
+    let failed = value_at(
+        value,
+        &[
+            &["is_error"],
+            &["isError"],
+            &["error"],
+            &["exit_code"],
+            &["exitCode"],
+        ],
+    )
+    .is_some_and(|value| {
+        value.as_bool().unwrap_or(false)
+            || value.as_i64().is_some_and(|code| code != 0)
+            || value
+                .as_str()
+                .is_some_and(|text| !text.is_empty() && text != "0")
+    });
+    if failed && signals.contains(&WorkflowSignal::TestsRun) {
+        push_signal(&mut signals, WorkflowSignal::TestsFailed);
+    }
+    signals
+}
+
+fn push_signal(signals: &mut Vec<WorkflowSignal>, signal: WorkflowSignal) {
+    if !signals.contains(&signal) {
+        signals.push(signal);
+    }
 }
 
 pub fn parse_usage_value(
@@ -172,6 +298,7 @@ pub fn parse_usage_value(
             ],
         )
         .unwrap_or_else(|| "unknown".into()),
+        session_started_at: None,
         observed_at: timestamp_at(value),
         tokens,
         cost: Cost {
@@ -185,6 +312,10 @@ pub fn parse_usage_value(
             pricebook_version: None,
             price_source: None,
         },
+        turn_sequence: 0,
+        activity_sequence: 0,
+        workflow_signals: workflow_signals(value),
+        signal_capabilities: Vec::new(),
         classification_text: text_hint(value),
     })
 }

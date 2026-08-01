@@ -1,6 +1,10 @@
-<p align="center">
-  <img src="docs/media/metrune-logo.png" alt="Metrune" width="320">
-</p>
+<table align="center" border="0" cellpadding="14" cellspacing="0" bgcolor="#f8fafc">
+  <tr>
+    <td>
+      <img src="docs/media/metrune-logo.png" alt="Metrune" width="320">
+    </td>
+  </tr>
+</table>
 
 <p align="center">
   Privacy-first, self-hosted analytics for AI coding agents.
@@ -21,9 +25,16 @@ calculates usage and cost, optionally classifies sessions, and uploads a
 deliberately limited metadata schema to a server you run. The web dashboard
 shows organizations, teams, members, installations, pricing, and usage.
 
-> **Current version:** a single Linux host deployed with Docker Compose. Good
-> for evaluation and internal rollouts; not yet a high-availability platform.
-> Kubernetes, Helm and bundled observability are not included.
+For a visual map of the client/server boundary, start with the
+[architecture overview](docs/architecture.md#at-a-glance); the linked guides
+then provide the operational detail for deployment, privacy, and releases.
+
+> **First release:** `server-v0.1.0` and `client-v0.1.0`. All client operating
+> system artifacts share the one `client-v0.1.0` tag; see the
+> [versioning policy](docs/VERSIONING.md). The current support target is a
+> single Linux host deployed with Docker Compose for evaluation and internal
+> rollouts, not a high-availability platform. Kubernetes, Helm, and bundled
+> observability are not included.
 
 ## Client
 
@@ -39,16 +50,21 @@ curl -fsSL https://metrune.example.com/v1/client/install.sh | sh
 Then enroll and start uploading:
 
 ```bash
-metrune enroll --server https://metrune.example.com --token <enrollment-token>
+metrune enroll --server https://metrune.example.com
 metrune scan       # read local agent sessions
 metrune export     # review exactly what would be uploaded
 metrune upload
 ```
 
-Create the one-time enrollment code on your profile page in the dashboard.
-`enroll` also
-takes `--name`, `--user-alias` and `--classifier`; run `metrune enroll --help`
-for the full set.
+`enroll` shows a 10-minute device code and browser link. Sign in to Metrune,
+confirm that the browser and terminal codes match, review the client name and
+platform, and approve it. The CLI receives a revocable installation credential;
+it never stores your browser session or an identity-provider token. The
+credential is kept in the operating-system keyring, with a private mode-`0600`
+fallback file when no keyring service is available; ordinary config contains
+only its reference. `enroll` also takes `--name`, `--user-alias` and
+`--classifier`; run `metrune enroll --help` for the full set. The legacy
+`--token` path remains available for controlled automation.
 
 `metrune update` verifies and replaces the binary in place. Details and the
 air-gapped path are in the [client distribution guide](docs/CLIENT_DISTRIBUTION.md).
@@ -131,6 +147,12 @@ configurable variable, the bootstrap-admin flow and the backup requirements are
 in the [deployment guide](docs/DEPLOYMENT.md) and
 [operations runbook](docs/OPERATIONS.md).
 
+Enterprise deployments can configure one OpenID Connect provider. OIDC then
+becomes the only web authentication method; local passwords are used only when
+no provider is configured. CLI enrollment remains a public OAuth device flow:
+the user approves the machine with their SSO-backed browser session, while the
+CLI receives only a Metrune installation credential.
+
 ### Supported systems
 
 | Platform | Status |
@@ -155,7 +177,7 @@ provider credentials. The folder label can still reveal a project name — set
 
 ## Development
 
-Prerequisites: Rust stable, Node.js 20+, Docker with Compose v2.
+Prerequisites: Rust stable, Node.js 24+, Docker with Compose v2.
 
 ```bash
 docker compose up --build    # run the full stack locally
@@ -176,8 +198,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 - [Architecture](docs/architecture.md)
 - [Deployment](docs/DEPLOYMENT.md) · [Operations](docs/OPERATIONS.md)
 - [Client distribution](docs/CLIENT_DISTRIBUTION.md)
+- [Versioning](docs/VERSIONING.md)
 - [Privacy](docs/privacy.md) · [Security and logging](docs/SECURITY_AND_LOGGING.md)
-- [Authorization](docs/AUTHORIZATION.md) · [Multi-tenancy](docs/MULTI_TENANCY.md) · [Identity](docs/identity.md)
+- [Authorization](docs/AUTHORIZATION.md) · [Multi-tenancy](docs/MULTI_TENANCY.md) · [Identity](docs/identity.md) · [SSO and client auth](docs/sso-design.md)
 - [Pricing](docs/pricing.md) · [Classifier provisioning](docs/classifier-provisioning.md)
 - [Releasing](docs/RELEASING.md) · [Roadmap](docs/ROADMAP.md) · [Changelog](CHANGELOG.md)
 
@@ -187,3 +210,16 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 [Security policy](SECURITY.md) ·
 [Code of conduct](CODE_OF_CONDUCT.md) ·
 [License](LICENSE)
+
+Contributions are accepted under an [Individual Contributor License
+Agreement](CLA.md). You keep the copyright in your work, and section 7 of that
+agreement is a binding commitment that your contribution stays available under
+an OSI-approved licence for as long as it is distributed at all. See
+[CONTRIBUTING.md](CONTRIBUTING.md#sign-the-cla) for the one-time signing step.
+
+## License
+
+Copyright 2026 Florian Allgöwer
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the
+full text and [NOTICE](NOTICE) for third-party dependency notices.

@@ -10,13 +10,37 @@ credential, vault, and export operation".
 
 | Principal | Credential | Obtained by | Scope |
 | --- | --- | --- | --- |
-| Web session | `mts_…` bearer, hashed at rest in `web_sessions` | `POST /v1/auth/login` | One account with a nullable active organization; role comes from its active membership |
+| Web session | `mts_…` bearer, hashed at rest in `web_sessions` | Local `POST /v1/auth/login` or OIDC callback | One account with a nullable active organization; authentication method must match the deployment and role comes from its active membership |
 | Dashboard service token | opaque bearer, hashed at rest in `dashboard_tokens` | Provisioned by an operator | One organization, carries a stored role, has no user identity |
-| Installation | `mti_…` bearer, hashed at rest in `installations` | `POST /v1/enroll` | One installation in one organization |
-| Enrollment credential | organization enrollment token or a personal `mec_…` code | Operator-issued, or `POST /v1/me/enrollment-codes` | Creates exactly one installation |
+| Installation | `mti_…` bearer, hashed at rest in `installations` | OAuth device exchange or legacy `POST /v1/enroll` | One installation in one organization |
+| Device authorization | 256-bit `mdc_…` device code plus 40-bit human code, both hashed at rest | `POST /v1/oauth/device/authorization` | One pending native client request; expires in 10 minutes and can mint one installation |
+| Personal enrollment code | `mec_…` code | `POST /v1/me/enrollment-codes` | Creates exactly one owner-bound installation; expires in 10 minutes |
+| Organization enrollment token | opaque token | Operator/bootstrap provisioning | Legacy unattended path; reusable until its expiry or revocation |
 
 Roles are `admin`, `analyst`, and `viewer`. Only `admin` passes
 `DashboardAuth::require_admin`.
+
+## Browser and export boundary
+
+The Next.js dashboard is a server-side proxy. It forwards the signed-in
+`metrune_session` cookie as a bearer token and never sends database or service
+credentials to the browser. A development dashboard token may be configured
+for local-only operation; production Compose sets it to an empty value.
+
+Dashboard pages fail closed when the API is unavailable. Fixture data is only
+available when `METRUNE_ENABLE_DEMO_DATA=1`, outside production, and no browser
+session is present; a signed-in request is never replaced with demo values.
+Missing or non-admin roles cannot open administration or pricing controls, and
+session drilldown requires a signed-in member. The API remains the authoritative
+role and organization check for every proxy mutation.
+
+`GET /api/export` requires a signed-in web session and an admin/analyst role; it
+is an organization-session export. It accepts
+the same bounded date/team/project/category/client/status/workflow filters as
+the dashboard, returns `401`/`403`/`503` instead of an empty success file when
+the live API is unavailable, marks the response `no-store`, and prefixes cells
+that begin with spreadsheet formula characters (`=`, `+`, `-`, `@`, or control
+characters) before CSV quoting.
 
 ## Invariants
 
@@ -39,6 +63,10 @@ Roles are `admin`, `analyst`, and `viewer`. Only `admin` passes
 6. **Classifier secrets follow execution mode.** Local mode may return the
    organization's provider secret only to its installation. Managed mode never
    returns that secret and uses it only inside the API.
+7. **Browser authentication is single-mode.** When OIDC is configured, only
+   `oidc` web sessions authorize; local password login/reset are disabled.
+   Without OIDC, only `local` web sessions authorize. Startup revokes sessions
+   from the previous mode. Dashboard service tokens are independent.
 
 ## Operation matrix
 
@@ -48,13 +76,18 @@ Roles are `admin`, `analyst`, and `viewer`. Only `admin` passes
 | --- | --- |
 | `GET /v1/healthz`, `GET /v1/readyz` | Unauthenticated liveness and readiness |
 | `GET /v1/client/manifest` | Unauthenticated client release manifest; signed by the release pipeline, never by the deployment |
-| `GET /v1/client/install.sh` | Unauthenticated installer rendered from the manifest |
+| `GET /v1/client/install.sh` | Unauthenticated installer rendered from the manifest; it verifies the artifact digest but is not an independent signature-verification boundary |
 | `GET /v1/downloads/{artifact}` | Unauthenticated client binary download; served only when it matches the manifest digest |
-| `POST /v1/auth/login` | Unauthenticated; per-address rate limit plus a per-email failure throttle |
+| `GET /v1/auth/methods` | Unauthenticated, non-secret discovery of whether OIDC or local password sign-in is active and the configured provider label |
+| `GET /v1/auth/sso/start` | OIDC only; address-limited authorization-code start with server-held state, nonce, and PKCE verifier; same-origin relative continuation only |
+| `GET /v1/auth/sso/callback` | OIDC only; atomically consumes state, exchanges the code, verifies signature/issuer/audience/expiry/nonce and verified email, then issues an `oidc` web session |
+| `POST /v1/auth/login` | Local mode only; per-address rate limit plus a per-email failure throttle |
 | `POST /v1/auth/invitations/inspect` | Unauthenticated; returns masked invitation metadata only |
-| `POST /v1/auth/invitations/accept` | Unauthenticated for a new account; an existing account requires its matching user session |
-| `POST /v1/auth/password-reset/request` | Unauthenticated and address-limited; always returns the same accepted response |
-| `POST /v1/auth/password-reset/complete` | Unauthenticated possession flow; consumes the expiring token and revokes existing sessions |
+| `POST /v1/auth/invitations/accept` | Unauthenticated for a new account; creates a password only in local mode. An existing account requires its matching current-mode user session |
+| `POST /v1/auth/password-reset/request` | Local mode only; unauthenticated and address-limited; always returns the same accepted response |
+| `POST /v1/auth/password-reset/complete` | Local mode only; unauthenticated possession flow; consumes the expiring token and revokes existing sessions |
+| `POST /v1/oauth/device/authorization` | Public native client `metrune-cli`; bounded client name/platform; per-address rate limit; returns short-lived device and user codes with `Cache-Control: no-store` |
+| `POST /v1/oauth/token` | Public device-code possession flow; persists polling interval, returns `authorization_pending`, `slow_down`, `access_denied`, or `expired_token`, and atomically consumes an approved grant |
 
 ### Account session
 
@@ -64,6 +97,8 @@ Roles are `admin`, `analyst`, and `viewer`. Only `admin` passes
 | `POST /v1/auth/organization` | Valid user session; requested organization must have an active membership for that session's user |
 | `POST /v1/organizations` | Valid user session; creates the organization and its initial admin membership atomically |
 | `POST /v1/auth/logout` | Revokes the presented user session |
+| `POST /v1/oauth/device/verification` | Valid user session with an active membership; possession of the human code; returns only the requested client name, platform, code, and expiry |
+| `POST /v1/oauth/device/approval` | Valid user session with an active membership; explicit approve or deny. Approval binds the client to that user and active organization; `teamId` must belong to the same organization |
 
 ### Installation credentials
 
@@ -74,13 +109,20 @@ Roles are `admin`, `analyst`, and `viewer`. Only `admin` passes
 | `POST /v1/installation/classifier/provision` | Installation token; local mode can return the organization's classifier credential, while managed mode returns no credential; per-installation rate limit; `Cache-Control: no-store` |
 | `POST /v1/installation/classifier/classify` | Installation token; managed mode only; resolves the provider credential server-side, accepts at most 64 KiB of semantic text, and returns only a category assignment; per-installation rate limit; `Cache-Control: no-store` |
 
+The native client uses Metrune's OAuth device grant by default. It has no
+embedded client secret and never receives the person's web session or an
+identity-provider refresh token. A successful, one-time exchange returns the
+long-lived, revocable installation credential used by upload, classifier, and
+provisioning requests. `POST /v1/enroll` remains the legacy personal-code and
+organization-token path for controlled automation.
+
 ### Organization administration
 
 Every operation below resolves the organization from the caller's credential.
 
 | Operation | Rule |
 | --- | --- |
-| `GET /v1/org/teams` | Any member. Team names are needed by the self-service enrollment flow on the profile page |
+| `GET /v1/org/teams` | Any member. Team names are needed by the browser device-approval flow |
 | `GET /v1/org/members`, `POST /v1/org/members` | Admin. Adding requires an existing account and creates only an organization membership |
 | `GET`/`POST /v1/org/invitations` | Admin user session. Lists metadata or sends an expiring email invitation; service tokens cannot invite |
 | `POST /v1/org/invitations/{id}/resend`, `DELETE /v1/org/invitations/{id}` | Admin user session. Resend rotates the token; revoke invalidates it |
@@ -92,7 +134,7 @@ Every operation below resolves the organization from the caller's credential.
 | `PATCH /v1/org/settings` | Admin |
 | `GET`/`PATCH /v1/org/classifier`, `POST /v1/org/classifier/test` | Admin |
 | `GET`/`POST /v1/org/credentials`, `DELETE /v1/org/credentials/{id}` | Admin. Responses carry credential metadata only, never the secret |
-| `POST /v1/org/vault/recovery` | Admin, **plus** re-verification of the caller's own password, **plus** a one-time database constraint so the recovery key can never be exported twice. Returns the key derived for the caller's **active** organization, so an admin of one tenant cannot obtain a co-tenant's key |
+| `POST /v1/org/vault/recovery` | Admin, **plus** re-verification: the caller's password in local mode or an OIDC session less than ten minutes old, **plus** a one-time database constraint so the recovery key can never be exported twice. Returns the key derived for the caller's **active** organization, so an admin of one tenant cannot obtain a co-tenant's key |
 | `GET /v1/org/prices` | Any member. Prices explain the costs already shown in analytics |
 | `POST /v1/org/prices`, `PATCH`/`DELETE /v1/org/prices/{id}` | Admin, and a user session, so the pricing change has a durable actor |
 
@@ -138,6 +180,9 @@ authenticated identity where one exists.
 | Ingestion | Installation | 60/minute | `METRUNE_RATE_LIMIT_INGEST_PER_MINUTE` |
 | Analytics | User or dashboard token | 120/minute | `METRUNE_RATE_LIMIT_ANALYTICS_PER_MINUTE` |
 | Enrollment codes | User | 20/hour | `METRUNE_RATE_LIMIT_ENROLLMENT_CODES_PER_HOUR` |
+| Device authorization requests | Client address | 10/minute | `METRUNE_RATE_LIMIT_DEVICE_AUTHORIZATIONS_PER_MINUTE` |
+| Device inspection/approval | User | 60/hour | `METRUNE_RATE_LIMIT_DEVICE_VERIFICATIONS_PER_HOUR` |
+| Device token polls | Client address, plus persistent per-device pacing | 300/minute | `METRUNE_RATE_LIMIT_DEVICE_TOKEN_POLLS_PER_MINUTE` |
 | Invitations | Admin user | 30/hour | `METRUNE_RATE_LIMIT_INVITATIONS_PER_HOUR` |
 | Password-reset requests | Client address | 10/hour | `METRUNE_RATE_LIMIT_PASSWORD_RESETS_PER_HOUR` |
 

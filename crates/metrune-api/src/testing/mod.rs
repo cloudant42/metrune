@@ -8,6 +8,11 @@ mod harness;
 
 mod analytics;
 mod authorization;
+mod control_plane;
+mod device_auth;
+mod http_contract;
 mod identity_flows;
+mod identity_lifecycle;
+mod oidc;
 mod tenancy;
 mod vault_migration;

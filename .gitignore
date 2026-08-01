@@ -9,8 +9,14 @@
 web/node_modules
 web/.next
 web/out
+web/playwright-report
+web/test-results
 *.tsbuildinfo
 coverage
 .playwright-mcp/
 .agents/
+.claude/
 .codex/
+.cursor/
+.idea/
+.vscode/

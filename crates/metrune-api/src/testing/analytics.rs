@@ -4,7 +4,7 @@
 //! `filtered_query` and `personal_usage_suffix`. Unit tests can only assert the
 //! SQL text; only a real query proves a co-tenant's rows stay invisible.
 
-use super::harness::{analytics_harness, batch, snapshot};
+use super::harness::{analytics_harness, batch, harness, snapshot};
 use axum::http::StatusCode;
 use serde_json::json;
 
@@ -34,6 +34,20 @@ async fn an_ingested_session_appears_only_in_its_own_organizations_analytics() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(overview["sessions"].as_u64(), Some(1));
     assert_eq!(overview["totalTokens"].as_u64(), Some(1_500));
+
+    // Empty legacy turn arrays must still produce a successful response for
+    // the turn-derived analytics dimensions. The nested ClickHouse ARRAY JOIN
+    // form is important here because newer ClickHouse analyzers do not expose
+    // an alias to a sibling ARRAY JOIN expression.
+    for path in [
+        "/v1/analytics/breakdowns?dimension=workflow",
+        "/v1/analytics/workflow-model",
+        "/v1/analytics/category-model",
+    ] {
+        let (status, body) = harness.get(path, Some(&alpha.admin.token)).await;
+        assert_eq!(status, StatusCode::OK, "{path} failed: {body}");
+        assert!(body.is_array(), "{path} did not return an array: {body}");
+    }
 
     // The co-tenant queries the same table and must see nothing.
     let (status, overview) = harness
@@ -84,6 +98,15 @@ async fn session_listings_and_facets_stay_organization_scoped() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sessions.as_array().expect("session array").len(), 1);
+    let session_key = sessions[0]["sessionKey"].as_str().expect("session key");
+    let (status, detail) = harness
+        .get(
+            &format!("/v1/analytics/sessions/{session_key}"),
+            Some(&alpha_service),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["sessionKey"].as_str(), Some(session_key));
 
     let (status, sessions) = harness
         .get("/v1/analytics/sessions", Some(&beta_service))
@@ -93,6 +116,13 @@ async fn session_listings_and_facets_stay_organization_scoped() {
         sessions.as_array().expect("session array").is_empty(),
         "a co-tenant's service token listed another organization's sessions"
     );
+    let (status, _) = harness
+        .get(
+            &format!("/v1/analytics/sessions/{session_key}"),
+            Some(&beta_service),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let (status, facets) = harness
         .get("/v1/analytics/facets", Some(&beta.admin.token))
@@ -120,6 +150,13 @@ async fn a_viewer_service_token_cannot_open_the_session_drilldown() {
         .create_dashboard_token(workspace.organization_id, "viewer")
         .await;
     let (status, _) = harness.get("/v1/analytics/sessions", Some(&viewer)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = harness
+        .get(
+            &format!("/v1/analytics/sessions/{}", "a".repeat(64)),
+            Some(&viewer),
+        )
+        .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     let revoked = harness
@@ -155,6 +192,19 @@ async fn personal_usage_only_covers_the_callers_own_installations() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(usage["overview"]["sessions"].as_u64(), Some(1));
+    let (status, sessions) = harness
+        .get("/v1/me/sessions", Some(&workspace.admin.token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let session_key = sessions[0]["sessionKey"].as_str().expect("session key");
+    let (status, detail) = harness
+        .get(
+            &format!("/v1/analytics/sessions/{session_key}"),
+            Some(&workspace.admin.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["sessionKey"].as_str(), Some(session_key));
 
     // A colleague in the same organization owns no installation, so their
     // personal view must be empty even though the org-wide view is not.
@@ -173,6 +223,13 @@ async fn personal_usage_only_covers_the_callers_own_installations() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(sessions.as_array().expect("session array").is_empty());
+    let (status, _) = harness
+        .get(
+            &format!("/v1/analytics/sessions/{session_key}"),
+            Some(&workspace.viewer.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -284,37 +341,59 @@ async fn a_snapshot_with_raw_identifiers_is_rejected_without_failing_the_batch()
     let mut raw = snapshot("raw-session", "raw-user");
     raw.session_key = "too-short".into();
     raw.user_key = "also-short".into();
+    let payload = batch(
+        "batch-mixed",
+        vec![raw, snapshot("good-session", "good-user")],
+    );
 
     let (status, ack) = harness
-        .send(
-            "POST",
-            "/v1/ingest/sessions",
-            Some(&token),
-            batch(
-                "batch-mixed",
-                vec![raw, snapshot("good-session", "good-user")],
-            ),
-        )
+        .send("POST", "/v1/ingest/sessions", Some(&token), payload.clone())
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(ack["accepted"].as_u64(), Some(1));
     assert_eq!(ack["rejected"].as_u64(), Some(1));
     assert!(!ack["errors"].as_array().expect("errors").is_empty());
+    assert_eq!(
+        ack["acceptedSessionKeys"]
+            .as_array()
+            .map(|values| values.len()),
+        Some(1),
+        "partial acknowledgements must identify accepted rows"
+    );
+    assert_eq!(
+        ack["rejectedSessionKeys"]
+            .as_array()
+            .map(|values| values.len()),
+        Some(1),
+        "partial acknowledgements must identify rejected rows"
+    );
+
+    let (status, retry) = harness
+        .send("POST", "/v1/ingest/sessions", Some(&token), payload)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        retry["accepted"].as_u64(),
+        Some(1),
+        "a partial batch was incorrectly recorded as fully complete"
+    );
+    assert_eq!(retry["duplicates"].as_u64(), Some(0));
+    assert_eq!(retry["rejected"].as_u64(), Some(1));
 }
 
 #[tokio::test]
 async fn an_unsupported_batch_schema_is_refused_outright() {
-    let harness = analytics_harness!();
+    let harness = harness!();
     let workspace = harness.workspace("schema").await;
     let (_, token) = harness
         .create_installation(workspace.organization_id, Some(workspace.admin.user_id))
         .await;
 
-    let (status, _) = harness
-        .send(
-            "POST",
+    let (status, response) = harness
+        .send_client(
             "/v1/ingest/sessions",
-            Some(&token),
+            &token,
+            Some(env!("CARGO_PKG_VERSION")),
             json!({
                 "schemaVersion": "999",
                 "batchId": "batch-future",
@@ -323,7 +402,62 @@ async fn an_unsupported_batch_schema_is_refused_outright() {
             }),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(response["code"], "client_unsupported");
+    assert!(response["minimumClientVersion"].is_null());
+}
+
+#[tokio::test]
+async fn a_client_from_a_different_major_version_is_refused() {
+    let harness = harness!();
+    let workspace = harness.workspace("major-version").await;
+    let (_, token) = harness
+        .create_installation(workspace.organization_id, Some(workspace.admin.user_id))
+        .await;
+    let server_major = metrune_core::release::major_version(env!("CARGO_PKG_VERSION"))
+        .expect("server package version is valid");
+    let incompatible_client = format!("{}.0.0", server_major + 1);
+
+    let (status, response) = harness
+        .send_client(
+            "/v1/ingest/sessions",
+            &token,
+            Some(&incompatible_client),
+            batch("batch-major-mismatch", vec![]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(response["code"], "client_unsupported");
+    assert!(response["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("major version")));
+}
+
+#[tokio::test]
+async fn a_configured_client_floor_rejects_old_or_unversioned_clients() {
+    let mut harness = harness!();
+    harness
+        .state
+        .set_minimum_client_version(Some("0.2.0-beta.2"));
+    let workspace = harness.workspace("client-floor").await;
+    let (_, token) = harness
+        .create_installation(workspace.organization_id, Some(workspace.admin.user_id))
+        .await;
+    let payload = batch("batch-old-client", vec![]);
+
+    for client_version in [Some("0.2.0-beta.1"), None] {
+        let (status, response) = harness
+            .send_client(
+                "/v1/ingest/sessions",
+                &token,
+                client_version,
+                payload.clone(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(response["code"], "client_unsupported");
+        assert_eq!(response["minimumClientVersion"], "0.2.0-beta.2");
+    }
 }
 
 #[tokio::test]

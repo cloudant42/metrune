@@ -3,13 +3,13 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
 COPY migrations ./migrations
-RUN cargo build --release -p metrune-api -p metrune
+RUN cargo build --locked --release -p metrune-api -p metrune
 # A manifest covering the Linux client this image carries, so a fresh
 # deployment can mirror and verify one platform with no operator setup. Mount a
 # release manifest over /usr/share/metrune/downloads to mirror every platform —
 # see docs/CLIENT_DISTRIBUTION.md.
 ARG METRUNE_CLIENT_VERSION=0.0.0-source
-ARG METRUNE_RELEASE_BASE_URL=https://github.com/metrune/metrune/releases/latest/download
+ARG METRUNE_RELEASE_BASE_URL=https://github.com/cloudant42/metrune/releases/download/client-v0.1.0
 RUN cd /src/target/release \
     && sha256sum metrune > SHA256SUMS.tmp \
     && sed 's/ metrune$/ metrune-linux-x86_64/' SHA256SUMS.tmp > SHA256SUMS \

@@ -9,6 +9,18 @@ export const dynamic = "force-dynamic";
 
 type PageProps = { searchParams: Promise<Record<string, string | string[] | undefined>> };
 
+function publicBaseUrl(value: string | undefined, fallback: string): string {
+  try {
+    const url = new URL(value?.trim() || fallback);
+    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("unsupported URL scheme");
+    url.hash = "";
+    url.search = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return fallback.replace(/\/+$/, "");
+  }
+}
+
 export default async function ProfilePage({ searchParams }: PageProps) {
   const rawParams = await searchParams;
   const requestedInstallation = typeof rawParams.installation === "string"
@@ -16,14 +28,14 @@ export default async function ProfilePage({ searchParams }: PageProps) {
     : undefined;
   const data = await getProfileData(requestedInstallation);
   if (!data) redirect("/login");
-  const { user, usage, installations, teams } = data;
+  const { user, usage, installations } = data;
   const selectedInstallation = requestedInstallation
     ? installations.find(item => item.id === requestedInstallation)
     : undefined;
   if (requestedInstallation && !selectedInstallation) redirect("/profile");
   const name = user.displayName ?? user.email;
-  const serverUrl = process.env.METRUNE_PUBLIC_API_URL ?? "http://localhost:8080";
-  const releaseBaseUrl = process.env.METRUNE_CLIENT_RELEASE_BASE_URL ?? `${serverUrl}/v1/downloads`;
+  const serverUrl = publicBaseUrl(process.env.METRUNE_PUBLIC_API_URL, "http://localhost:8080");
+  const releaseBaseUrl = publicBaseUrl(process.env.METRUNE_CLIENT_RELEASE_BASE_URL, `${serverUrl}/v1/downloads`);
   const hasUsage = usage.overview.sessions > 0;
   const hasInstallations = installations.length > 0;
   return (
@@ -64,11 +76,11 @@ export default async function ProfilePage({ searchParams }: PageProps) {
               <>
                 <p className="eyebrow">Getting started</p>
                 <h2 id="onboarding-title">Connect your first client</h2>
-                <p className="onboarding-copy">Your private analytics appear here as soon as an enrolled client uploads usage. Create a one-time enrollment code below — it takes about a minute.</p>
+                <p className="onboarding-copy">Your private analytics appear here as soon as an enrolled client uploads usage. Start enrollment in the CLI, then approve that machine in your browser.</p>
                 <ol className="onboarding-steps">
-                  <li>Create an enrollment code</li>
                   <li>Install the client on your machine</li>
-                  <li>Run the enroll command, then code with your AI tools as usual</li>
+                  <li>Run the enroll command and open its approval link</li>
+                  <li>Confirm the matching device code, then code with your AI tools as usual</li>
                 </ol>
               </>
             )}
@@ -76,7 +88,7 @@ export default async function ProfilePage({ searchParams }: PageProps) {
         </section>
       )}
       <div className="profile-client-grid">
-        <ClientEnrollment installations={installations} teams={teams} serverUrl={serverUrl} releaseBaseUrl={releaseBaseUrl} />
+        <ClientEnrollment installations={installations} serverUrl={serverUrl} releaseBaseUrl={releaseBaseUrl} />
       </div>
     </>
   );

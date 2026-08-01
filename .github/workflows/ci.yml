@@ -1,7 +1,12 @@
 name: CI
 
 on:
+  # Release tags are cut from a commit that has already passed this workflow
+  # on main. Limiting push runs avoids running the full matrix a second time
+  # when the tag is published; pull requests remain fully checked.
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
@@ -48,6 +53,10 @@ jobs:
           --health-retries 20
       clickhouse:
         image: clickhouse/clickhouse-server:24.8-alpine
+        env:
+          # Match the local integration harness: the test client deliberately
+          # connects as the unauthenticated default user.
+          CLICKHOUSE_SKIP_USER_SETUP: 1
         ports:
           - 8123:8123
         options: >-
@@ -92,12 +101,33 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+      - run: npm run lint
       - run: npm run typecheck
       - run: npm run build
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npx playwright install --with-deps chromium
+        working-directory: web
+      - run: make test-e2e
 
   deployment:
     runs-on: ubuntu-latest

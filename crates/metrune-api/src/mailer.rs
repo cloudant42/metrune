@@ -57,8 +57,8 @@ impl Mailer {
             .from
             .parse::<Mailbox>()
             .context("METRUNE_SMTP_FROM must be a valid mailbox")?;
-        let public_url = env::var("METRUNE_PUBLIC_API_URL")
-            .context("METRUNE_PUBLIC_API_URL is required when SMTP is configured")?
+        let public_url = env::var("METRUNE_PUBLIC_WEB_URL")
+            .context("METRUNE_PUBLIC_WEB_URL is required when SMTP is configured")?
             .trim_end_matches('/')
             .to_owned();
         Ok(Some(Self {
@@ -199,6 +199,7 @@ impl SmtpEnvironment {
     }
 }
 
+#[derive(Debug)]
 struct CompleteSmtpEnvironment {
     host: String,
     port: u16,
@@ -230,7 +231,7 @@ fn escape_html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_html;
+    use super::{escape_html, normalize_email, SmtpEnvironment};
 
     #[test]
     fn email_html_escapes_operator_controlled_values() {
@@ -238,5 +239,40 @@ mod tests {
             escape_html("<Team & \"friends\">"),
             "&lt;Team &amp; &quot;friends&quot;&gt;"
         );
+    }
+
+    #[test]
+    fn email_normalization_trims_and_canonicalizes_case() {
+        assert_eq!(
+            normalize_email("  Teammate@Example.TEST  ").expect("valid email"),
+            "teammate@example.test"
+        );
+        assert!(normalize_email("not an address").is_err());
+        assert!(normalize_email(&format!("{}@example.test", "a".repeat(321))).is_err());
+    }
+
+    #[test]
+    fn partial_or_invalid_smtp_configuration_fails_closed() {
+        let missing = SmtpEnvironment {
+            host: Some("smtp.example.test".into()),
+            ..SmtpEnvironment::default()
+        }
+        .complete()
+        .expect_err("partial SMTP configuration must not be silently disabled");
+        assert!(missing.to_string().contains("METRUNE_SMTP_PORT"));
+
+        let invalid_port = SmtpEnvironment {
+            host: Some("smtp.example.test".into()),
+            port: Some("not-a-port".into()),
+            username: Some("user".into()),
+            password: Some("secret".into()),
+            from: Some("Metrune <metrune@example.test>".into()),
+            security: Some("tls".into()),
+        }
+        .complete()
+        .expect_err("an invalid SMTP port must fail startup validation");
+        assert!(invalid_port
+            .to_string()
+            .contains("METRUNE_SMTP_PORT must be a valid port"));
     }
 }

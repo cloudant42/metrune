@@ -13,9 +13,32 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 /// Bump when the manifest gains a field a client must understand to stay safe.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// Explicit client version sent on requests to a Metrune server.
+pub const CLIENT_VERSION_HEADER: &str = "x-metrune-client-version";
+/// Stable machine-readable code for a terminal compatibility rejection.
+pub const CLIENT_UNSUPPORTED_ERROR_CODE: &str = "client_unsupported";
+
+/// Public server capabilities used by clients before an authenticated upload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerInfo {
+    pub server_version: String,
+    pub supported_schema_versions: Vec<String>,
+    pub minimum_client_version: Option<String>,
+}
+
+/// Body returned with HTTP 426 when a client cannot speak to this server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientUnsupportedResponse {
+    pub error: String,
+    pub code: String,
+    pub minimum_client_version: Option<String>,
+}
 
 /// Where a client can fetch an artifact from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +84,7 @@ fn upstream_source() -> ArtifactSource {
 #[serde(rename_all = "camelCase")]
 pub struct ClientReleaseManifest {
     pub schema_version: u32,
-    /// The version this manifest publishes, e.g. `0.3.0`.
+    /// The version this manifest publishes, e.g. `0.1.0`.
     pub version: String,
     /// The oldest client version the server still accepts uploads from.
     pub minimum_version: String,
@@ -138,17 +161,16 @@ impl ClientReleaseManifest {
         })
     }
 
-    /// True when the manifest is newer than `current`, using a plain numeric
-    /// comparison of dot-separated components. Release tags are `vMAJOR.MINOR.
-    /// PATCH`; anything unparsable sorts as 0 rather than erroring, so a
-    /// malformed manifest can never claim to be an upgrade.
+    /// True when the manifest is newer than `current`. Release tags may carry
+    /// a leading `v`; normal semantic-version prerelease ordering applies.
+    /// A malformed manifest can never claim to be an upgrade.
     pub fn is_newer_than(&self, current: &str) -> bool {
-        version_key(&self.version) > version_key(current)
+        compare_versions(&self.version, current).is_some_and(std::cmp::Ordering::is_gt)
     }
 
     /// True when `current` is older than the minimum this release supports.
     pub fn requires_upgrade(&self, current: &str) -> bool {
-        version_key(current) < version_key(&self.minimum_version)
+        version_is_older(current, &self.minimum_version)
     }
 }
 
@@ -227,7 +249,109 @@ pub enum SignatureError {
     Mismatch,
 }
 
+/// Why a release manifest cannot be consumed.  Keep this validation in the
+/// shared crate so the API mirror, updater, and release builder all enforce
+/// the same fail-closed contract.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ManifestError {
+    #[error("unsupported client manifest schema version {0}")]
+    UnsupportedSchema(u32),
+    #[error("invalid release version {0:?}")]
+    InvalidVersion(String),
+    #[error("minimum client version {minimum:?} is newer than release {version:?}")]
+    MinimumAfterRelease { minimum: String, version: String },
+    #[error("client manifest has no artifacts")]
+    EmptyArtifacts,
+    #[error("client manifest repeats artifact target {0:?}")]
+    DuplicateTarget(String),
+    #[error("client manifest repeats artifact name {0:?}")]
+    DuplicateArtifact(String),
+    #[error("client manifest contains an unknown target {0:?}")]
+    UnknownTarget(String),
+    #[error("client manifest contains an unsafe artifact name {0:?}")]
+    UnsafeArtifact(String),
+    #[error("client manifest contains an invalid SHA-256 for {artifact:?}")]
+    InvalidDigest { artifact: String },
+    #[error("client manifest contains a non-HTTPS artifact URL for {artifact:?}")]
+    InsecureUrl { artifact: String },
+    #[error("client manifest has an invalid upstream URL")]
+    InvalidUpstreamUrl,
+    #[error("client manifest has an invalid release timestamp")]
+    InvalidReleaseTimestamp,
+}
+
 impl ClientReleaseManifest {
+    /// Validate transported metadata before using it as a download allowlist.
+    /// Partial mirrors are allowed (for example a development image carrying
+    /// only Linux), but every entry must be one of the published targets and
+    /// must have an unambiguous, HTTPS download URL and full SHA-256 digest.
+    /// Loopback HTTP artifact URLs are accepted for local development stacks;
+    /// remote mirrors must always use HTTPS.
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.schema_version != MANIFEST_SCHEMA_VERSION {
+            return Err(ManifestError::UnsupportedSchema(self.schema_version));
+        }
+        let version = parsed_version(&self.version)
+            .ok_or_else(|| ManifestError::InvalidVersion(self.version.clone()))?;
+        let minimum = parsed_version(&self.minimum_version)
+            .ok_or_else(|| ManifestError::InvalidVersion(self.minimum_version.clone()))?;
+        if minimum > version {
+            return Err(ManifestError::MinimumAfterRelease {
+                minimum: self.minimum_version.clone(),
+                version: self.version.clone(),
+            });
+        }
+        if chrono::DateTime::parse_from_rfc3339(&self.released_at).is_err() {
+            return Err(ManifestError::InvalidReleaseTimestamp);
+        }
+        if !is_https_url(&self.upstream_base_url) {
+            return Err(ManifestError::InvalidUpstreamUrl);
+        }
+        if self.artifacts.is_empty() {
+            return Err(ManifestError::EmptyArtifacts);
+        }
+        let known_targets: HashSet<&str> = PUBLISHED_TARGETS.iter().map(|entry| entry.0).collect();
+        let mut targets = HashSet::new();
+        let mut artifacts = HashSet::new();
+        for entry in &self.artifacts {
+            if !known_targets.contains(entry.target.as_str()) {
+                return Err(ManifestError::UnknownTarget(entry.target.clone()));
+            }
+            if !targets.insert(entry.target.as_str()) {
+                return Err(ManifestError::DuplicateTarget(entry.target.clone()));
+            }
+            if !artifacts.insert(entry.artifact.as_str()) {
+                return Err(ManifestError::DuplicateArtifact(entry.artifact.clone()));
+            }
+            if entry.artifact.is_empty()
+                || entry.artifact == "."
+                || entry.artifact == ".."
+                || entry.artifact.contains('/')
+                || entry.artifact.contains('\\')
+                || entry.artifact.contains('\0')
+                || entry.artifact.chars().any(char::is_whitespace)
+            {
+                return Err(ManifestError::UnsafeArtifact(entry.artifact.clone()));
+            }
+            if entry.sha256.len() != 64
+                || !entry
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ManifestError::InvalidDigest {
+                    artifact: entry.artifact.clone(),
+                });
+            }
+            if !is_secure_download_url(&entry.url) {
+                return Err(ManifestError::InsecureUrl {
+                    artifact: entry.artifact.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Sign the manifest with the base64 ed25519 release key. Used by the
     /// release pipeline only; the key never leaves CI and never reaches a
     /// deployment, which is what keeps a mirror unable to mint its own release.
@@ -294,6 +418,30 @@ impl ClientReleaseManifest {
     }
 }
 
+fn is_https_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+fn is_secure_download_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        let has_safe_authority = url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none();
+        let local_http = url.scheme() == "http"
+            && matches!(
+                url.host_str(),
+                Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+            );
+        has_safe_authority && (url.scheme() == "https" || local_http)
+    })
+}
+
 /// The build target of the running binary, matching `ReleaseArtifact::target`.
 /// Returns `None` on a platform we do not publish, so callers report that
 /// rather than downloading something that cannot run.
@@ -313,13 +461,47 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn version_key(version: &str) -> Vec<u64> {
-    version
-        .trim()
-        .trim_start_matches('v')
-        .split(['.', '-', '+'])
-        .map(|part| part.parse::<u64>().unwrap_or(0))
-        .collect()
+fn parsed_version(version: &str) -> Option<semver::Version> {
+    semver::Version::parse(version.trim().trim_start_matches('v')).ok()
+}
+
+/// Whether a value is a complete semantic version, optionally prefixed by
+/// `v`. Operators use this to fail startup on a misspelled version floor.
+pub fn is_valid_version(version: &str) -> bool {
+    parsed_version(version).is_some()
+}
+
+/// Return the compatibility major for a complete semantic version.
+///
+/// Metrune's server and client are released independently, but the major
+/// number is their wire-compatibility line. Minor releases add features and
+/// patches fix or secure an existing line; a different major requires a
+/// coordinated compatibility release.
+pub fn major_version(version: &str) -> Option<u64> {
+    parsed_version(version).map(|parsed| parsed.major)
+}
+
+/// Whether two server/client versions belong to the same compatibility line.
+pub fn versions_share_major(left: &str, right: &str) -> bool {
+    major_version(left).is_some_and(|major| major_version(right) == Some(major))
+}
+
+/// Compare two semantic versions. Invalid values do not participate in an
+/// ordering, which prevents malformed release metadata from advertising an
+/// update.
+pub fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    Some(parsed_version(left)?.cmp(&parsed_version(right)?))
+}
+
+/// True when `current` is below `minimum`. An invalid current version is
+/// conservatively considered too old; an invalid minimum must be rejected by
+/// server configuration validation and therefore does not create a floor.
+pub fn version_is_older(current: &str, minimum: &str) -> bool {
+    match (parsed_version(current), parsed_version(minimum)) {
+        (Some(current), Some(minimum)) => current < minimum,
+        (None, Some(_)) => true,
+        (_, None) => false,
+    }
 }
 
 #[cfg(test)]
@@ -359,6 +541,24 @@ mod tests {
         assert!(release.is_newer_than("v0.2.9"));
         assert!(release.requires_upgrade("0.1.4"));
         assert!(!release.requires_upgrade("v0.2.0"));
+    }
+
+    #[test]
+    fn compares_prereleases_with_semver_precedence() {
+        let release = manifest("v0.2.0", "v0.2.0-beta.2");
+        assert!(release.is_newer_than("0.2.0-beta.2"));
+        assert!(release.requires_upgrade("0.2.0-beta.1"));
+        assert!(!release.requires_upgrade("0.2.0-beta.2"));
+        assert!(!release.requires_upgrade("0.2.0"));
+    }
+
+    #[test]
+    fn version_validation_rejects_partial_or_descriptive_values() {
+        assert!(is_valid_version("v1.2.3"));
+        assert!(is_valid_version("1.2.3-alpha.1"));
+        assert!(!is_valid_version("1.2"));
+        assert!(!is_valid_version("latest"));
+        assert!(version_is_older("not-a-version", "1.0.0"));
     }
 
     #[test]
@@ -475,5 +675,46 @@ mod tests {
         assert!(release.artifact_for("linux-x86_64").is_some());
         assert!(release.artifact_for("linux-aarch64").is_none());
         assert!(release.artifact_named("metrune-linux-x86_64").is_some());
+    }
+
+    #[test]
+    fn validates_transport_and_download_metadata() {
+        let mut release = manifest("v0.3.0", "v0.2.0");
+        release.artifacts[0].sha256 = "ab".repeat(32);
+        release.validate().expect("valid manifest");
+
+        release.artifacts[0].url = "http://mirror.test/client".into();
+        assert!(matches!(
+            release.validate(),
+            Err(ManifestError::InsecureUrl { .. })
+        ));
+
+        release.artifacts[0].url = "http://localhost:8080/v1/downloads/client".into();
+        release.validate().expect("loopback development URL");
+    }
+
+    #[test]
+    fn major_versions_define_the_server_client_compatibility_line() {
+        assert!(versions_share_major("0.1.0", "0.9.4"));
+        assert!(versions_share_major("v1.2.0", "1.0.0"));
+        assert!(!versions_share_major("0.1.0", "1.0.0"));
+        assert!(!versions_share_major("not-a-version", "0.1.0"));
+    }
+
+    #[test]
+    fn rejects_duplicate_targets_and_unsafe_artifact_names() {
+        let mut release = manifest("v0.3.0", "v0.2.0");
+        release.artifacts[0].sha256 = "ab".repeat(32);
+        release.artifacts.push(release.artifacts[0].clone());
+        assert!(matches!(
+            release.validate(),
+            Err(ManifestError::DuplicateTarget(_))
+        ));
+        release.artifacts.truncate(1);
+        release.artifacts[0].artifact = "../metrune".into();
+        assert!(matches!(
+            release.validate(),
+            Err(ManifestError::UnsafeArtifact(_))
+        ));
     }
 }

@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/metrune/metrune"
+repository = "https://github.com/cloudant42/metrune"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -31,8 +31,10 @@ hkdf = "0.12"
 hmac = "0.12"
 keyring = "4.1.5"
 lettre = { version = "0.11.22", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1-rustls-tls"] }
+openidconnect = { version = "4.0.1", features = ["timing-resistant-secret-traits"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

@@ -3,6 +3,7 @@ use crate::UsageMessage;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     env,
     fs::File,
     io::{BufRead, BufReader},
@@ -63,7 +64,7 @@ impl SourceAdapter for CopilotAdapter {
     fn parse(&self, source: &Path) -> Result<Vec<UsageMessage>> {
         let file = File::open(source)
             .with_context(|| format!("open Copilot source {}", source.display()))?;
-        Ok(BufReader::new(file)
+        let mut messages = BufReader::new(file)
             .lines()
             .map_while(Result::ok)
             .enumerate()
@@ -77,7 +78,27 @@ impl SourceAdapter for CopilotAdapter {
                     source.display().to_string(),
                 )
             })
-            .collect())
+            .collect::<Vec<_>>();
+        messages.sort_by_key(|message| message.observed_at);
+        let mut session_starts = HashMap::new();
+        for message in &messages {
+            session_starts
+                .entry(message.session_id.clone())
+                .and_modify(|started: &mut chrono::DateTime<chrono::Utc>| {
+                    *started = (*started).min(message.observed_at)
+                })
+                .or_insert(message.observed_at);
+        }
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.turn_sequence = index.saturating_add(1) as u32;
+            message.activity_sequence = 1;
+            // OTEL chat spans intentionally contain no prompt or tool detail.
+            message.classification_text = None;
+            message.workflow_signals.clear();
+            message.signal_capabilities.clear();
+            message.session_started_at = session_starts.get(&message.session_id).copied();
+        }
+        Ok(messages)
     }
 }
 

@@ -1,4 +1,4 @@
-.PHONY: check test test-integration integration-up integration-down web-build compose-check licenses notices
+.PHONY: check test test-integration test-e2e test-sso-e2e release-check restore-drill integration-up integration-down web-build compose-check licenses notices
 
 TEST_PG_CONTAINER := metrune-test-postgres
 TEST_PG_PORT := 55432
@@ -11,22 +11,43 @@ check:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
-	cd web && npm run typecheck && npm run build
+	cd web && npm run lint && npm run typecheck && npm run build
 	docker compose config --quiet
 	bash scripts/check-production-compose.sh
 
 test:
 	cargo test --workspace
 
+test-e2e:
+	bash scripts/test-e2e.sh
+	bash scripts/test-sso-e2e.sh
+
+test-sso-e2e:
+	bash scripts/test-sso-e2e.sh
+
 # The HTTP tests need a real Postgres because every authorization rule in the
 # API is a SQL predicate, and a real ClickHouse because the analytics scoping
 # lives in query WHERE clauses. Without these variables the tests report that
 # they were skipped, so a plain `make test` stays useful without Docker.
-test-integration: integration-up
+test-integration:
+	@set -e; \
+	trap '$(MAKE) integration-down' 0 2 3 15; \
+	$(MAKE) integration-up; \
 	METRUNE_TEST_DATABASE_URL=$(TEST_DATABASE_URL) \
 	METRUNE_TEST_CLICKHOUSE_URL=$(TEST_CLICKHOUSE_URL) \
 		cargo test --workspace
-	$(MAKE) integration-down
+
+# The release gate is intentionally broader than `make check`: it exercises
+# the SQL-backed authorization suite, browser flows, and backup/restore drill
+# that cannot be covered by unit tests alone.
+release-check:
+	$(MAKE) check
+	$(MAKE) test-integration
+	$(MAKE) test-e2e
+	$(MAKE) restore-drill
+
+restore-drill:
+	bash scripts/restore-drill.sh
 
 integration-up:
 	@docker rm -f $(TEST_PG_CONTAINER) $(TEST_CH_CONTAINER) >/dev/null 2>&1 || true
@@ -67,9 +88,14 @@ licenses:
 	cargo deny check licenses sources bans
 
 # Regenerates NOTICE from the resolved Rust graph and the installed dashboard
-# tree. Run `npm ci` in web/ first, or the npm section comes out empty.
+# tree. The install is production-only because the runner image ships only the
+# deps Next traces into .next/standalone — dev tooling is never distributed and
+# must not appear in NOTICE. Restores the full tree afterwards so `make check`
+# still has eslint and tsc.
 notices:
+	cd web && npm ci --omit=dev --omit=optional
 	python3 scripts/generate-notices.py --output NOTICE
+	cd web && npm ci
 
 web-build:
 	cd web && npm run build
