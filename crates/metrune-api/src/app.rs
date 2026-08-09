@@ -2720,16 +2720,7 @@ async fn analytics_sessions(
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<Vec<SessionRow>>, ApiError> {
     let auth = analytics_auth(&state, &headers).await?;
-    if auth.user_id.is_some() {
-        return Err(ApiError::forbidden(
-            "organization session drilldown is not available to user sessions",
-        ));
-    }
-    if auth.role == "viewer" {
-        return Err(ApiError::forbidden(
-            "session drilldown requires analyst or admin role",
-        ));
-    }
+    let owner_scope = auth.session_owner_scope()?;
     let order = match query.sort.as_deref() {
         Some("cost") => "total_cost DESC",
         Some("tokens") => "total_tokens DESC",
@@ -2751,7 +2742,11 @@ async fn analytics_sessions(
         workflow: query.workflow,
     };
     let base = "SELECT session_key, installation_id, client_id, project_alias, category_id, category_confidence, classification_status, total_tokens, total_cost, ended_at_ms FROM session_snapshots_dedup FINAL";
-    let (mut sql, params) = filtered_query(base, &filters, &auth.organization_id);
+    let (mut sql, mut params) = filtered_query(base, &filters, &auth.organization_id);
+    if let Some(owner) = owner_scope {
+        sql.push_str(" AND owner_user_id = ?");
+        params.push(owner.to_string());
+    }
     sql.push_str(&format!(" ORDER BY {order} LIMIT {limit} OFFSET {offset}"));
     let mut q = state.clickhouse.query(&sql);
     for param in params {
@@ -2774,13 +2769,10 @@ async fn analytics_session_detail(
     if session_key.len() < 32 || session_key.len() > 128 {
         return Err(ApiError::bad_request("invalid session key"));
     }
+    let owner_scope = auth.session_owner_scope()?;
     let mut sql = "SELECT snapshot_json FROM session_snapshots_dedup FINAL WHERE organization_id = ? AND session_key = ?".to_string();
-    if auth.user_id.is_some() {
+    if owner_scope.is_some() {
         sql.push_str(" AND owner_user_id = ?");
-    } else if auth.role == "viewer" {
-        return Err(ApiError::forbidden(
-            "session drilldown requires analyst or admin role",
-        ));
     }
     sql.push_str(" LIMIT 1");
     let mut query = state
@@ -2788,8 +2780,8 @@ async fn analytics_session_detail(
         .query(&sql)
         .bind(&auth.organization_id)
         .bind(&session_key);
-    if let Some(user_id) = auth.user_id {
-        query = query.bind(user_id.to_string());
+    if let Some(owner) = owner_scope {
+        query = query.bind(owner.to_string());
     }
     let row = query
         .fetch_optional::<SnapshotJsonRow>()
@@ -2927,6 +2919,26 @@ impl DashboardAuth {
             return Err(ApiError::forbidden("organization admin role required"));
         }
         Ok(())
+    }
+
+    /// Whether this caller may read the whole organization's session data.
+    ///
+    /// Analysts and admins drill into every session. Anyone else is limited to
+    /// the sessions they own, which needs a user identity to scope by.
+    pub(crate) fn reads_whole_organization(&self) -> bool {
+        self.role == "admin" || self.role == "analyst"
+    }
+
+    /// The owner every session row must match, or `None` for an
+    /// organization-wide read. A viewer's service token has no user identity to
+    /// scope by, so it may read nothing.
+    pub(crate) fn session_owner_scope(&self) -> Result<Option<Uuid>, ApiError> {
+        if self.reads_whole_organization() {
+            return Ok(None);
+        }
+        self.user_id.map(Some).ok_or(ApiError::forbidden(
+            "session drilldown requires analyst or admin role",
+        ))
     }
 
     pub(crate) fn organization_uuid(&self) -> Result<Uuid, ApiError> {

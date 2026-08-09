@@ -1,6 +1,7 @@
-import { getOrgSessions, type PageParams, type Session } from "@/lib/api";
+import { getCurrentUser, getMySessions, getOrgSessions, type PageParams, type Session } from "@/lib/api";
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
+import { isSessionToken } from "@/lib/session";
 
 function csv(value: unknown) {
   let text = String(value ?? "");
@@ -18,7 +19,11 @@ const MAX_EXPORT_ROWS = 10_000;
 
 export async function GET(request: Request) {
   const store = await cookies();
-  if (!store.get("metrune_session")?.value) {
+  if (!isSessionToken(store.get("metrune_session")?.value)) {
+    return NextResponse.json({ error: "Sign in to export sessions." }, { status: 401 });
+  }
+  const user = await getCurrentUser();
+  if (!user) {
     return NextResponse.json({ error: "Sign in to export sessions." }, { status: 401 });
   }
   const url = new URL(request.url);
@@ -27,9 +32,13 @@ export async function GET(request: Request) {
     const value = url.searchParams.get(key)?.trim();
     if (value) params[key] = value.slice(0, 320);
   }
+  // An analyst or admin exports the organization; everyone else exports the
+  // sessions they own, which is what the personal endpoint returns.
+  const wholeOrganization = user.role === "admin" || user.role === "analyst";
+  const fetchPage = wholeOrganization ? getOrgSessions : getMySessions;
   const sessions: Session[] = [];
   for (let page = 0; sessions.length < MAX_EXPORT_ROWS; page += 1) {
-    const result = await getOrgSessions(params, page, "ended", PAGE_SIZE);
+    const result = await fetchPage(params, page, "ended", PAGE_SIZE);
     if (result.kind === "unauthorized") return NextResponse.json({ error: "Sign in to export sessions." }, { status: 401 });
     if (result.kind === "forbidden") return NextResponse.json({ error: "Analyst or admin access is required to export sessions." }, { status: 403 });
     if (result.kind !== "live") return NextResponse.json({ error: "Live session data is temporarily unavailable." }, { status: 503 });
@@ -58,7 +67,7 @@ export async function GET(request: Request) {
   return new Response(body, {
     headers: {
       "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": "attachment; filename=metrune-sessions.csv",
+      "Content-Disposition": `attachment; filename=${wholeOrganization ? "metrune-sessions.csv" : "metrune-my-sessions.csv"}`,
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
     },
