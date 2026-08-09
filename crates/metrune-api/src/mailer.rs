@@ -30,11 +30,17 @@ impl Mailer {
     pub(crate) fn from_env(environment: &str) -> anyhow::Result<Option<Self>> {
         let values = SmtpEnvironment::read();
         if values.is_empty() {
+            // Running without mail is a supported deployment choice: invitations
+            // and administrator-issued password resets return a link instead of
+            // sending one. It is warned about rather than refused because the
+            // operator loses self-service recovery by making it.
             if environment == "production" {
-                bail!(
-                    "SMTP is required in production; configure METRUNE_SMTP_HOST, \
-                     METRUNE_SMTP_PORT, METRUNE_SMTP_USERNAME, METRUNE_SMTP_PASSWORD, \
-                     METRUNE_SMTP_FROM, and METRUNE_SMTP_SECURITY"
+                tracing::warn!(
+                    "SMTP is not configured. Invitations and administrator-issued password \
+                     resets return a manual link for you to deliver, and self-service password \
+                     reset does nothing. Set METRUNE_SMTP_HOST, METRUNE_SMTP_PORT, \
+                     METRUNE_SMTP_USERNAME, METRUNE_SMTP_PASSWORD, METRUNE_SMTP_FROM, and \
+                     METRUNE_SMTP_SECURITY to enable delivery."
                 );
             }
             return Ok(None);
@@ -253,6 +259,10 @@ mod tests {
 
     #[test]
     fn partial_or_invalid_smtp_configuration_fails_closed() {
+        // No configuration at all is a supported deployment choice and must
+        // read as empty, which is what lets the API start without a mailer.
+        assert!(SmtpEnvironment::default().is_empty());
+
         let missing = SmtpEnvironment {
             host: Some("smtp.example.test".into()),
             ..SmtpEnvironment::default()

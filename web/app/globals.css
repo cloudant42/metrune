@@ -364,6 +364,18 @@ button, select, a, input { transition: border-color 160ms ease, background 160ms
 }
 .banner strong { color: var(--fg); font-weight: 600; }
 
+/* A one-off invitation link: long, must stay selectable, and wraps rather than
+   overflowing the panel on a narrow viewport. */
+.invite-banner { align-items: flex-start; flex-direction: column; gap: 8px; }
+.invite-link {
+  width: 100%; padding: 6px 8px;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  overflow-wrap: anywhere; user-select: all;
+}
+.invite-actions { display: flex; gap: 8px; }
+
 /* ==========================================================================
    Controls
    ========================================================================== */

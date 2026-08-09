@@ -77,11 +77,15 @@ services:
       # binaries to mirror every platform, including in air-gapped networks.
       METRUNE_CLIENT_DOWNLOAD_DIR: /usr/share/metrune/downloads
       METRUNE_TRUST_PROXY_HEADERS: ${METRUNE_TRUST_PROXY_HEADERS:-false}
-      METRUNE_SMTP_HOST: ${METRUNE_SMTP_HOST:?METRUNE_SMTP_HOST must be set}
-      METRUNE_SMTP_PORT: ${METRUNE_SMTP_PORT:?METRUNE_SMTP_PORT must be set}
-      METRUNE_SMTP_USERNAME: ${METRUNE_SMTP_USERNAME:?METRUNE_SMTP_USERNAME must be set}
-      METRUNE_SMTP_PASSWORD: ${METRUNE_SMTP_PASSWORD:?METRUNE_SMTP_PASSWORD must be set}
-      METRUNE_SMTP_FROM: ${METRUNE_SMTP_FROM:?METRUNE_SMTP_FROM must be set}
+      # Optional. Without them the API starts and warns: invitations and
+      # administrator-issued password resets return a link to deliver by hand,
+      # and self-service password reset is unavailable. Set all five to enable
+      # delivery; a partial configuration is rejected at startup.
+      METRUNE_SMTP_HOST: ${METRUNE_SMTP_HOST:-}
+      METRUNE_SMTP_PORT: ${METRUNE_SMTP_PORT:-}
+      METRUNE_SMTP_USERNAME: ${METRUNE_SMTP_USERNAME:-}
+      METRUNE_SMTP_PASSWORD: ${METRUNE_SMTP_PASSWORD:-}
+      METRUNE_SMTP_FROM: ${METRUNE_SMTP_FROM:-}
       METRUNE_SMTP_SECURITY: ${METRUNE_SMTP_SECURITY:-starttls}
       RUST_LOG: ${RUST_LOG:-metrune_api=info,tower_http=info}
     ports:
@@ -124,8 +128,6 @@ services:
     environment:
       METRUNE_ENV: production
       METRUNE_API_URL: http://api:8080
-      METRUNE_DASHBOARD_TOKEN: ""
-      METRUNE_ENABLE_DEMO_DATA: "0"
       METRUNE_PUBLIC_API_URL: ${METRUNE_PUBLIC_API_URL:?METRUNE_PUBLIC_API_URL must be an HTTPS URL}
       METRUNE_CLIENT_RELEASE_BASE_URL: ${METRUNE_CLIENT_RELEASE_BASE_URL:-}
     ports:

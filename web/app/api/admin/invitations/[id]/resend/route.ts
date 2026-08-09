@@ -9,5 +9,6 @@ export async function POST(_: Request, context: Context) {
   if (!result.ok) {
     return NextResponse.json({ error: result.error }, { status: result.status });
   }
-  return new NextResponse(null, { status: 204 });
+  // A workspace without SMTP gets the rotated accept link back here.
+  return NextResponse.json(result.data ?? {}, { status: 200 });
 }

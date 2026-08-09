@@ -66,10 +66,33 @@ async function send(path: string, method: string, body?: unknown): Promise<strin
   return payload.error ?? `Request failed with ${response.status}`;
 }
 
+type InvitationDelivery = { delivery?: string; acceptUrl?: string };
+
+/** Like `send`, but keeps the response body so a caller can read it. */
+async function sendForResult(
+  path: string,
+  method: string,
+  body?: unknown,
+): Promise<{ error: string | null; data: InvitationDelivery }> {
+  const response = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    return { error: payload.error ?? `Request failed with ${response.status}`, data: {} };
+  }
+  return { error: null, data: payload as InvitationDelivery };
+}
+
 export function MembersPanel({ members, invitations, settings }: { members: Member[]; invitations: Invitation[]; settings: OrgSettings }) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Set only when the server has no mail transport and handed the accept link
+  // back for this administrator to deliver.
+  const [manualInvite, setManualInvite] = useState<{ email: string; url: string } | null>(null);
 
   async function run(action: () => Promise<string | null>) {
     setBusy(true);
@@ -85,15 +108,30 @@ export function MembersPanel({ members, invitations, settings }: { members: Memb
     event.preventDefault();
     const form = event.currentTarget;
     const data = new FormData(form);
-    const failure = await run(() => send("/api/admin/invitations", "POST", {
-      email: data.get("email"),
-      role: data.get("role"),
-    }));
-    if (!failure) form.reset();
+    const email = String(data.get("email") ?? "");
+    let delivered: InvitationDelivery = {};
+    const failure = await run(async () => {
+      const result = await sendForResult("/api/admin/invitations", "POST", {
+        email,
+        role: data.get("role"),
+      });
+      delivered = result.data;
+      return result.error;
+    });
+    if (failure) return;
+    form.reset();
+    setManualInvite(delivered.acceptUrl ? { email, url: delivered.acceptUrl } : null);
   }
 
   async function resend(invitation: Invitation) {
-    await run(() => send(`/api/admin/invitations/${invitation.id}/resend`, "POST"));
+    let delivered: InvitationDelivery = {};
+    const failure = await run(async () => {
+      const result = await sendForResult(`/api/admin/invitations/${invitation.id}/resend`, "POST");
+      delivered = result.data;
+      return result.error;
+    });
+    if (failure) return;
+    setManualInvite(delivered.acceptUrl ? { email: invitation.email, url: delivered.acceptUrl } : null);
   }
 
   async function revokeInvitation(invitation: Invitation) {
@@ -128,6 +166,24 @@ export function MembersPanel({ members, invitations, settings }: { members: Memb
         </form>
       </div>
       {error && <p className="form-error" role="alert">{error}</p>}
+      {manualInvite && (
+        <div className="banner invite-banner" role="status">
+          <strong>Share this link with {manualInvite.email}</strong>
+          <span>
+            This server has no email transport, so the invitation was not sent. The link is single-use,
+            expires, and is shown only once — resend the invitation to issue a new one.
+          </span>
+          <code className="invite-link">{manualInvite.url}</code>
+          <span className="invite-actions">
+            <button className="btn ghost" type="button" onClick={() => navigator.clipboard?.writeText(manualInvite.url)}>
+              Copy link
+            </button>
+            <button className="btn ghost" type="button" onClick={() => setManualInvite(null)}>
+              Dismiss
+            </button>
+          </span>
+        </div>
+      )}
       <p className="panel-note">
         {settings.ssoEnforced
           ? "Invitations are expiring and single-use. New members accept the invitation, then sign in through the configured identity provider."
@@ -172,10 +228,10 @@ export function MembersPanel({ members, invitations, settings }: { members: Memb
                 <tr key={invitation.id}>
                   <td>{invitation.email}</td>
                   <td>{invitation.role}</td>
-                  <td><span className={`badge ${invitation.status === "pending" ? "ok" : invitation.status === "delivery_failed" || invitation.status === "expired" ? "warn" : ""}`}>{invitation.status.replaceAll("_", " ")}</span></td>
+                  <td><span className={`badge ${invitation.status === "pending" ? "ok" : invitation.status === "delivery_failed" || invitation.status === "expired" ? "warn" : invitation.status === "manual" ? "warn" : ""}`}>{invitation.status.replaceAll("_", " ")}</span></td>
                   <td>{formatTime(Date.parse(invitation.expiresAt))}</td>
                   <td className="actions-col">
-                    {(invitation.status === "pending" || invitation.status === "delivery_failed" || invitation.status === "expired") && (
+                    {(invitation.status === "pending" || invitation.status === "manual" || invitation.status === "delivery_failed" || invitation.status === "expired") && (
                       <>
                         <button className="btn ghost small" type="button" disabled={busy} onClick={() => resend(invitation)}>Resend</button>
                         <button className="btn danger small" type="button" disabled={busy} onClick={() => revokeInvitation(invitation)}>Revoke</button>

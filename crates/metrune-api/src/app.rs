@@ -590,6 +590,10 @@ pub(crate) fn router(state: AppState) -> Router {
             patch(update_member).delete(remove_member),
         )
         .route(
+            "/v1/org/members/{user_id}/password-reset",
+            post(identity::reset_member_password),
+        )
+        .route(
             "/v1/org/invitations",
             get(identity::list_invitations).post(identity::create_invitation),
         )
