@@ -309,6 +309,11 @@ if [ "$actual" != "$sha" ]; then
 fi
 
 chmod +x "$tmp/metrune"
+# A stock macOS install has no /usr/local/bin, and `install` will not create the
+# destination directory for us.
+if [ ! -d "$target" ]; then
+  mkdir -p "$target" 2>/dev/null || sudo mkdir -p "$target"
+fi
 if [ -w "$target" ]; then
   install "$tmp/metrune" "$target/metrune"
 else
@@ -379,6 +384,20 @@ mod tests {
         assert!(!script.contains("metrune-windows-x86_64.exe"));
         assert!(script.contains("checksum mismatch"));
         assert!(script.contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn install_script_creates_a_missing_destination_directory() {
+        // A stock macOS install has no /usr/local/bin, and `install` fails with
+        // "No such file or directory" rather than creating it.
+        let script = render_install_script(&manifest());
+        let create = script
+            .find("mkdir -p \"$target\"")
+            .expect("the installer must create a missing destination");
+        let copy = script
+            .find("install \"$tmp/metrune\"")
+            .expect("the installer must copy the binary");
+        assert!(create < copy, "the destination is created after the copy");
     }
 
     #[test]

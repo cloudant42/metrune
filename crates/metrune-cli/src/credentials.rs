@@ -39,6 +39,19 @@ impl CredentialStore {
         }
     }
 
+    /// Same as [`Self::for_tests`] but keeps the system keyring enabled, so a
+    /// test can prove the native backend is really being used. The fallback
+    /// path still points somewhere disposable: if the keyring is unavailable
+    /// the store silently writes there instead, and the test asserts on the
+    /// returned storage mode to catch exactly that.
+    #[cfg(test)]
+    pub(crate) fn for_native_keyring_tests(fallback_path: PathBuf) -> Self {
+        Self {
+            fallback_path,
+            use_keyring: true,
+        }
+    }
+
     /// Classifier credentials are scoped to the server that provisioned them.
     /// Provider IDs such as `openrouter` are not globally unique, and reusing
     /// one key across two servers can silently send semantic text to the
@@ -357,5 +370,84 @@ mod tests {
             .expect("read retained credential")
             .is_some());
         std::fs::remove_file(path).expect("remove server-scoped fallback");
+    }
+
+    /// Removes the keyring entry even when an assertion unwinds, so a failing
+    /// run cannot leave a credential behind in a developer's login keychain.
+    struct KeyringGuard {
+        credential_id: String,
+        fallback_path: PathBuf,
+    }
+
+    impl Drop for KeyringGuard {
+        fn drop(&mut self) {
+            if let Ok(entry) = keyring_entry("installation", &self.credential_id) {
+                let _ = entry.delete_credential();
+            }
+            // The store writes here if the keyring turns out to be unavailable,
+            // which is precisely the case this test is asserting against.
+            let _ = std::fs::remove_file(&self.fallback_path);
+        }
+    }
+
+    /// Proves the client really stores installation tokens in the operating
+    /// system's credential store, rather than quietly degrading to the
+    /// fallback file. `docs/RELEASING.md` makes this a release gate for the
+    /// macOS and Windows clients.
+    ///
+    /// Ignored by default: it writes to the real login keychain, and CI images
+    /// without a secret service (Linux) would legitimately fall back. Run it on
+    /// a native runner with `cargo test -p metrune --ignored native_keyring`.
+    #[test]
+    #[ignore = "requires a real OS credential store; run on a native macOS or Windows runner"]
+    fn an_installation_token_round_trips_through_the_native_keyring() {
+        let path = test_path("native-keyring");
+        let store = CredentialStore::for_native_keyring_tests(path.clone());
+        let credential_id = format!(
+            "e2e-native-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after the epoch")
+                .as_nanos()
+        );
+        let _guard = KeyringGuard {
+            credential_id: credential_id.clone(),
+            fallback_path: path.clone(),
+        };
+        let token = "mti_native_keyring_probe";
+
+        let storage = store
+            .set_installation(&credential_id, token)
+            .expect("store the installation token");
+        assert_eq!(
+            storage, "system keyring",
+            "the native credential store was unavailable, so the token fell back to a file"
+        );
+        assert!(
+            !path.exists(),
+            "a keyring write must not also leave the token in the fallback file"
+        );
+
+        assert_eq!(
+            store
+                .get_installation(&credential_id)
+                .expect("read the installation token")
+                .as_deref(),
+            Some(token)
+        );
+
+        store
+            .delete_installation(&credential_id)
+            .expect("delete the installation token");
+        // Read straight through the backend: `get_installation` would report
+        // `None` for a fallback miss even if the keyring entry survived, and
+        // `delete_scoped` ignores keyring deletion errors.
+        let entry = keyring_entry("installation", &credential_id)
+            .expect("open the keyring entry after deletion");
+        assert!(
+            entry.get_password().is_err(),
+            "the credential is still present in the native keyring after deletion"
+        );
     }
 }

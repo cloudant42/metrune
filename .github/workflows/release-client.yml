@@ -79,6 +79,22 @@ jobs:
           expected="${GITHUB_REF_NAME#client-v}"
           grep -F "${expected}" <<<"$version"
           "${{ matrix.source }}" --help
+      - name: Prove the native credential store is used
+        # Installation tokens must land in the operating system's credential
+        # store, not the 0600 fallback file. The store degrades silently, so
+        # this asserts the storage mode rather than trusting a successful
+        # write. RELEASING.md makes it a gate for leaving experimental tier.
+        #
+        # Skipped on Linux: hosted runners have no D-Bus secret service, so
+        # falling back there is correct behaviour, and scripts/test-e2e.sh
+        # already covers the fallback path.
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          cargo test --locked -p metrune --target "${{ matrix.target }}" \
+            -- --ignored --exact \
+            credentials::tests::an_installation_token_round_trips_through_the_native_keyring
+
       - name: Name release artifact
         shell: bash
         run: cp "${{ matrix.source }}" "${{ matrix.artifact }}"

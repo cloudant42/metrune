@@ -9,7 +9,46 @@ api_url="http://localhost:${api_port}"
 web_url="http://localhost:${web_port}"
 tmp_dir="$(mktemp -d)"
 
+case "$(uname -s)" in
+  Linux) host_platform="linux" ;;
+  Darwin) host_platform="macos" ;;
+  *)
+    echo "unsupported host platform: $(uname -s)" >&2
+    exit 1
+    ;;
+esac
+
+# GNU and BSD userland disagree on all three of these, and this script has to
+# run on a Linux CI runner and a developer's Mac.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+file_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    stat -c '%a' "$1"
+  else
+    stat -f '%OLp' "$1"
+  fi
+}
+
+iso_millis() {
+  python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")'
+}
+
+# On macOS the client stores its installation token in the login Keychain, which
+# outlives $tmp_dir. Only ever remove the one account this run created: a
+# developer's real enrollment uses the same service name.
+created_keychain_account=""
+
 cleanup() {
+  if [[ -n "$created_keychain_account" ]]; then
+    security delete-generic-password -s metrune -a "$created_keychain_account" >/dev/null 2>&1 || true
+  fi
   docker compose -p "$project" -f "$repo_root/compose.yaml" down -v --rmi local --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$tmp_dir"
 }
@@ -38,12 +77,37 @@ for attempt in $(seq 1 90); do
 done
 
 manifest_json="$(curl -fsS "${api_url}/v1/client/manifest")"
-artifact_url="$(python3 -c 'import json,sys; manifest=json.load(sys.stdin); print(next(item["url"] for item in manifest["artifacts"] if item["target"] == "linux-x86_64"))' <<<"$manifest_json")"
-artifact_sha256="$(python3 -c 'import json,sys; manifest=json.load(sys.stdin); print(next(item["sha256"] for item in manifest["artifacts"] if item["target"] == "linux-x86_64"))' <<<"$manifest_json")"
-client="$tmp_dir/metrune"
-curl -fsSL "$artifact_url" -o "$client"
-[[ "$(sha256sum "$client" | cut -d' ' -f1)" == "$artifact_sha256" ]]
-chmod 700 "$client"
+manifest_targets="$(python3 -c 'import json,sys; print(" ".join(item["target"] for item in json.load(sys.stdin)["artifacts"]))' <<<"$manifest_json")"
+echo "client manifest offers: ${manifest_targets:-<none>}"
+
+if [[ -n "${METRUNE_E2E_CLIENT:-}" ]]; then
+  client="$METRUNE_E2E_CLIENT"
+  echo "using the client binary at $client"
+elif [[ "$host_platform" == "linux" ]]; then
+  # The published Linux artifact is the one the stack serves, so downloading it
+  # also exercises the distribution path end to end.
+  artifact_url="$(python3 -c 'import json,sys; manifest=json.load(sys.stdin); print(next(item["url"] for item in manifest["artifacts"] if item["target"] == "linux-x86_64"))' <<<"$manifest_json")"
+  artifact_sha256="$(python3 -c 'import json,sys; manifest=json.load(sys.stdin); print(next(item["sha256"] for item in manifest["artifacts"] if item["target"] == "linux-x86_64"))' <<<"$manifest_json")"
+  client="$tmp_dir/metrune"
+  curl -fsSL "$artifact_url" -o "$client"
+  [[ "$(sha256_of "$client")" == "$artifact_sha256" ]]
+  chmod 700 "$client"
+else
+  # Released macOS binaries do exist, at the experimental tier, but the
+  # development image synthesizes a manifest covering only the Linux client it
+  # built for itself, so this stack has nothing a Mac can execute. Building from
+  # the checkout is also the better default here: it tests the working tree
+  # rather than the last published release. The download-and-verify path stays
+  # covered by the Linux run in CI.
+  echo "building the ${host_platform} client from source (this stack mirrors only the Linux artifact)"
+  cargo build --release --package metrune
+  client="$repo_root/target/release/metrune"
+fi
+
+[[ -x "$client" ]] || {
+  echo "client binary is missing or not executable: $client" >&2
+  exit 1
+}
 "$client" --version
 "$client" --help >/dev/null
 
@@ -69,7 +133,7 @@ enrollment_log="${tmp_dir}/device-enrollment.log"
 "${client_command[@]}" enroll \
   --server "$api_url" \
   --name "CLI E2E" \
-  --platform linux \
+  --platform "$host_platform" \
   --classifier none >"$enrollment_log" 2>&1 &
 enrollment_pid="$!"
 device_user_code=""
@@ -102,7 +166,7 @@ if ! wait "$enrollment_pid"; then
   exit 1
 fi
 grep -q "Enrollment saved to" "$enrollment_log"
-[[ "$(stat -c '%a' "$config_path")" == "600" ]]
+[[ "$(file_mode "$config_path")" == "600" ]]
 
 installation_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["installationId"])' <"$config_path")"
 installation_credential_id="$(python3 -c '
@@ -113,9 +177,15 @@ credential_id=config["installationCredentialId"]
 assert credential_id
 print(credential_id)
 ' <"$config_path")"
+# Both credential paths are accepted because this run is hermetic. The HOME
+# override above means macOS cannot resolve a login keychain ("A default
+# keychain could not be found") and Linux CI has no D-Bus secret service, so in
+# practice both land on the fallback file. Covering the real system-keyring path
+# needs a non-hermetic test that does not relocate HOME.
 if grep -q "0600 fallback file" "$enrollment_log"; then
+  echo "credential storage: 0600 fallback file"
   credentials_path="${client_home}/.config/metrune/credentials.json"
-  [[ "$(stat -c '%a' "$credentials_path")" == "600" ]]
+  [[ "$(file_mode "$credentials_path")" == "600" ]]
   python3 -c '
 import json,sys
 credentials=json.load(open(sys.argv[1], encoding="utf-8"))
@@ -124,6 +194,10 @@ assert value.startswith("mti_")
 ' "$credentials_path" "$installation_credential_id"
 else
   grep -q "system keyring" "$enrollment_log"
+  echo "credential storage: system keyring"
+  if [[ "$host_platform" == "macos" ]]; then
+    created_keychain_account="installation:${installation_credential_id}"
+  fi
 fi
 status_output="$("${client_command[@]}" status)"
 [[ "$status_output" != *"mti_"* ]]
@@ -139,7 +213,7 @@ update_output="$("${client_command[@]}" update --check)"
 
 session_dir="${client_home}/.codex/sessions/$(date -u +%Y/%m/%d)"
 session_file="${session_dir}/client-upload.jsonl"
-session_timestamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+session_timestamp="$(iso_millis)"
 raw_session_id="raw-e2e-session-${project}"
 private_project_path="/private/e2e-project-${project}"
 private_prompt="E2E_PRIVATE_PROMPT_MUST_NOT_UPLOAD_${project}"

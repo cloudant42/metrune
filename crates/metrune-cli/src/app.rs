@@ -79,6 +79,11 @@ enum Command {
         clients: Vec<String>,
         #[arg(long)]
         no_classify: bool,
+        /// Re-read every source even if nothing changed since the last scan.
+        /// Use after fixing a classifier: the server replaces a session by key
+        /// and revision, so re-uploading cannot double-count it.
+        #[arg(long)]
+        force: bool,
     },
     /// Print the pending, sanitized upload envelope.
     Export {
@@ -161,6 +166,18 @@ enum ReleaseCommand {
 enum ClassifierCommand {
     /// Fetch the classifier URL, model, and credential from the Metrune server.
     Provision,
+    /// Change the classifier without re-enrolling this installation. Omit the
+    /// flags to choose interactively, exactly as `enroll` does.
+    Configure {
+        #[arg(long, value_enum)]
+        classifier: Option<ClassifierSelection>,
+        /// OpenAI-compatible endpoint for a local or custom classifier.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Model for a local or custom classifier.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Show classifier configuration without revealing its credential.
     Status,
     /// Remove the locally stored classifier credential and profile.
@@ -551,9 +568,10 @@ pub(crate) async fn run() -> Result<()> {
         Command::Scan {
             clients,
             no_classify,
+            force,
         } => {
             let config = load_config(&config_path)?;
-            let count = scan(&state, &config, &clients, no_classify).await?;
+            let count = scan(&state, &config, &clients, no_classify, force).await?;
             println!("Queued {count} sanitized session snapshots.");
         }
         Command::Export { limit } => {
@@ -635,7 +653,7 @@ async fn watch(
                 }
             }
             let config = load_config(config_path)?;
-            if let Err(error) = scan(state, &config, &[], false).await {
+            if let Err(error) = scan(state, &config, &[], false, false).await {
                 eprintln!("scan failed: {error:#}");
             }
             match upload(state, &config, 500).await {
@@ -724,6 +742,11 @@ async fn sync_openrouter(
 async fn classifier_command(config_path: &Path, command: ClassifierCommand) -> Result<()> {
     match command {
         ClassifierCommand::Provision => provision_classifier(config_path, false).await,
+        ClassifierCommand::Configure {
+            classifier,
+            endpoint,
+            model,
+        } => configure_classifier_after_enrollment(config_path, classifier, endpoint, model).await,
         ClassifierCommand::Status => {
             let config = load_config(config_path)?;
             let Some(profile) = config.classifier else {
@@ -794,6 +817,22 @@ async fn provision_classifier(config_path: &Path, quiet: bool) -> Result<()> {
     let response = fetch_server_classifier(config_path).await?;
     if !response.enabled {
         let mut config = load_config(config_path)?;
+        // Only the organization's own profile is the organization's to remove.
+        // A local or custom classifier was configured on this machine and must
+        // survive a server that simply has none of its own.
+        if config
+            .classifier
+            .as_ref()
+            .is_some_and(|profile| profile.execution_mode == ClassifierExecutionMode::Local)
+        {
+            if !quiet {
+                println!(
+                    "The organization has no classifier; keeping the locally configured one. \
+                     Run 'metrune classifier configure' to change it."
+                );
+            }
+            return Ok(());
+        }
         if let Some(profile) = config.classifier.take() {
             if !profile.credential_id.is_empty() {
                 CredentialStore::default()
@@ -802,7 +841,10 @@ async fn provision_classifier(config_path: &Path, quiet: bool) -> Result<()> {
         }
         save_config(config_path, &config)?;
         if !quiet {
-            println!("Classification is disabled; it can be configured later.");
+            println!(
+                "Classification is disabled. Run 'metrune classifier configure' to set up a \
+                 local model."
+            );
         }
         return Ok(());
     }
@@ -1189,6 +1231,7 @@ async fn scan(
     config: &ClientConfig,
     requested_clients: &[String],
     no_classify: bool,
+    force: bool,
 ) -> Result<usize> {
     let home = env::var_os("HOME")
         .map(PathBuf::from)
@@ -1242,7 +1285,7 @@ async fn scan(
                 scan_context_fingerprint,
                 file_fingerprint(&source)?
             );
-            if state.fingerprint(&source)?.as_deref() == Some(&fingerprint) {
+            if !force && state.fingerprint(&source)?.as_deref() == Some(&fingerprint) {
                 continue;
             }
             match adapter.parse(&source) {
@@ -1268,6 +1311,10 @@ async fn scan(
     }
 
     let mut queued = 0;
+    // A misconfigured classifier fails identically for every session. Report
+    // the cause once, naming the classifier so the fix is obvious, and count
+    // the rest instead of repeating the same provider error N times.
+    let mut classification_failures = 0_usize;
     for mut messages in sessions.into_values() {
         messages.sort_by_key(|message| (message.turn_sequence, message.activity_sequence));
         let Some(first) = messages.iter().min_by_key(|message| message.observed_at) else {
@@ -1295,9 +1342,16 @@ async fn scan(
                 .classify(&classification_text)
                 .await
                 .unwrap_or_else(|error| {
-                    eprintln!(
-                        "semantic classification failed; keeping semantic status failed: {error:#}"
-                    );
+                    classification_failures += 1;
+                    if classification_failures == 1 {
+                        eprintln!(
+                            "semantic classification failed using {}: {error:#}\n\
+                             Sessions are still queued without a category. Check the model and \
+                             endpoint with 'metrune classifier status', then change them with \
+                             'metrune classifier configure' and re-run 'metrune scan --force'.",
+                            classifier.id()
+                        );
+                    }
                     CategoryAssignment::failed(classifier.id())
                 })
         };
@@ -1329,6 +1383,11 @@ async fn scan(
             state.queue_snapshot(&snapshot)?;
             queued += 1;
         }
+    }
+    if classification_failures > 1 {
+        eprintln!(
+            "semantic classification failed for {classification_failures} sessions in total."
+        );
     }
     Ok(queued)
 }
@@ -2731,6 +2790,65 @@ mod tests {
             }),
             "invalid_grant"
         );
+    }
+
+    #[test]
+    fn scan_defaults_to_incremental_and_accepts_an_explicit_rescan() {
+        let cli = Cli::try_parse_from(["metrune", "scan"]).expect("scan should parse");
+        assert!(
+            matches!(cli.command, Command::Scan { force: false, .. }),
+            "scan must stay incremental unless asked otherwise"
+        );
+
+        let cli = Cli::try_parse_from(["metrune", "scan", "--force"]).expect("scan should parse");
+        assert!(matches!(cli.command, Command::Scan { force: true, .. }));
+    }
+
+    #[test]
+    fn the_classifier_can_be_reconfigured_without_re_enrolling() {
+        let cli = Cli::try_parse_from([
+            "metrune",
+            "classifier",
+            "configure",
+            "--classifier",
+            "local",
+            "--endpoint",
+            "http://localhost:11434/v1/chat/completions",
+            "--model",
+            "gemma4:e4b-mlx",
+        ])
+        .expect("classifier configure should parse");
+        let Command::Classifier {
+            command:
+                ClassifierCommand::Configure {
+                    classifier,
+                    endpoint,
+                    model,
+                },
+        } = cli.command
+        else {
+            panic!("expected a classifier configure command");
+        };
+        assert!(matches!(classifier, Some(ClassifierSelection::Local)));
+        assert_eq!(model.as_deref(), Some("gemma4:e4b-mlx"));
+        assert_eq!(
+            endpoint.as_deref(),
+            Some("http://localhost:11434/v1/chat/completions")
+        );
+
+        // The flags are optional so the command can prompt, exactly like enroll.
+        let cli = Cli::try_parse_from(["metrune", "classifier", "configure"])
+            .expect("classifier configure should parse without flags");
+        assert!(matches!(
+            cli.command,
+            Command::Classifier {
+                command: ClassifierCommand::Configure {
+                    classifier: None,
+                    endpoint: None,
+                    model: None,
+                },
+            }
+        ));
     }
 
     #[test]
