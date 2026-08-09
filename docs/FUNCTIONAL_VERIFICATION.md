@@ -2,13 +2,20 @@
 
 Full-system verification was rerun on 2026-08-01 from the active working tree,
 including the client/server compatibility, version telemetry, analytics, web,
-security, browser, and recovery gates.
+security, browser, and recovery gates. The later uncommitted changes described
+below have targeted coverage, but this report does not claim a fresh full-system
+rerun for them.
 
 ## Result
 
 - Rust: 206 tests passed (`23` CLI, `128` API, `30` core, `10` adapter,
   `3` contract, `9` outbox, and `3` pricing tests), including all API tests
   against fresh PostgreSQL 17 and ClickHouse 24.8 containers.
+- The current tree adds seven targeted normal tests for viewer session scope,
+  manual invitations and administrator-issued resets, classifier/scan CLI
+  parsing, and nested Claude usage, plus an ignored native-keyring round-trip
+  gate. Those additions still need a fresh full run before release claims are
+  made.
 - Compatibility: semantic-version ordering, the 24-hour SQLite gate, explicit
   CLI version headers, unauthenticated server information, typed 426 rejection,
   same-major server/client enforcement, terminal CLI instructions, retained
@@ -20,6 +27,8 @@ security, browser, and recovery gates.
   built password-mode and OIDC deployments. The same E2E gate installed the
   server-distributed Linux client and completed a real non-empty enrollment,
   scan, upload, update, and revocation lifecycle.
+- `scripts/test-e2e.sh` now also supports macOS and builds the client from the
+  checkout there; that host path was not part of the dated browser run.
 - Web: ESLint, TypeScript, Next production build, and all 45 generated Next
   routes passed.
 - Packaging: release Rust workspace build, API image, web image, development
@@ -49,7 +58,7 @@ available. `Not executed` identifies an explicit remaining external boundary.
 |---|---|---|
 | Privacy-safe upload schema; no prompts, responses, paths, commands, raw user IDs, or local classification text | `tests/contracts.rs`; adapter fixture tests; Trivy secret scan | Verified |
 | Stable pseudonymous session identity | `session_identity_is_stable_across_installation_identity_keys`; adapter fallback identity tests | Verified |
-| Claude Code adapter | `parses_claude_and_codex_jsonl_without_persisting_content` | Verified with fixtures |
+| Claude Code adapter | `parses_claude_and_codex_jsonl_without_persisting_content`; nested usage under the Claude `message` object | Verified with fixtures |
 | Codex adapter, current token events, cumulative deltas, counter resets, missing metadata | `tests/adapters.rs` Codex cases | Verified with fixtures |
 | OpenCode SQLite adapter | `parses_opencode_sqlite_read_only` | Verified with fixture database |
 | Copilot OTEL adapter, discovery, deduplication, missing IDs, zero-token spans, prompt exclusion | `tests/adapters.rs` and `adapters::copilot::tests` | Verified with fixtures |
@@ -68,7 +77,7 @@ available. `Not executed` identifies an explicit remaining external boundary.
 | Release manifest signing, verification, version ordering, target selection, tamper rejection | `release::tests`; release build command | Verified |
 | Client mirror URL rewrite without invalidating signatures or digests | core release and API distribution tests | Verified |
 | Atomic updater replacement | `updater_stages_and_atomically_replaces_the_existing_binary`; server-mirrored artifact checksum in E2E | Verified locally |
-| Installation/classifier keyring scopes, fallback permissions, migration, round trip, deletion, malformed-file fail-closed behavior | `credentials::tests`; `legacy_installation_tokens_migrate_out_of_config_without_losing_access`; CLI E2E | Verified |
+| Installation/classifier keyring scopes, fallback permissions, migration, round trip, deletion, malformed-file fail-closed behavior | `credentials::tests`; `legacy_installation_tokens_migrate_out_of_config_without_losing_access`; CLI E2E; ignored native-keyring round-trip test in the release workflow | Fallback verified; native keyring is a release gate, not part of the dated run |
 
 Real Claude, Codex, OpenCode, and Copilot user stores were intentionally not
 read. The parsers were executed against controlled fixtures so verification
@@ -80,12 +89,13 @@ the operator's own sessions.
 | Command | Behavior exercised | Status |
 |---|---|---|
 | `metrune enroll` | Real device authorization, local and OIDC-backed browser approval, CLI polling, installation exchange, config without a bearer secret, protected credential storage, classifier selection; legacy `--token` compatibility | Verified E2E |
-| `metrune scan` | Adapter fixtures, unknown client, no-classify path, checkpoint and outbox behavior | Verified |
+| `metrune scan` | Adapter fixtures, unknown client, no-classify path, checkpoint and outbox behavior; `--force` parsing and checkpoint bypass path | Verified with targeted coverage; full force-rescan E2E not rerun |
 | `metrune export` | Empty and non-empty sanitized envelopes, stable pending batch ID, schema/privacy contracts | Verified |
 | `metrune upload` | Non-empty live upload, connection failure retention, retry/idempotency, revision replacement, revoked-token retention, version header, typed 426 parsing, and update-notice decision | Verified E2E and unit |
 | `metrune watch` / `daemon` | CLI alias, scan/upload primitives, server-profile refresh selection, 24-hour update gate, opt-out, and terminal compatibility-error branch | Covered; sustained process and signal handling not executed |
 | `metrune status` | Real enrolled config, queue state, secret redaction | Verified E2E |
 | `metrune classifier provision` | Disabled live configuration; local and managed API provisioning; credential redaction | Verified |
+| `metrune classifier configure` | Changes classifier configuration without re-enrollment | Covered by targeted CLI parsing; live provider execution not rerun |
 | `metrune classifier status` | Disabled live state and non-secret output | Verified E2E |
 | `metrune classifier logout` | Credential-store deletion primitive | Covered; not run against a desktop keyring service |
 | `metrune pricing sync-openrouter` | Catalog conversion and merge primitives | Covered; live OpenRouter catalog not requested without credentials/network contract |
@@ -102,7 +112,7 @@ was not executed on Windows.
 
 ## API coverage matrix
 
-The Axum router exposes 58 distinct paths and 68 method handlers.
+The Axum router exposes 59 distinct paths and 69 method handlers.
 
 | Path and methods | Primary coverage | Status |
 |---|---|---|
@@ -133,8 +143,9 @@ The Axum router exposes 58 distinct paths and 68 method handlers.
 | `POST /v1/installation/classifier/classify-batch` | item and byte bounds, partial retry/parser/provider tests | Covered with loopback provider |
 | `GET/POST /v1/org/members` | role authorization, tenant listings, member/invitation flows | Verified |
 | `PATCH/DELETE /v1/org/members/{user_id}` | foreign-org rejection, last-admin protection, removal revokes installations | Verified |
-| `GET/POST /v1/org/invitations` | lifecycle, masking, SMTP-unavailable behavior, role authorization | Verified |
-| `POST /v1/org/invitations/{id}/resend` | lifecycle authorization and generic external-mail failure behavior | Covered; real delivery not executed |
+| `POST /v1/org/members/{user_id}/password-reset` | admin-only, organization-scoped manual reset link, single-use completion, and cross-tenant rejection | Verified |
+| `GET/POST /v1/org/invitations` | lifecycle, masking, manual `201`/`delivery: "manual"`/fragment `acceptUrl` without a mailer, SMTP behavior, role authorization | Verified |
+| `POST /v1/org/invitations/{id}/resend` | lifecycle authorization, token rotation, manual accept-link response without a mailer, and external-mail failure behavior | Covered; real delivery not executed |
 | `DELETE /v1/org/invitations/{id}` | revoked token indistinguishability and authorization | Verified |
 | `GET/POST /v1/org/teams` | lifecycle, validation, audit effects, browser creation | Verified |
 | `PATCH/DELETE /v1/org/teams/{id}` | rename/delete lifecycle and cross-tenant no-side-effect regression | Verified |
@@ -191,13 +202,17 @@ Fourteen user pages exist:
   exercised.
 - Server/client timezone differences were exercised in the production build;
   displayed dates now hydrate deterministically and timestamps identify UTC.
-- Signed-in API failures now render an unavailable state instead of demo
-  organization data. Demo fixtures require `METRUNE_ENABLE_DEMO_DATA=1`, are
-  disabled in production, and are never selected for a browser session.
-- Administration, pricing, and session-drilldown pages fail closed for missing
-  or insufficient roles. Session exports preserve filters, return explicit
-  errors when live data is unavailable, set `no-store`, and neutralize
-  spreadsheet formula prefixes.
+- API failures now render an unavailable state instead of placeholder
+  organization data. Anonymous page requests receive a `307` to `/login`, and
+  anonymous `/api/*` requests receive `401` JSON, so no response carries
+  organization data without a session.
+- Administration and pricing pages fail closed for missing or insufficient
+  roles. Session drilldown and export are organization-wide for an analyst or
+  admin and scoped to the caller's own sessions otherwise. Exports use
+  `metrune-sessions.csv` for the organization view and
+  `metrune-my-sessions.csv` for the personal view; they preserve filters,
+  return explicit errors when live data is unavailable, set `no-store`, and
+  neutralize spreadsheet formula prefixes.
 - Login, SSO, and workspace continuation paths are checked by the shared
   same-origin-relative navigation validator; profile download URLs are
   normalized and restricted to HTTP(S).
@@ -228,17 +243,17 @@ SQL-backed integration suite and targeted concurrency tests.
 |---|---|---|
 | PostgreSQL 17 | all migrations and live control-plane tests | Verified |
 | ClickHouse 24.8 | live ingestion/analytics and destructive restore | Verified |
-| Development Compose | clean build/start/readiness/web/CLI/browser E2E | Verified |
+| Development Compose | clean build/start/readiness/web/CLI/browser E2E | Verified in the dated Linux run |
 | Production Compose | rendered invariants, four-service topology, loopback binds, secrets and non-root checks | Verified |
 | SMTP STARTTLS/TLS | complete/partial/invalid config, fail-closed production behavior, generic public failures | Covered; no relay credentials, so delivery not executed |
 | OpenID Connect | real HTTP discovery/authorization/JWKS/token exchange, RSA verification, browser redirect/cookie E2E, device approval and upload | Verified against deterministic providers; operator IdP federation remains external |
 | OpenAI-compatible classifier/OpenRouter | loopback HTTP success, fallback, repair, retry, 503 and timeout | Covered; no paid/live provider request |
 | OpenRouter pricing catalog | parser and catalog precedence | Covered; live catalog sync not executed |
-| Desktop keyring | private fallback file behavior | Covered; no desktop secret-service session |
+| Desktop keyring | private fallback file behavior; native round-trip release gate | Fallback covered; native secret-service/keychain execution is a release-workflow gate |
 | GitHub releases | signed manifest/checksum/update contracts and release workflows; remote tag read | Covered; remote had no tags, local `gh` credential was invalid, and connector access could not inspect secrets/variables |
 | HTTPS reverse proxy/DNS | production configuration validation | Not executed; no production hostname/certificate |
 | Linux x86_64 client/server | release build and Compose runtime | Verified |
-| Windows/macOS clients | workflow/action syntax and target selection | Not executed; host toolchains/runners unavailable |
+| Windows/macOS clients | workflow/action syntax and target selection; macOS E2E checkout-build path | Not executed in the dated run; Windows runners and a macOS release E2E gate remain unavailable |
 
 Production configuration rejects insecure bootstrap credentials, non-HTTPS
 public URLs, incomplete/plaintext SMTP, insecure remote classifier endpoints,
@@ -261,6 +276,10 @@ bootstrap identity, database connections, and download paths were inspected.
 - Five loopback classifier tests for structured fallback, repair, partial
   batches, upstream failure, and timeout.
 - Two fallback credential-store persistence/permission/fail-closed tests.
+- Seven targeted regressions cover viewer session scope, manual invitation and
+  administrator-issued reset delivery, `classifier configure`, `scan --force`,
+  and nested Claude usage; the ignored native-keyring round-trip test is a
+  separate release gate.
 - Protected installation-credential scoping and transparent legacy-config
   migration tests.
 - OIDC configuration tests for partial setup, production secret policy,
@@ -271,7 +290,7 @@ bootstrap identity, database connections, and download paths were inspected.
   approval, and installation upload.
 - A Playwright enterprise-SSO scenario backed by an isolated signed OIDC
   provider and real API/web/database processes.
-- Six invitation, password-reset, SMTP-unavailable, concurrency, and reaper
+- Invitation, password-reset, manual/SMTP-unavailable, concurrency, and reaper
   lifecycle tests.
 - Five team/installation, credential/classifier, pricing, retention, and
   concurrent enrollment control-plane tests.
@@ -372,13 +391,14 @@ bootstrap identity, database connections, and download paths were inspected.
 
 ## Remaining risks and explicitly unexecuted behavior
 
-- No real SMTP message was delivered. A controlled relay account is required
-  to verify DNS, authentication, TLS policy, spam handling, and inbox links.
+- No real SMTP message was delivered. The no-mailer invitation response is
+  covered; a controlled relay account is still required to verify DNS,
+  authentication, TLS policy, spam handling, and inbox links.
 - No real OpenRouter/OpenAI-compatible paid endpoint was called. Deterministic
   loopback tests cover its protocol and failure contract without leaking text
   or credentials.
-- No canonical signed release was published or self-installed, and
-  Windows/macOS binaries were not built on this Linux host. The remote had no
+- No canonical signed release was published or self-installed, and the dated
+  run did not execute the macOS E2E path or Windows runners. The remote had no
   tags, so the tag-triggered workflow has not yet run for this repository.
 - The OIDC protocol path is verified with deterministic signed providers, not a
   real Entra ID, Okta, Keycloak, or customer federation policy. Redirect URI,
@@ -414,7 +434,7 @@ bootstrap identity, database connections, and download paths were inspected.
   zero vulnerabilities. The production standalone dependency scan and both
   runtime-image scans were also clean; development tooling is not shipped.
 - NOTICE generation completed against the final installed dependency tree.
-- The web fail-closed/demo, role, export, and continuation hardening added on
+- The web fail-closed, role, export, and continuation hardening added on
   2026-08-01 passed lint, TypeScript, production build, and the full browser
   matrix against freshly built password-mode and OIDC stacks.
 

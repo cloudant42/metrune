@@ -13,7 +13,9 @@ canonical in [VERSIONING.md](VERSIONING.md).
    integration tests, browser flows, and the restore drill.
 3. Review migration ordering and rollback limits, including migration 017's
    client-version telemetry columns.
-4. Verify invitation and reset delivery against the production SMTP provider.
+4. Verify the no-mailer invitation and administrator-issued member-reset paths
+   return usable manual links; when SMTP is configured, verify invitation and
+   password-reset delivery against the production provider.
 5. Exercise install, enrollment, upload, and analytics on a clean Linux host.
 6. Create and push an annotated `server-vX.Y.Z` or `client-vX.Y.Z` tag from
    the reviewed commit. Use a separate tag when the other line is released;
@@ -46,7 +48,19 @@ rejections, and key rotation are described in
 
 Linux x86_64 is supported in the beta. Windows and macOS artifacts are
 experimental until platform-specific enrollment, credential-store, and
-watch-mode tests are release gates.
+watch-mode tests are release gates. Of those three:
+
+- Credential store: gated. Each native build leg runs the ignored
+  `an_installation_token_round_trips_through_the_native_keyring` test, which
+  fails if the token silently lands in the 0600 fallback instead of the
+  operating system's store. Linux is exempt: hosted runners have no secret
+  service, and `scripts/test-e2e.sh` covers the fallback path there.
+- Enrollment: `scripts/test-e2e.sh` supports Linux and macOS, building the
+  client from the checkout on macOS because the dev stack mirrors only the
+  Linux artifact. CI currently runs the E2E gate on Linux; the macOS path is
+  available but is not yet a release-workflow gate. Windows is still
+  uncovered.
+- Watch mode: not covered on any platform.
 
 ## Server images
 
@@ -78,14 +92,17 @@ service. Keep previous images and backups until the rollback window closes.
 
 ## Web safety gate
 
-- Signed-in pages never replace an API failure with fixture organization data.
-- Demo fixtures require `METRUNE_ENABLE_DEMO_DATA=1`, are disabled in
-  production, and are never used when a browser session is present.
+- Pages never replace an API failure with fixture organization data.
+- Every dashboard route redirects to `/login` without a browser session, and the
+  web app holds no credential other than that session.
+- Unauthenticated `/api/*` requests receive `401` JSON rather than a page
+  redirect.
 - Missing roles cannot open administration/pricing or session-drilldown UI;
   backend role checks remain authoritative.
-- `/api/export` preserves filters, returns an error instead of an empty success
-  file when live data is unavailable, marks CSV `no-store`, and neutralizes
-  spreadsheet formula prefixes.
+- `/api/export` scopes analyst/admin downloads to the organization and all
+  other roles to their own sessions, preserves filters, returns an error
+  instead of an empty success file when live data is unavailable, marks CSV
+  `no-store`, and neutralizes spreadsheet formula prefixes.
 - Login, SSO, workspace-selection, and device continuations accept only
   same-origin relative paths.
 
@@ -133,6 +150,7 @@ Every verification claim must identify the exact fixture or external boundary:
   exits watch/upload without retrying, and retains its local outbox.
 - Organization and personal installation views show the version reported by a
   current client.
-- SMTP delivery and a clean-host Linux client flow have been exercised.
+- The no-mailer invitation/member-reset flows and a clean-host Linux client
+  flow have been exercised; real SMTP delivery remains an external gate.
 - `client-manifest.json` is attached to the release, is signed, and
   `metrune update --check` against a staging server reports the new version.

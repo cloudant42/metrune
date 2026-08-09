@@ -3,7 +3,9 @@
 ## Beta flows
 
 - The deployment bootstraps exactly one initial administrator.
-- Administrators invite users by email with an organization role.
+- Administrators invite users with an organization role. SMTP sends the
+  invitation when configured; otherwise the administrator receives a manual
+  accept link.
 - A new user follows the expiring link. They create a password only on a
   deployment without SSO; under OIDC, the account is linked by verified email
   on first provider sign-in.
@@ -18,10 +20,14 @@
   active organization and optional team. The CLI receives an installation
   credential, never the person's browser or identity-provider token.
 
-With no OIDC provider, passwords are hashed with Argon2. Invitation and reset tokens contain 32 random
-bytes; only SHA-256 token digests are stored. Resending an invitation rotates
-its token. Production mail requires authenticated, certificate-verified
-STARTTLS or implicit TLS.
+With no OIDC provider, passwords are hashed with Argon2. Invitation and reset
+tokens contain 32 random bytes; only SHA-256 token digests are stored.
+Resending an invitation rotates its token and returns a new manual link when
+SMTP is absent. Public password-reset email delivery requires authenticated,
+certificate-verified STARTTLS or implicit TLS; an administrator-issued member
+reset can return a manual link without SMTP. A deployment may run with no
+mailer at all — production logs a warning rather than refusing to start — but a
+partially configured relay is still rejected at startup.
 
 ## Roles
 

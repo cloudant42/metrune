@@ -66,6 +66,10 @@ only its reference. `enroll` also takes `--name`, `--user-alias` and
 `--classifier`; run `metrune enroll --help` for the full set. The legacy
 `--token` path remains available for controlled automation.
 
+`metrune classifier configure` changes the classifier without re-enrolling.
+Use `metrune scan --force` when every source must be re-read instead of using
+the existing checkpoints.
+
 `metrune update` verifies and replaces the binary in place. Details and the
 air-gapped path are in the [client distribution guide](docs/CLIENT_DISTRIBUTION.md).
 
@@ -129,8 +133,10 @@ Local, for trying it out:
 docker compose up --build
 ```
 
-Open <http://localhost:3001> and sign in as `admin@test.com` / `admin`. These
-credentials and port bindings are development-only — never expose this stack.
+Open <http://localhost:3001>. The dashboard requires a session, so every page
+redirects to the sign-in form until you sign in as `admin@test.com` / `admin`.
+These credentials are development-only, and both ports bind to `127.0.0.1`, so
+the stack is reachable only from this machine.
 
 Production, as a separate standalone stack:
 
@@ -140,8 +146,12 @@ cp deploy/compose/production.env.example /private/path/metrune.env
 docker compose --env-file /private/path/metrune.env -f compose.production.yaml up -d
 ```
 
-You also need authenticated TLS SMTP (invitations and password resets depend on
-it) and an external HTTPS reverse proxy — a minimal Caddy example is in
+SMTP is optional. Configure authenticated TLS SMTP and invitations and password
+resets are emailed. Without it the server still starts, logging a warning:
+invitations and administrator-issued member resets return a manual link to
+deliver yourself, and only self-service password reset is unavailable. You do
+need an external HTTPS reverse proxy — a minimal Caddy
+example is in
 [`deploy/compose/Caddyfile.example`](deploy/compose/Caddyfile.example). Every
 configurable variable, the bootstrap-admin flow and the backup requirements are
 in the [deployment guide](docs/DEPLOYMENT.md) and

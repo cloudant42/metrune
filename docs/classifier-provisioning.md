@@ -57,6 +57,21 @@ default is therefore a product/configuration change that has not yet been
 made; it must be paired with disclosure that selected semantic text is sent to
 Metrune and the configured model provider.
 
+## Choosing a semantic model
+
+A semantic classifier provider must expose an OpenAI-compatible
+`POST /v1/chat/completions` endpoint and return reliable JSON in the
+`{category, confidence}` shape. In `auto` response mode, the client first tries
+strict `json_schema` output and, when the provider rejects that request with
+HTTP 400 or 422, retries with prompt-based JSON. It makes one bounded repair
+attempt for malformed output. These are compatibility requirements, not a
+quality benchmark.
+
+The built-in default for a local classifier is
+`http://localhost:11434/v1/chat/completions` with model `qwen2.5-coder:7b`.
+Choose another model only after confirming that it supports the endpoint and
+reliably returns the required JSON contract.
+
 ## Client installation
 
 Enrollment provisions the selected organization classifier automatically. To
@@ -79,12 +94,18 @@ uploads do not retrieve or transmit provider credentials. `metrune classifier
 logout` removes the local profile and any local credential; rerunning
 `provision` obtains the current server configuration.
 
+`metrune classifier configure` changes the classifier configuration without
+requiring enrollment again. Use it when switching the local/custom endpoint,
+model, or classifier mode independently of server provisioning.
+
 ## Response handling
 
-The classifier contract is always `{category, confidence}`. Metrune uses strict
-structured JSON when supported, automatically falls back to prompt-based JSON
-when a provider rejects that parameter, accepts fenced or wrapped JSON, and
-retries one malformed response. Persistent failures remain visible as a
+The classifier contract is always `{category, confidence}`. In `auto` response
+mode, Metrune uses strict structured JSON when supported and automatically
+falls back to prompt-based JSON when a provider rejects that parameter;
+`prompt_json` profiles use the prompt path directly. It accepts fenced or
+wrapped JSON and retries one malformed response. Persistent failures remain
+visible as a
 `failed` semantic status on the session, with category `unknown` only when a
 valid classifier response itself cannot map the session to a supported
 category. These outcomes never block usage accounting.
