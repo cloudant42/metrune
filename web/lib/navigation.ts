@@ -1,4 +1,27 @@
 /**
+ * Routes reachable without a browser session.
+ *
+ * This is deliberately separate from the chrome-less list in `components/shell.tsx`:
+ * that one also covers `/organizations` and `/device`, which render without the
+ * sidebar but still require a signed-in user.
+ */
+const PUBLIC_PATHS = [
+  "/login",
+  "/accept-invite",
+  "/forgot-password",
+  "/reset-password",
+  "/api/auth/login",
+  "/api/auth/logout",
+  "/api/auth/sso/start",
+  "/api/auth/password-reset",
+  "/api/auth/invitations",
+];
+
+export function isPublicPath(pathname: string): boolean {
+  return PUBLIC_PATHS.some(path => pathname === path || pathname.startsWith(`${path}/`));
+}
+
+/**
  * Accept only same-origin relative continuation paths.
  *
  * This is intentionally stricter than URL parsing: values are eventually

@@ -1,22 +1,14 @@
 import { BreakdownBars, TrendChart } from "@/components/charts";
 import { FilterBar } from "@/components/filters";
 import { ArrowRightIcon } from "@/components/icons";
-import { getFacets, getOverviewData, type PageParams } from "@/lib/api";
+import { getCurrentUser, getFacets, getOverviewData, type PageParams } from "@/lib/api";
 import { formatCompact, formatMoney, shortModel } from "@/lib/format";
+import { redirect } from "next/navigation";
 
 type PageProps = { searchParams: Promise<Record<string, string | string[] | undefined>> };
 
 export async function toParams(raw: Record<string, string | string[] | undefined>): Promise<PageParams> {
   return Object.fromEntries(Object.entries(raw).map(([key, value]) => [key, Array.isArray(value) ? value[0] : value]));
-}
-
-export function DemoBanner() {
-  return (
-    <div className="banner" role="status">
-      <strong>Demo data</strong>
-      <span>Live organization data is not available. Demo fixtures are enabled for this local showcase only.</span>
-    </div>
-  );
 }
 
 export function UnavailablePanel({ message = "Live organization data is temporarily unavailable." }: { message?: string }) {
@@ -37,12 +29,13 @@ export function UnavailablePanel({ message = "Live organization data is temporar
 
 export default async function Home({ searchParams }: PageProps) {
   const params = await toParams(await searchParams);
-  const [{ data, source }, facets] = await Promise.all([getOverviewData(params), getFacets(params)]);
-  if (source === "unavailable" || facets.source === "unavailable") return <UnavailablePanel />;
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  const [data, facets] = await Promise.all([getOverviewData(params), getFacets(params)]);
+  if (!data || !facets) return <UnavailablePanel />;
   return (
     <>
-      {source === "demo" && <DemoBanner />}
-      <FilterBar params={params} facets={facets.data} />
+      <FilterBar params={params} facets={facets} />
       <section className="metric-grid" aria-label="Usage summary">
         <Metric label="Total spend" value={formatMoney(data.overview.totalCost)} detail="Sanitized usage metadata" />
         <Metric label="Tokens" value={formatCompact(data.overview.totalTokens)} detail="Input, output, cache and reasoning" />

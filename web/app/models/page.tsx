@@ -1,20 +1,22 @@
 import { BreakdownBars, ModelHeatmap } from "@/components/charts";
 import { CategoryGuide } from "@/components/category-guide";
 import { FilterBar } from "@/components/filters";
-import { getFacets, getModelsData } from "@/lib/api";
+import { getCurrentUser, getFacets, getModelsData } from "@/lib/api";
 import { formatCompact, label, shortModel } from "@/lib/format";
-import { DemoBanner, toParams, UnavailablePanel } from "../page";
+import { toParams, UnavailablePanel } from "../page";
+import { redirect } from "next/navigation";
 
 type PageProps = { searchParams: Promise<Record<string, string | string[] | undefined>> };
 
 export default async function ModelsPage({ searchParams }: PageProps) {
   const params = await toParams(await searchParams);
-  const [{ data, source }, facets] = await Promise.all([getModelsData(params), getFacets(params)]);
-  if (source === "unavailable" || facets.source === "unavailable") return <UnavailablePanel />;
+  const user = await getCurrentUser();
+  if (!user) redirect("/login?next=%2Fmodels");
+  const [data, facets] = await Promise.all([getModelsData(params), getFacets(params)]);
+  if (!data || !facets) return <UnavailablePanel />;
   return (
     <>
-      {source === "demo" && <DemoBanner />}
-      <FilterBar params={params} facets={facets.data} />
+      <FilterBar params={params} facets={facets} />
       <CategoryGuide />
       <section className="panel" aria-labelledby="heatmap-title">
         <div className="panel-header">

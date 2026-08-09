@@ -1,9 +1,10 @@
 import Link from "next/link";
 import { CategoryGuide } from "@/components/category-guide";
 import { FilterBar } from "@/components/filters";
-import { getFacets, getUsageBreakdown, type PageParams } from "@/lib/api";
+import { getCurrentUser, getFacets, getUsageBreakdown, type PageParams } from "@/lib/api";
 import { formatCompact, formatMoney, label, shortModel } from "@/lib/format";
-import { DemoBanner, toParams, UnavailablePanel } from "../page";
+import { toParams, UnavailablePanel } from "../page";
+import { redirect } from "next/navigation";
 
 type PageProps = { searchParams: Promise<Record<string, string | string[] | undefined>> };
 
@@ -19,14 +20,15 @@ function buildHref(params: PageParams, patch: Record<string, string | undefined>
 export default async function UsagePage({ searchParams }: PageProps) {
   const params = await toParams(await searchParams);
   const dimension = dimensions.includes(params.dimension as never) ? (params.dimension as string) : "category";
-  const [{ data: values, source }, facets] = await Promise.all([getUsageBreakdown(params, dimension), getFacets(params)]);
-  if (source === "unavailable" || facets.source === "unavailable") return <UnavailablePanel />;
+  const user = await getCurrentUser();
+  if (!user) redirect("/login?next=%2Fusage");
+  const [values, facets] = await Promise.all([getUsageBreakdown(params, dimension), getFacets(params)]);
+  if (!values || !facets) return <UnavailablePanel />;
   const totalCost = values.reduce((sum, value) => sum + value.cost, 0);
   const format = dimension === "model" ? shortModel : label;
   return (
     <>
-      {source === "demo" && <DemoBanner />}
-      <FilterBar params={params} facets={facets.data} />
+      <FilterBar params={params} facets={facets} />
       <nav className="tabs" aria-label="Breakdown dimension">
         {dimensions.map(entry => (
           <Link key={entry} href={buildHref(params, { dimension: entry })} className={entry === dimension ? "active" : ""} aria-current={entry === dimension ? "page" : undefined}>

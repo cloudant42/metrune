@@ -1,6 +1,7 @@
 import Link from "next/link";
-import { getSessionDetail } from "@/lib/api";
+import { getCurrentUser, getSessionDetail } from "@/lib/api";
 import { formatCompact, formatMoney, label, shortModel } from "@/lib/format";
+import { redirect } from "next/navigation";
 
 type PageProps = { params: Promise<{ sessionKey: string }> };
 
@@ -10,6 +11,8 @@ function tokenTotal(tokens: { input: number; output: number; cacheRead: number; 
 
 export default async function SessionDetailPage({ params }: PageProps) {
   const { sessionKey } = await params;
+  const user = await getCurrentUser();
+  if (!user) redirect(`/login?next=${encodeURIComponent(`/sessions/${sessionKey}`)}`);
   const session = await getSessionDetail(sessionKey);
   if (!session) {
     return (
