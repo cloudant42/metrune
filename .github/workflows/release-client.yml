@@ -1,13 +1,52 @@
 name: Release client
 
 on:
-  push:
-    tags: ["client-v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-client-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
+  # The committed package version is the only place the release number is
+  # written. A manual run derives the tag from it and the publish job creates
+  # that tag. The operator never types or pushes a version tag, so the tag can
+  # never disagree with the shipped binary.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve the release tag
+        id: resolve
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] &&
+            [ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ]; then
+            echo "manual client releases must run against ${DEFAULT_BRANCH}" >&2
+            exit 1
+          fi
+          package_version="$(bash scripts/resolve-release-version.sh client)"
+          tag="client-v${package_version}"
+          version="$(bash scripts/check-release-version.sh client "$tag" "$package_version")"
+          # Re-releasing an existing version would move a tag that published
+          # artifacts and signed manifests already point at. Transport or auth
+          # failures also stop the release rather than looking like a 404.
+          bash scripts/assert-release-tag-available.sh "$tag"
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
   gate:
     runs-on: ubuntu-latest
     permissions:
@@ -23,7 +62,7 @@ jobs:
         run: python3 scripts/verify-release-checks.py
 
   build:
-    needs: gate
+    needs: [version, gate]
     strategy:
       matrix:
         include:
@@ -52,7 +91,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: 1.88.0
           targets: ${{ matrix.target }}
       - name: Build the client
         env:
@@ -60,6 +99,7 @@ jobs:
           # signed by the Metrune release key. Release builds fail closed when
           # the repository variable has not been configured.
           METRUNE_RELEASE_PUBKEY: ${{ vars.METRUNE_RELEASE_PUBKEY }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -69,15 +109,16 @@ jobs:
           }
           package_id="$(cargo pkgid -p metrune)"
           package_version="${package_id##*@}"
-          bash scripts/check-release-version.sh client "${GITHUB_REF_NAME}" "${package_version}" >/dev/null
+          bash scripts/check-release-version.sh client "${RELEASE_TAG}" "${package_version}" >/dev/null
           cargo build --locked --release -p metrune --target "${{ matrix.target }}"
       - name: Smoke-test the native binary
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           version="$("${{ matrix.source }}" --version 2>/dev/null)"
           echo "$version"
-          expected="${GITHUB_REF_NAME#client-v}"
-          grep -F "${expected}" <<<"$version"
+          grep -F "${RELEASE_VERSION}" <<<"$version"
           "${{ matrix.source }}" --help
       - name: Prove the native credential store is used
         # Installation tokens must land in the operating system's credential
@@ -104,7 +145,7 @@ jobs:
           path: ${{ matrix.artifact }}
 
   publish:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -120,7 +161,7 @@ jobs:
           merge-multiple: true
       # The release job disables setup-node's package cache explicitly. Keep
       # this scoped ignore because zizmor cannot distinguish that from its
-      # cache-enabled form on tag-triggered publishing workflows.
+      # cache-enabled form in a publishing workflow.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # zizmor: ignore[cache-poisoning]
         with:
           node-version: 24
@@ -138,12 +179,14 @@ jobs:
           cp NOTICE artifacts/NOTICE
       - name: Generate checksums and release manifest
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           sha256sum artifacts/metrune-* > artifacts/SHA256SUMS
-          client_version="${GITHUB_REF_NAME#client-v}"
           cat > artifacts/RELEASE_MANIFEST.txt <<EOF
-          version: ${client_version}
-          tag: ${GITHUB_REF_NAME}
+          version: ${RELEASE_VERSION}
+          tag: ${RELEASE_TAG}
           commit: ${GITHUB_SHA}
           clients:
             - artifact: metrune-linux-x86_64
@@ -167,6 +210,8 @@ jobs:
           # signed and verifiable by clients that pin the public key.
           METRUNE_RELEASE_SIGNING_KEY: ${{ secrets.METRUNE_RELEASE_SIGNING_KEY }}
           MINIMUM_CLIENT_VERSION: ${{ vars.MINIMUM_CLIENT_VERSION }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           test -n "${METRUNE_RELEASE_SIGNING_KEY}" || {
@@ -177,7 +222,7 @@ jobs:
             echo "MINIMUM_CLIENT_VERSION must be configured explicitly" >&2
             exit 1
           }
-          client_version="${GITHUB_REF_NAME#client-v}"
+          client_version="${RELEASE_VERSION}"
           minimum_version="${MINIMUM_CLIENT_VERSION#v}"
           bash scripts/check-release-version.sh client "client-v${minimum_version}" "${minimum_version}" >/dev/null
           # Generated by the released binary itself, so the manifest can never
@@ -187,14 +232,40 @@ jobs:
             --version "${client_version}" \
             --minimum-version "${minimum_version}" \
             --checksums SHA256SUMS \
-            --upstream-base-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" \
+            --upstream-base-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}" \
             --output client-manifest.json)
       - name: Attest release binaries
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: artifacts/metrune-*
+      - name: Validate a resumable release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: bash scripts/release-draft.sh validate
+      - name: Recheck the release tag before creating the draft
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: bash scripts/assert-release-tag-available.sh "$RELEASE_TAG"
+      # Upload into a commit-bound draft first. A failed upload can be resumed;
+      # the Git tag is created only after every expected asset is verified.
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             artifacts/*
+          draft: true
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          overwrite_files: true
+      - name: Verify and publish the complete release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          bash scripts/release-draft.sh verify \
+            NOTICE RELEASE_MANIFEST.txt SHA256SUMS client-manifest.json \
+            metrune-linux-x86_64 metrune-windows-x86_64.exe \
+            metrune-macos-x86_64 metrune-macos-arm64
+          bash scripts/release-draft.sh publish

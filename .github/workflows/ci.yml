@@ -1,9 +1,9 @@
 name: CI
 
 on:
-  # Release tags are cut from a commit that has already passed this workflow
-  # on main. Limiting push runs avoids running the full matrix a second time
-  # when the tag is published; pull requests remain fully checked.
+  # The release gate consumes these checks from the release commit on main,
+  # so a release can only publish a commit that already passed them. Pull
+  # requests remain fully checked.
   push:
     branches:
       - main

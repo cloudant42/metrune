@@ -2,8 +2,9 @@ name: Security scans
 
 on:
   pull_request:
-  # The release gate consumes checks from the release commit's main push.
-  # Do not duplicate the complete scan matrix for the later release tag push.
+  # The release gate consumes these checks from the release commit on main,
+  # so a release can only publish a commit that already passed the full scan
+  # matrix.
   push:
     branches:
       - main

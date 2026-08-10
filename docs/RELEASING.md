@@ -7,19 +7,45 @@ canonical in [VERSIONING.md](VERSIONING.md).
 
 ## Prepare
 
-1. Update the version for the release line being shipped and `CHANGELOG.md`.
-   The first server release and first client release are both `0.1.0`.
+Releases are cut from a reviewed branch and triggered by hand. Nothing is
+released automatically, and no tag is pushed by hand.
+
+1. Branch from `main`, then update the version for the release line being
+   shipped and `CHANGELOG.md`. The server version is `[workspace.package]` in
+   `Cargo.toml`; the client keeps its own version in
+   `crates/metrune-cli/Cargo.toml` so the two lines move independently.
 2. Run `make release-check`, which includes `make check`, SQL-backed
    integration tests, browser flows, and the restore drill.
 3. Review migration ordering and rollback limits, including migration 017's
    client-version telemetry columns.
-4. Verify the no-mailer invitation and administrator-issued member-reset paths
-   return usable manual links; when SMTP is configured, verify invitation and
-   password-reset delivery against the production provider.
+4. Verify the no-mailer invitation path returns a usable manual link and all
+   password-reset paths remain unavailable; when SMTP is configured, verify
+   invitation and account-owner password-reset delivery against the production
+   provider.
 5. Exercise install, enrollment, upload, and analytics on a clean Linux host.
-6. Create and push an annotated `server-vX.Y.Z` or `client-vX.Y.Z` tag from
-   the reviewed commit. Use a separate tag when the other line is released;
-   do not reuse a server tag for client artifacts.
+6. Push the branch, open a pull request, and merge it once review and the
+   required checks pass.
+7. Run the **Release server images** or **Release client** workflow manually
+   against `main`. Release the two lines with separate runs; a server release
+   never publishes client artifacts.
+
+The committed version is the only place a release number is written. The
+workflow reads it, derives the namespaced `server-vX.Y.Z` or `client-vX.Y.Z`
+tag, and creates that tag on the released commit when it publishes the GitHub
+release. An operator never types a version or a tag, so the tag cannot
+disagree with the shipped artifact. Direct tag pushes do not trigger release
+workflows.
+
+A manual run refuses to publish when the derived tag already exists, so
+shipping a fix means bumping the version rather than moving a tag that
+published artifacts and signed manifests already point at.
+Manual runs are also rejected from any branch other than the repository's
+default branch, and one release per component runs at a time so concurrent
+operators cannot race the tag-existence check. Tag lookup fails closed on
+transport or authentication errors and is repeated immediately before the
+release is published. Artifacts are first uploaded into a draft tied to the
+exact commit, checked for completeness, and only then published; an interrupted
+upload resumes that draft instead of claiming or moving the release tag.
 
 The tag is not a versioning mechanism by itself: the server workspace version,
 the client package version, the binary `--version`, and request headers must
@@ -30,7 +56,7 @@ or version assertion is missing.
 
 ## Client artifacts
 
-The `client-vX.Y.Z` workflow builds and runs `--version` and `--help` on Linux
+The client release workflow builds and runs `--version` and `--help` on Linux
 x86_64, Windows x86_64, Intel macOS, and Apple Silicon. It publishes checksums,
 a support-tier manifest, build-provenance attestations, and
 `client-manifest.json` — the machine-readable manifest `metrune update` and
@@ -64,10 +90,12 @@ watch-mode tests are release gates. Of those three:
 
 ## Server images
 
-The `server-vX.Y.Z` workflow builds the API and web images from the reviewed
+The server release workflow builds the API and web images from the reviewed
 server release commit, generates image SBOMs and provenance, scans for
 high/critical findings, and publishes `SERVER_IMAGE_MANIFEST.txt`. No moving
-`latest` tag is published. A server release does not publish a client version;
+`latest` tag is published. Version tags are promoted only after both images
+pass scanning and attestation, and an existing version tag is never moved to a
+different digest. A server release does not publish a client version;
 production deployments mount a separately selected, signed `client-vX.Y.Z`
 manifest and its artifacts.
 
@@ -150,7 +178,8 @@ Every verification claim must identify the exact fixture or external boundary:
   exits watch/upload without retrying, and retains its local outbox.
 - Organization and personal installation views show the version reported by a
   current client.
-- The no-mailer invitation/member-reset flows and a clean-host Linux client
-  flow have been exercised; real SMTP delivery remains an external gate.
+- The no-mailer invitation flow and password-reset refusal, plus a clean-host
+  Linux client flow, have been exercised; real SMTP delivery remains an
+  external gate.
 - `client-manifest.json` is attached to the release, is signed, and
   `metrune update --check` against a staging server reports the new version.
