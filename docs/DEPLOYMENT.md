@@ -20,7 +20,9 @@ outside the beta support contract.
 2. Set mode `0600` and replace every placeholder.
 3. Use immutable API and web image references from the release manifest.
 4. Choose independent, randomly generated PostgreSQL, ClickHouse, local
-   bootstrap (when used), SMTP, OIDC, and infrastructure credentials.
+   bootstrap (when used), SMTP, OIDC, and infrastructure credentials. SMTP is
+   needed for email delivery and is also validated by the current production
+   startup checks.
 5. Use the `server-vX.Y.Z` release for the API/web images, Compose file, and
    migration directories. Select the separately released `client-vX.Y.Z`
    manifest and artifacts for the client mirror.
@@ -29,7 +31,9 @@ Production startup requires:
 
 - HTTPS `METRUNE_PUBLIC_API_URL` and `METRUNE_PUBLIC_WEB_URL` values on the
   same hostname (the latter is used in CLI device-approval links);
-- authenticated SMTP using certificate-verified STARTTLS or implicit TLS;
+- optionally, authenticated SMTP using certificate-verified STARTTLS or
+  implicit TLS for invitation and password-reset email; without it, invitation
+  links can be delivered manually and password reset is unavailable;
 - an initial organization name and administrator email, plus either a local
   password of at least 12 characters or complete OIDC configuration;
 - a writable named volume for the encrypted credential-vault key.
@@ -112,11 +116,15 @@ docker compose --env-file /private/path/metrune.env \
 ```
 
 The API refuses production startup when bootstrap values remain after a user
-exists. Administrators add later users by sending expiring invitations from
-the Members page. In local mode, password-reset requests use the same SMTP
-transport and return a generic response to avoid revealing registered
-addresses. Under OIDC, invited users do not set a password and reset endpoints
-are disabled.
+exists. Administrators add later users with expiring invitations from the
+Members page. With SMTP configured, the invitation is emailed; without a
+mailer, the API returns an `acceptUrl` for the administrator to deliver
+manually. In local mode, password-reset requests use the same SMTP transport
+and return a generic response to avoid revealing registered addresses. An
+administrator can trigger a reset for a known member only when SMTP is
+configured; the token is always delivered to the account owner and is never
+returned to a workspace administrator. Under OIDC, invited users do not set a
+password and reset endpoints are disabled.
 
 ## Upgrade
 

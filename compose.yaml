@@ -71,7 +71,7 @@ services:
       METRUNE_SECRETS_KEY_FILE: /var/lib/metrune/secrets/master.key
       RUST_LOG: metrune_api=info,tower_http=info
     ports:
-      - "${METRUNE_API_PORT:-8080}:8080"
+      - "127.0.0.1:${METRUNE_API_PORT:-8080}:8080"
     volumes:
       - metrune-secrets:/var/lib/metrune/secrets
     depends_on:
@@ -85,12 +85,10 @@ services:
     environment:
       METRUNE_ENV: development
       METRUNE_API_URL: http://api:8080
-      METRUNE_DASHBOARD_TOKEN: met_dashboard_dev
-      METRUNE_ENABLE_DEMO_DATA: ${METRUNE_ENABLE_DEMO_DATA:-0}
       METRUNE_PUBLIC_API_URL: ${METRUNE_PUBLIC_API_URL:-http://localhost:8080}
       METRUNE_CLIENT_RELEASE_BASE_URL: ${METRUNE_CLIENT_RELEASE_BASE_URL:-http://localhost:8080/v1/downloads}
     ports:
-      - "${METRUNE_WEB_PORT:-3001}:3000"
+      - "127.0.0.1:${METRUNE_WEB_PORT:-3001}:3000"
     depends_on:
       - api
 

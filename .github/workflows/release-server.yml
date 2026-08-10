@@ -1,22 +1,55 @@
 name: Release server images
 
 on:
-  push:
-    tags: ["server-v*"]
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Server version or server-vX.Y.Z tag (defaults to the current ref name)"
-        required: false
-        type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-server-${{ github.repository }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
+  # The committed workspace version is the only place the release number is
+  # written. A manual run derives the tag from it and the manifest job creates
+  # that tag. The operator never types or pushes a version tag, so the tag can
+  # never disagree with the shipped images.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve the release tag
+        id: resolve
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] &&
+            [ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ]; then
+            echo "manual server releases must run against ${DEFAULT_BRANCH}" >&2
+            exit 1
+          fi
+          package_version="$(bash scripts/resolve-release-version.sh server)"
+          tag="server-v${package_version}"
+          version="$(bash scripts/check-release-version.sh server "$tag" "$package_version")"
+          # Re-releasing an existing version would move a tag that published
+          # image digests already point at. Transport or auth failures also
+          # stop the release rather than looking like a 404.
+          bash scripts/assert-release-tag-available.sh "$tag"
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
   gate:
     runs-on: ubuntu-latest
     permissions:
@@ -32,7 +65,7 @@ jobs:
         run: python3 scripts/verify-release-checks.py
 
   images:
-    needs: gate
+    needs: [version, gate]
     strategy:
       fail-fast: false
       matrix:
@@ -52,29 +85,17 @@ jobs:
         with:
           persist-credentials: false
 
-      # The dispatch input is passed through the environment, never
-      # interpolated into the script body.
-      - name: Resolve version
-        id: version
+      - name: Resolve image names
+        id: meta
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          raw="${INPUT_VERSION}"
-          if [ -z "$raw" ]; then raw="${GITHUB_REF_NAME}"; fi
-          if [[ "$raw" == server-v* ]]; then
-            tag="$raw"
-          else
-            tag="server-v${raw#v}"
-          fi
-          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          version="$(bash scripts/check-release-version.sh server "$tag" "$package_version")"
           image="${REGISTRY}/${GITHUB_REPOSITORY,,}-${{ matrix.component }}"
           {
-            echo "tag=${tag}"
-            echo "version=${version}"
+            echo "version=${VERSION}"
             echo "image=${image}"
-            echo "candidate=${image}:${version}-candidate-${GITHUB_SHA}"
+            echo "candidate=${image}:${VERSION}-candidate-${GITHUB_SHA}"
           } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -84,7 +105,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       # Build under a temporary tag first. The production version tag is only
       # promoted after the exact pushed digest passes Trivy.
       - name: Build and push candidate
@@ -98,10 +118,10 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
-          tags: ${{ steps.version.outputs.candidate }}
+          tags: ${{ steps.meta.outputs.candidate }}
           labels: |
             org.opencontainers.image.title=metrune-${{ matrix.component }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.licenses=Apache-2.0
@@ -113,30 +133,23 @@ jobs:
       - name: Scan the candidate image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ steps.version.outputs.candidate }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ steps.meta.outputs.candidate }}@${{ steps.build.outputs.digest }}
           scanners: vuln,secret,misconfig
           ignore-unfixed: true
           severity: HIGH,CRITICAL
           exit-code: 1
 
-      - name: Promote the scanned digest to the release tag
-        env:
-          IMAGE: ${{ steps.version.outputs.image }}
-          VERSION: ${{ steps.version.outputs.version }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: docker buildx imagetools create --tag "${IMAGE}:${VERSION}" "${IMAGE}@${DIGEST}"
-
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          subject-name: ${{ steps.version.outputs.image }}
+          subject-name: ${{ steps.meta.outputs.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
       - name: Record the published digest
         env:
-          IMAGE: ${{ steps.version.outputs.image }}
-          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
           DIGEST: ${{ steps.build.outputs.digest }}
           COMPONENT: ${{ matrix.component }}
         run: |
@@ -149,37 +162,117 @@ jobs:
           path: digests/${{ matrix.component }}.txt
 
   manifest:
-    needs: images
+    needs: [version, images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: digests
           pattern: image-digest-*
           merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # zizmor: ignore[cache-poisoning]
+        with:
+          node-version: 24
+          cache: ''
+      - name: Verify the committed third-party notices
+        run: |
+          set -euo pipefail
+          npm ci --omit=dev --omit=optional --prefix web
+          python3 scripts/generate-notices.py --output /tmp/metrune-NOTICE
+          cmp -s NOTICE /tmp/metrune-NOTICE || {
+            echo "NOTICE is stale; run make notices and commit the generated file" >&2
+            diff -u NOTICE /tmp/metrune-NOTICE || true
+            exit 1
+          }
 
       # Operators pin these digests in compose.production.yaml before rollout.
       - name: Build the server image manifest
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
-          raw="${INPUT_VERSION}"
-          if [ -z "$raw" ]; then raw="${GITHUB_REF_NAME}"; fi
-          if [[ "$raw" == server-v* ]]; then tag="$raw"; else tag="server-v${raw#v}"; fi
-          version="${tag#server-v}"
           {
-            echo "version: ${version}"
-            echo "tag: ${tag}"
+            echo "version: ${VERSION}"
+            echo "tag: ${TAG}"
             echo "commit: ${GITHUB_SHA}"
             echo "images:"
             sed 's/^/  - /' digests/*.txt
           } > SERVER_IMAGE_MANIFEST.txt
           cat SERVER_IMAGE_MANIFEST.txt
 
+      - name: Validate a resumable release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: bash scripts/release-draft.sh validate
+      - name: Recheck the release tag before creating the draft
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: bash scripts/assert-release-tag-available.sh "$RELEASE_TAG"
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: SERVER_IMAGE_MANIFEST.txt
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            NOTICE
+            SERVER_IMAGE_MANIFEST.txt
+          draft: true
+          fail_on_unmatched_files: true
+          overwrite_files: true
+      - name: Verify the complete release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: bash scripts/release-draft.sh verify NOTICE SERVER_IMAGE_MANIFEST.txt
+
+      # Neither final version tag exists until both matrix legs have built,
+      # passed Trivy, emitted provenance, and reached this downstream job.
+      - name: Promote the reviewed image digests to version tags
+        run: |
+          set -euo pipefail
+          inspect_error="$(mktemp)"
+          trap 'rm -f "$inspect_error"' EXIT
+          while IFS= read -r published; do
+            destination="${published%@*}"
+            image="${destination%:*}"
+            digest="${published##*@}"
+            source="${image}@${digest}"
+            docker buildx imagetools inspect "$source" >/dev/null
+            if manifest="$(docker buildx imagetools inspect "$destination" --format '{{json .Manifest}}' 2>"$inspect_error")"; then
+              current="$(jq -r '.digest // empty' <<<"$manifest")"
+              [[ -n "$current" ]] || {
+                echo "could not resolve the existing digest for $destination" >&2
+                exit 1
+              }
+              [[ "$current" == "$digest" ]] || {
+                echo "$destination already points at $current, refusing to move it to $digest" >&2
+                exit 1
+              }
+              echo "$destination already points at the intended digest"
+            elif grep -Eqi 'manifest unknown|name unknown|not found|no such manifest' "$inspect_error"; then
+              docker buildx imagetools create --tag "$destination" "$source"
+            else
+              cat "$inspect_error" >&2
+              echo "could not determine whether $destination already exists" >&2
+              exit 1
+            fi
+          done < <(sort digests/*.txt)
+
+      - name: Publish the verified release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: bash scripts/release-draft.sh publish

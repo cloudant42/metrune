@@ -151,10 +151,11 @@ workstation:
 curl -fsSL https://metrune.example.com/v1/client/install.sh | sh
 ```
 
-It selects the artifact for the running platform, verifies the SHA-256, and
-installs to `/usr/local/bin` (override with `METRUNE_INSTALL_DIR`). Windows has
-no shell installer; download the `.exe` from the release or the mirror and check
-it against `SHA256SUMS`.
+It selects the artifact for the running platform, verifies the SHA-256, creates
+the destination directory when it is missing, and installs to `/usr/local/bin`
+(override with `METRUNE_INSTALL_DIR`). This includes stock macOS systems where
+`/usr/local/bin` may not exist. Windows has no shell installer; download the
+`.exe` from the release or the mirror and check it against `SHA256SUMS`.
 
 The rendered shell helper is enabled only when the server has a configured
 release public key and verifies the manifest signature before rendering. It
@@ -201,7 +202,7 @@ minimum first so clients receive a warning, deploy a server that accepts the
 old and new schemas, observe installation telemetry, and only then raise the
 server floor. Keep the two values equal once the rollout closes.
 
-The repository's tag-triggered release workflow defines Linux x86-64, Windows
+The repository's manually dispatched release workflow defines Linux x86-64, Windows
 x86-64, Intel macOS, and Apple Silicon macOS artifacts. At the 2026-08-01
 verification point the remote had no tags, so no real release execution,
 signature, repository variable, or cross-platform artifact could be confirmed.

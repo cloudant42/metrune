@@ -79,12 +79,13 @@ async fn session_listings_and_facets_stay_organization_scoped() {
         )
         .await;
 
-    // Session drilldown is reserved for service dashboard tokens; a signed-in
-    // user is refused regardless of role.
-    let (status, _) = harness
+    // An admin's browser session drills into the whole organization, the same
+    // as an analyst service token.
+    let (status, sessions) = harness
         .get("/v1/analytics/sessions", Some(&alpha.admin.token))
         .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sessions.as_array().expect("session array").len(), 1);
 
     let alpha_service = harness
         .create_dashboard_token(alpha.organization_id, "analyst")
@@ -143,6 +144,77 @@ async fn session_listings_and_facets_stay_organization_scoped() {
 }
 
 #[tokio::test]
+async fn a_viewers_browser_session_only_drills_into_its_own_sessions() {
+    let harness = analytics_harness!();
+    let workspace = harness.workspace("viewer-scope").await;
+    let viewer = harness
+        .create_member(workspace.organization_id, "viewer-scope", "viewer")
+        .await;
+
+    // One session owned by the admin, one owned by the viewer.
+    for (owner, key) in [
+        (workspace.admin.user_id, "vs-admin-session"),
+        (viewer.user_id, "vs-viewer-session"),
+    ] {
+        let (_, token) = harness
+            .create_installation(workspace.organization_id, Some(owner))
+            .await;
+        harness
+            .send(
+                "POST",
+                "/v1/ingest/sessions",
+                Some(&token),
+                batch(key, vec![snapshot(key, "vs-user")]),
+            )
+            .await;
+    }
+
+    // `snapshot` pads the stored key out to 40 characters.
+    let stored_key = |key: &str| format!("{key:0<40}");
+
+    let (status, sessions) = harness
+        .get("/v1/analytics/sessions", Some(&viewer.token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = sessions.as_array().expect("session array");
+    assert_eq!(rows.len(), 1, "a viewer listed sessions it does not own");
+    assert_eq!(
+        rows[0]["sessionKey"].as_str(),
+        Some(stored_key("vs-viewer-session").as_str())
+    );
+
+    // The admin's session stays closed to the viewer, while its own opens.
+    let (status, _) = harness
+        .get(
+            &format!("/v1/analytics/sessions/{}", stored_key("vs-admin-session")),
+            Some(&viewer.token),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a viewer opened a session it does not own"
+    );
+    let (status, _) = harness
+        .get(
+            &format!("/v1/analytics/sessions/{}", stored_key("vs-viewer-session")),
+            Some(&viewer.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, sessions) = harness
+        .get("/v1/analytics/sessions", Some(&workspace.admin.token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sessions.as_array().expect("session array").len(),
+        2,
+        "an admin browser session must see the whole organization"
+    );
+}
+
+#[tokio::test]
 async fn a_viewer_service_token_cannot_open_the_session_drilldown() {
     let harness = analytics_harness!();
     let workspace = harness.workspace("drilldown-role").await;
@@ -178,12 +250,14 @@ async fn personal_usage_only_covers_the_callers_own_installations() {
     let (_, admin_token) = harness
         .create_installation(workspace.organization_id, Some(workspace.admin.user_id))
         .await;
+    let mut owned_snapshot = snapshot("pu-session", "pu-user");
+    owned_snapshot.team_key = Some("platform".into());
     harness
         .send(
             "POST",
             "/v1/ingest/sessions",
             Some(&admin_token),
-            batch("batch-1", vec![snapshot("pu-session", "pu-user")]),
+            batch("batch-1", vec![owned_snapshot]),
         )
         .await;
 
@@ -197,6 +271,22 @@ async fn personal_usage_only_covers_the_callers_own_installations() {
         .await;
     assert_eq!(status, StatusCode::OK);
     let session_key = sessions[0]["sessionKey"].as_str().expect("session key");
+    let (status, matching_team) = harness
+        .get(
+            "/v1/me/sessions?team=platform",
+            Some(&workspace.admin.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(matching_team.as_array().expect("session array").len(), 1);
+    let (status, other_team) = harness
+        .get(
+            "/v1/me/sessions?team=another-team",
+            Some(&workspace.admin.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(other_team.as_array().expect("session array").is_empty());
     let (status, detail) = harness
         .get(
             &format!("/v1/analytics/sessions/{session_key}"),

@@ -182,5 +182,6 @@ substitute the platform's backup and restore commands.
 
 Record these manually as part of a production drill: multi-partition ClickHouse
 history and merge/mutation backlog, external backup retrieval of the vault key,
-DNS and TLS cutover, SMTP delivery, and the elapsed wall-clock time against the
-recovery-time objective.
+DNS and TLS cutover, SMTP delivery when configured, the no-mailer manual
+invitation/password-reset-refusal flows, and the elapsed wall-clock time
+against the recovery-time objective.

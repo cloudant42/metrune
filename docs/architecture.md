@@ -71,17 +71,19 @@ and encrypted provider credentials. ClickHouse owns revisioned usage snapshots
 and analytical queries. The browser communicates through the Next.js
 server-side proxy and never connects directly to either database.
 
-The web proxy forwards only the signed-in session (or a development-only
-dashboard token) to the API. Production and signed-in requests fail closed when
-the API cannot answer: they render an unavailable state rather than substituting
-fixture organization data. Explicit local showcase fixtures require
-`METRUNE_ENABLE_DEMO_DATA=1` and are never used for a browser session. UI role
-visibility is least-privilege only; the API repeats every authorization check.
+The web proxy forwards only the signed-in session to the API, and middleware
+redirects page requests to `/login` before rendering when that session is
+absent. Unauthenticated `/api/*` requests receive `401` JSON. Requests fail
+closed when the API cannot answer: they render an unavailable state rather than
+substituting fixture organization data. UI role visibility is least-privilege
+only; the API repeats every authorization check.
 
-Organization session exports remain admin/analyst-only, preserve the dashboard
-filters, use `Cache-Control: no-store`, and neutralize spreadsheet formula
-prefixes before CSV quoting. Redirect continuations are restricted to
-same-origin relative paths by a shared validator.
+Organization-wide session exports remain admin/analyst-only. Every other role
+exports only the sessions it owns; the files are named
+`metrune-sessions.csv` and `metrune-my-sessions.csv`, respectively. Both paths
+preserve the dashboard filters, use `Cache-Control: no-store`, and neutralize
+spreadsheet formula prefixes before CSV quoting. Redirect continuations are
+restricted to same-origin relative paths by a shared validator.
 
 The API authenticates a web session, service token, or installation token.
 Web sessions come from either deployment-wide OIDC or local passwords, never

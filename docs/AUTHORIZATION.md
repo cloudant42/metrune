@@ -24,18 +24,27 @@ Roles are `admin`, `analyst`, and `viewer`. Only `admin` passes
 
 The Next.js dashboard is a server-side proxy. It forwards the signed-in
 `metrune_session` cookie as a bearer token and never sends database or service
-credentials to the browser. A development dashboard token may be configured
-for local-only operation; production Compose sets it to an empty value.
+credentials to the browser. There is no other credential and no fallback: a
+request without that cookie has no bearer token to forward, in every
+environment.
 
-Dashboard pages fail closed when the API is unavailable. Fixture data is only
-available when `METRUNE_ENABLE_DEMO_DATA=1`, outside production, and no browser
-session is present; a signed-in request is never replaced with demo values.
-Missing or non-admin roles cannot open administration or pricing controls, and
-session drilldown requires a signed-in member. The API remains the authoritative
-role and organization check for every proxy mutation.
+Middleware returns `307` to `/login` before rendering when the cookie is absent,
+so an anonymous response never contains organization data. This is a presence
+check only — the API stays authoritative, and pages additionally resolve the
+signed-in user before reading data.
 
-`GET /api/export` requires a signed-in web session and an admin/analyst role; it
-is an organization-session export. It accepts
+Dashboard pages fail closed when the API is unavailable: a failed read renders
+an explicit "unavailable" panel and never substitutes placeholder data.
+Missing or non-admin roles cannot open administration or pricing controls. The
+session drilldown is organization-wide for an analyst or admin and scoped to the
+caller's own sessions for every other role; a viewer's service token has no user
+identity to scope by and is refused. The API remains the authoritative role and
+organization check for every proxy mutation.
+
+`GET /api/export` requires a signed-in web session. An admin or analyst exports
+the whole organization; every other role exports only the sessions it owns, and
+the filename is `metrune-sessions.csv` for the organization view or
+`metrune-my-sessions.csv` for the personal view. It accepts
 the same bounded date/team/project/category/client/status/workflow filters as
 the dashboard, returns `401`/`403`/`503` instead of an empty success file when
 the live API is unavailable, marks the response `no-store`, and prefixes cells
@@ -124,9 +133,10 @@ Every operation below resolves the organization from the caller's credential.
 | --- | --- |
 | `GET /v1/org/teams` | Any member. Team names are needed by the browser device-approval flow |
 | `GET /v1/org/members`, `POST /v1/org/members` | Admin. Adding requires an existing account and creates only an organization membership |
-| `GET`/`POST /v1/org/invitations` | Admin user session. Lists metadata or sends an expiring email invitation; service tokens cannot invite |
-| `POST /v1/org/invitations/{id}/resend`, `DELETE /v1/org/invitations/{id}` | Admin user session. Resend rotates the token; revoke invalidates it |
+| `GET`/`POST /v1/org/invitations` | Admin user session. Lists metadata or creates an expiring invitation; SMTP sends it when configured, otherwise `201` returns `delivery: "manual"` and an `acceptUrl` whose token is in the URL fragment. Service tokens cannot invite |
+| `POST /v1/org/invitations/{id}/resend`, `DELETE /v1/org/invitations/{id}` | Admin user session. Resend rotates the token and returns the same manual link when no mailer is configured; revoke invalidates it |
 | `PATCH`/`DELETE /v1/org/members/{user_id}` | Admin. The final active admin cannot be demoted or removed; removal clears affected active sessions |
+| `POST /v1/org/members/{user_id}/password-reset` | Admin user session in local-password mode; organization-scoped. Requires SMTP and sends the token only to the account owner; global-account reset tokens are never returned to a workspace administrator. Unavailable under OIDC |
 | `POST /v1/org/teams`, `PATCH`/`DELETE /v1/org/teams/{id}` | Admin |
 | `GET /v1/org/installations` | Admin. The fleet inventory is an administrative view |
 | `PATCH /v1/org/installations/{id}` | Admin |

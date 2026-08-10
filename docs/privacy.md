@@ -58,7 +58,8 @@ deployment guidance.
 - Browser analytics access is scoped by the web session's active organization
   membership; service and installation tokens remain bound to one
   organization.
-- Session drilldown requires analyst or admin role.
+- Organization-wide session drilldown requires an analyst or admin role. Every
+  other role sees only the sessions it owns.
 - ClickHouse retention defaults to 365 days.
 - Default request logs exclude bodies, headers, credentials, and classifier
   text; operational integrations must preserve that boundary.

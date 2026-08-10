@@ -66,4 +66,32 @@ if grep -q '/docker-entrypoint-initdb.d' <<<"$postgres_config"; then
   exit 1
 fi
 
-echo "production Compose contract is valid"
+# The dashboard forwards the browser session and nothing else; a shared token
+# in the web environment would restore anonymous organization access.
+if grep -Eq '^[[:space:]]+METRUNE_DASHBOARD_TOKEN:' "$rendered"; then
+  echo "production Compose must not give the web service a dashboard token" >&2
+  exit 1
+fi
+
+docker compose -f compose.yaml config > "$rendered"
+
+# The development stack seeds an admin organization and a weak bootstrap
+# password, so it must never be reachable from outside the host.
+dev_published="$(grep -c 'published:' "$rendered" || true)"
+dev_localhost="$(grep -c 'host_ip: 127.0.0.1' "$rendered" || true)"
+if [[ "$dev_published" != "2" || "$dev_localhost" != "2" ]]; then
+  echo "development Compose must publish only API and web on 127.0.0.1" >&2
+  exit 1
+fi
+
+if grep -q 'host_ip: 0.0.0.0' "$rendered"; then
+  echo "development Compose exposes a service on all interfaces" >&2
+  exit 1
+fi
+
+if grep -Eq '^[[:space:]]+METRUNE_DASHBOARD_TOKEN:' "$rendered"; then
+  echo "development Compose must not give the web service a dashboard token" >&2
+  exit 1
+fi
+
+echo "Compose contracts are valid"

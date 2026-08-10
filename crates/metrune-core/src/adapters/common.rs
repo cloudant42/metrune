@@ -223,6 +223,7 @@ pub fn parse_usage_value(
             value,
             &[
                 &["usage", "input_tokens"],
+                &["message", "usage", "input_tokens"],
                 &["tokens", "input"],
                 &["input_tokens"],
             ],
@@ -231,6 +232,7 @@ pub fn parse_usage_value(
             value,
             &[
                 &["usage", "output_tokens"],
+                &["message", "usage", "output_tokens"],
                 &["tokens", "output"],
                 &["output_tokens"],
             ],
@@ -239,6 +241,7 @@ pub fn parse_usage_value(
             value,
             &[
                 &["usage", "cache_read_input_tokens"],
+                &["message", "usage", "cache_read_input_tokens"],
                 &["tokens", "cache", "read"],
                 &["cache_read"],
             ],
@@ -247,6 +250,7 @@ pub fn parse_usage_value(
             value,
             &[
                 &["usage", "cache_creation_input_tokens"],
+                &["message", "usage", "cache_creation_input_tokens"],
                 &["tokens", "cache", "write"],
                 &["cache_write"],
             ],
@@ -255,6 +259,7 @@ pub fn parse_usage_value(
             value,
             &[
                 &["usage", "reasoning_tokens"],
+                &["message", "usage", "reasoning_tokens"],
                 &["tokens", "reasoning"],
                 &["reasoning_tokens"],
             ],

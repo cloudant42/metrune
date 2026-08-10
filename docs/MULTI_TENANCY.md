@@ -39,9 +39,11 @@ Login returns all active memberships:
   one transaction.
 
 Workspace admins invite an email address with a role, resend or revoke a
-pending invitation, change a member's role, or remove a membership. New users
-set their password after following the expiring email link. Existing users
-must sign in as the invited address before acceptance. The API prevents
+pending invitation, change a member's role, or remove a membership. SMTP sends
+the invitation when configured; otherwise create and resend return a manual
+`acceptUrl` whose token is in the URL fragment. New users set their password
+after following the expiring link. Existing users must sign in as the invited
+address before acceptance. The API prevents
 removal or demotion of the final active admin. Removing a membership clears
 that workspace from the affected user's active sessions.
 

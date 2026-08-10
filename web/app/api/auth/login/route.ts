@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { sessionCookieIsSecure } from "@/lib/session";
 
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
@@ -20,7 +21,7 @@ export async function POST(request: Request) {
     result.cookies.set("metrune_session", payload.sessionToken, {
       httpOnly: true,
       sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
+      secure: sessionCookieIsSecure(),
       path: "/",
       expires: new Date(payload.expiresAt),
     });

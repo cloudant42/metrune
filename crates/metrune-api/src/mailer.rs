@@ -30,11 +30,15 @@ impl Mailer {
     pub(crate) fn from_env(environment: &str) -> anyhow::Result<Option<Self>> {
         let values = SmtpEnvironment::read();
         if values.is_empty() {
+            // Running without mail is a supported deployment choice: invitations
+            // return a manual link, while password reset is unavailable because
+            // its token must be delivered only to the account owner.
             if environment == "production" {
-                bail!(
-                    "SMTP is required in production; configure METRUNE_SMTP_HOST, \
-                     METRUNE_SMTP_PORT, METRUNE_SMTP_USERNAME, METRUNE_SMTP_PASSWORD, \
-                     METRUNE_SMTP_FROM, and METRUNE_SMTP_SECURITY"
+                tracing::warn!(
+                    "SMTP is not configured. Invitations return a manual link, and password \
+                     reset is unavailable. Set METRUNE_SMTP_HOST, METRUNE_SMTP_PORT, \
+                     METRUNE_SMTP_USERNAME, METRUNE_SMTP_PASSWORD, METRUNE_SMTP_FROM, and \
+                     METRUNE_SMTP_SECURITY to enable delivery."
                 );
             }
             return Ok(None);
@@ -83,14 +87,18 @@ impl Mailer {
              The link expires soon. If you did not expect this invitation, \
              you can ignore this email."
         );
-        let html = format!(
-            "<p>You were invited to join <strong>{}</strong> on Metrune as <strong>{}</strong>.</p>\
-             <p><a href=\"{}\">Accept invitation</a></p>\
-             <p>This single-use link expires soon. If you did not expect this \
-             invitation, you can ignore this email.</p>",
-            escape_html(organization_name),
-            escape_html(role),
-            escape_html(&link),
+        let html = layout(
+            &format!("Accept your invitation to {organization_name} on Metrune."),
+            "You've been invited",
+            &format!(
+                "You were invited to join <strong>{}</strong> on Metrune as <strong>{}</strong>.",
+                escape_html(organization_name),
+                escape_html(role),
+            ),
+            "Accept invitation",
+            &link,
+            "This single-use link expires soon. If you did not expect this invitation, \
+             you can ignore this email.",
         );
         self.send(recipient, &subject, plain, html).await
     }
@@ -107,12 +115,14 @@ impl Mailer {
              The link expires soon. If you did not request this reset, \
              you can ignore this email."
         );
-        let html = format!(
-            "<p>A password reset was requested for your Metrune account.</p>\
-             <p><a href=\"{}\">Choose a new password</a></p>\
-             <p>This single-use link expires soon. If you did not request \
-             this reset, you can ignore this email.</p>",
-            escape_html(&link),
+        let html = layout(
+            "Choose a new password for your Metrune account.",
+            "Reset your password",
+            "A password reset was requested for your Metrune account.",
+            "Choose a new password",
+            &link,
+            "This single-use link expires soon. If you did not request this reset, \
+             you can ignore this email.",
         );
         self.send(recipient, "Reset your Metrune password", plain, html)
             .await
@@ -220,6 +230,57 @@ fn required(value: Option<String>, name: &str) -> anyhow::Result<String> {
     value.with_context(|| format!("{name} is required when SMTP is configured"))
 }
 
+/// Wrap one call to action in the shared Metrune email shell.
+///
+/// Mail clients strip `<style>` blocks and most modern CSS, so this is a
+/// centred table with inline attributes only. The button is a table cell with a
+/// `bgcolor` rather than a styled anchor, because Outlook drops background
+/// colours on links. `intro` is already-escaped HTML; every other caller-supplied
+/// value is escaped here.
+fn layout(
+    preheader: &str,
+    heading: &str,
+    intro: &str,
+    cta: &str,
+    link: &str,
+    note: &str,
+) -> String {
+    const FONT: &str = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif";
+    let link = escape_html(link);
+    format!(
+        "<!doctype html><html><body style=\"margin:0;padding:0;background-color:#f4f7fc;\">\
+         <div style=\"display:none;max-height:0;overflow:hidden;opacity:0;\">{preheader}</div>\
+         <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" width=\"100%\" \
+         style=\"background-color:#f4f7fc;\"><tr><td align=\"center\" style=\"padding:32px 16px;\">\
+         <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" width=\"100%\" \
+         style=\"max-width:520px;\">\
+         <tr><td style=\"padding-bottom:20px;font-family:{FONT};font-size:18px;font-weight:700;\
+         letter-spacing:0.3px;color:#001553;\">Metrune</td></tr>\
+         <tr><td style=\"background-color:#ffffff;border:1px solid #dde4f0;border-radius:12px;\
+         padding:32px;font-family:{FONT};\">\
+         <p style=\"margin:0 0 12px;font-size:20px;line-height:28px;font-weight:600;color:#001553;\">\
+         {heading}</p>\
+         <p style=\"margin:0 0 24px;font-size:15px;line-height:24px;color:#5f6b8f;\">{intro}</p>\
+         <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\"><tr>\
+         <td bgcolor=\"#0070e0\" style=\"border-radius:8px;\">\
+         <a href=\"{link}\" style=\"display:inline-block;padding:12px 24px;font-family:{FONT};\
+         font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">{cta}</a>\
+         </td></tr></table>\
+         <p style=\"margin:24px 0 4px;font-size:13px;line-height:20px;color:#5f6b8f;\">\
+         Or paste this link into your browser:</p>\
+         <p style=\"margin:0;font-size:13px;line-height:20px;word-break:break-all;\">\
+         <a href=\"{link}\" style=\"color:#0059bd;\">{link}</a></p>\
+         </td></tr>\
+         <tr><td style=\"padding:20px 4px 0;font-family:{FONT};font-size:12px;line-height:18px;\
+         color:#5f6b8f;\">{note}</td></tr>\
+         </table></td></tr></table></body></html>",
+        preheader = escape_html(preheader),
+        heading = escape_html(heading),
+        cta = escape_html(cta),
+        note = escape_html(note),
+    )
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -231,7 +292,7 @@ fn escape_html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_html, normalize_email, SmtpEnvironment};
+    use super::{escape_html, layout, normalize_email, SmtpEnvironment};
 
     #[test]
     fn email_html_escapes_operator_controlled_values() {
@@ -239,6 +300,28 @@ mod tests {
             escape_html("<Team & \"friends\">"),
             "&lt;Team &amp; &quot;friends&quot;&gt;"
         );
+    }
+
+    #[test]
+    fn email_layout_escapes_every_value_except_the_prepared_intro() {
+        let html = layout(
+            "<preheader>",
+            "<heading>",
+            "<strong>already escaped</strong>",
+            "<cta>",
+            "https://example.test/accept#a\"b",
+            "<note>",
+        );
+        // The intro is prepared by the caller, which escapes the organization
+        // name and role before marking them up, so its tags must survive.
+        assert!(html.contains("<strong>already escaped</strong>"));
+        for raw in ["<preheader>", "<heading>", "<cta>", "<note>"] {
+            assert!(!html.contains(raw), "{raw} reached the document unescaped");
+        }
+        // The link lands in an href and in the visible fallback, so a quote in
+        // it must not be able to close the attribute.
+        assert!(html.contains("a&quot;b"));
+        assert!(!html.contains("accept#a\"b"));
     }
 
     #[test]
@@ -253,6 +336,10 @@ mod tests {
 
     #[test]
     fn partial_or_invalid_smtp_configuration_fails_closed() {
+        // No configuration at all is a supported deployment choice and must
+        // read as empty, which is what lets the API start without a mailer.
+        assert!(SmtpEnvironment::default().is_empty());
+
         let missing = SmtpEnvironment {
             host: Some("smtp.example.test".into()),
             ..SmtpEnvironment::default()

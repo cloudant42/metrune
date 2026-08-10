@@ -269,3 +269,41 @@ fn parses_opencode_sqlite_read_only() {
     assert_eq!(messages[0].tokens.total(), 330);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Claude Code nests usage under `message`, alongside `message.role` and
+/// `message.model`. A fixture written in the flat shape passes while every real
+/// transcript is discarded, so this mirrors a record taken from
+/// `~/.claude/projects/<project>/<session>.jsonl` verbatim.
+#[test]
+fn parses_claude_usage_nested_under_message() {
+    let root = test_root();
+    let path = root.join("claude-nested.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"user","cwd":"/Users/dev/project","sessionId":"s-nested","timestamp":"2026-08-09T09:59:00Z","message":{"role":"user","content":[{"type":"text","text":"private prompt"}]}}
+{"type":"assistant","cwd":"/Users/dev/project","sessionId":"s-nested","uuid":"a1","version":"2.0.1","timestamp":"2026-08-09T10:00:00Z","message":{"role":"assistant","model":"claude-sonnet-4-5","usage":{"input_tokens":2,"cache_creation_input_tokens":9361,"cache_read_input_tokens":12642,"output_tokens":1326,"service_tier":"standard"}}}
+"#,
+    )
+    .unwrap();
+
+    let parsed = ClaudeAdapter.parse(&path).unwrap();
+    assert_eq!(
+        parsed.len(),
+        1,
+        "a real Claude transcript produced no usage messages"
+    );
+    let message = &parsed[0];
+    assert_eq!(message.tokens.input, 2);
+    assert_eq!(message.tokens.output, 1326);
+    assert_eq!(message.tokens.cache_read, 12642);
+    assert_eq!(message.tokens.cache_write, 9361);
+    assert_eq!(message.tokens.total(), 23331);
+    assert_eq!(message.model_id, "claude-sonnet-4-5");
+    assert_eq!(message.session_id, "s-nested");
+    // The prompt is carried for the classifier and stripped when the snapshot
+    // is built, the same as the flat-shape fixture above.
+    assert_eq!(
+        message.classification_text.as_deref(),
+        Some("private prompt")
+    );
+}

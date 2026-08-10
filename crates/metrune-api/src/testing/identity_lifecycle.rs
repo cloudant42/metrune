@@ -465,3 +465,140 @@ async fn the_identity_reaper_deletes_only_records_past_their_retention_window() 
     assert!(!old_device_exists);
     assert!(recent_device_exists);
 }
+
+/// A self-hosted workspace with no mail transport must still be able to add
+/// people: the invitation is created and its accept link is returned to the
+/// administrator to deliver. The test harness never configures SMTP, so this
+/// is the no-mailer path.
+#[tokio::test]
+async fn a_workspace_without_smtp_returns_the_invitation_link_to_the_administrator() {
+    let harness = harness!();
+    let workspace = harness.workspace("manual-invite").await;
+
+    let (status, created) = harness
+        .send(
+            "POST",
+            "/v1/org/invitations",
+            Some(&workspace.admin.token),
+            json!({"email": "manual@example.test", "role": "analyst"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["delivery"].as_str(), Some("manual"));
+    assert_eq!(created["email"].as_str(), Some("manual@example.test"));
+
+    let accept_url = created["acceptUrl"].as_str().expect("an accept url");
+    let (_, fragment) = accept_url
+        .split_once('#')
+        .expect("the token travels in the URL fragment");
+    assert!(
+        fragment.starts_with("mti_"),
+        "unexpected invitation token: {fragment}"
+    );
+
+    // The returned link must actually work, not merely look plausible.
+    let (status, inspection) = harness
+        .send(
+            "POST",
+            "/v1/auth/invitations/inspect",
+            None,
+            json!({"token": fragment}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inspection["role"].as_str(), Some("analyst"));
+
+    // Resending rotates the token, so the administrator can recover a lost
+    // link, and the previous one stops working.
+    let invitation_id = created["id"].as_str().expect("invitation id");
+    let (status, resent) = harness
+        .send(
+            "POST",
+            &format!("/v1/org/invitations/{invitation_id}/resend"),
+            Some(&workspace.admin.token),
+            json!(null),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resent["delivery"].as_str(), Some("manual"));
+    let rotated = resent["acceptUrl"].as_str().expect("a rotated accept url");
+    assert_ne!(rotated, accept_url, "resend reused the previous token");
+
+    let (status, _) = harness
+        .send(
+            "POST",
+            "/v1/auth/invitations/inspect",
+            None,
+            json!({"token": fragment}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the superseded invitation token still resolves"
+    );
+}
+
+/// A workspace administrator must never receive a global-account reset token.
+/// Without SMTP there is no account-owner delivery channel, so the reset is
+/// refused before a token is minted.
+#[tokio::test]
+async fn an_administrator_cannot_issue_a_password_reset_without_smtp() {
+    let harness = harness!();
+    let workspace = harness.workspace("manual-reset").await;
+
+    // A viewer must not be able to mint a reset for anyone.
+    let (status, _) = harness
+        .send(
+            "POST",
+            &format!("/v1/org/members/{}/password-reset", workspace.admin.user_id),
+            Some(&workspace.viewer.token),
+            json!(null),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, response) = harness
+        .send(
+            "POST",
+            &format!(
+                "/v1/org/members/{}/password-reset",
+                workspace.viewer.user_id
+            ),
+            Some(&workspace.admin.token),
+            json!(null),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(response["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("require SMTP")));
+
+    let tokens = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM password_reset_tokens WHERE user_id = $1",
+    )
+    .bind(workspace.viewer.user_id)
+    .fetch_one(&harness.postgres)
+    .await
+    .expect("count reset tokens");
+    assert_eq!(tokens, 0, "the refused reset still minted a usable token");
+}
+
+/// An administrator must not be able to reach an account that merely shares
+/// this server.
+#[tokio::test]
+async fn a_password_reset_cannot_cross_organizations() {
+    let harness = harness!();
+    let alpha = harness.workspace("reset-alpha").await;
+    let beta = harness.workspace("reset-beta").await;
+
+    let (status, _) = harness
+        .send(
+            "POST",
+            &format!("/v1/org/members/{}/password-reset", beta.admin.user_id),
+            Some(&alpha.admin.token),
+            json!(null),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
