@@ -7,6 +7,49 @@ compatibility policy are defined in [VERSIONING.md](docs/VERSIONING.md).
 
 _No unreleased changes yet._
 
+## 0.1.1
+
+### Added
+
+- `classifier configure`, so a classifier model can be corrected without
+  re-enrolling and minting a second installation.
+- `scan --force`, which re-reads sources the incremental scan would skip.
+  Replay cannot double-count, because the server replaces by session key and
+  revision.
+- Manual invitation delivery on a workspace with no SMTP transport.
+- Administrator-initiated member password resets in the dashboard, delivered
+  by email to the account owner.
+
+### Changed
+
+- Production no longer refuses to start without SMTP; it warns and names what
+  the operator gave up. A partially configured relay is still rejected.
+- Session drilldown and export are scoped by role rather than by credential
+  type.
+- Server and client releases are triggered by hand from a merged commit. The
+  workflow derives its namespaced tag from the committed version and creates
+  it when publishing, so no tag is pushed by hand. See
+  [RELEASING.md](docs/RELEASING.md).
+
+### Fixed
+
+- The dashboard required a real browser session; every route redirects to
+  `/login` without one, and no route falls back to demo fixture data.
+- The development stack no longer issues a dashboard token and binds to
+  loopback.
+- Claude Code usage is read from the nested message object.
+- The macOS installer creates its destination directory instead of failing on
+  a stock system with no `/usr/local/bin`.
+- `classifier provision` no longer discards a locally configured profile when
+  the organization owns none.
+- Disabling an organization classifier removes its server-owned local profile
+  while preserving a classifier configured by the client.
+- Session browsing and CSV export now use the same role scope and retain the
+  selected installation and team filters.
+- Workspace administrators never receive global-account password-reset tokens;
+  administrator-issued resets require email delivery to the account owner.
+- The restore drill now runs portably on Linux and macOS.
+
 ## 0.1.0
 
 First open-source production-beta release for the server and client lines.

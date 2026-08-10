@@ -22,19 +22,14 @@
 
 A local client reads the session stores your coding agents already write,
 calculates usage and cost, optionally classifies sessions, and uploads a
-deliberately limited metadata schema to a server you run. The web dashboard
-shows organizations, teams, members, installations, pricing, and usage.
+deliberately limited metadata schema to a server you run. The dashboard breaks
+that down by team, member, and installation, with configurable pricing.
 
-For a visual map of the client/server boundary, start with the
-[architecture overview](docs/architecture.md#at-a-glance); the linked guides
-then provide the operational detail for deployment, privacy, and releases.
+See the [architecture overview](docs/architecture.md#at-a-glance) for the
+client/server boundary.
 
-> **First release:** `server-v0.1.0` and `client-v0.1.0`. All client operating
-> system artifacts share the one `client-v0.1.0` tag; see the
-> [versioning policy](docs/VERSIONING.md). The current support target is a
-> single Linux host deployed with Docker Compose for evaluation and internal
-> rollouts, not a high-availability platform. Kubernetes, Helm, and bundled
-> observability are not included.
+> **Beta.** Targets a single Linux host running Docker Compose. Not a
+> high-availability platform.
 
 ## Client
 
@@ -146,15 +141,15 @@ cp deploy/compose/production.env.example /private/path/metrune.env
 docker compose --env-file /private/path/metrune.env -f compose.production.yaml up -d
 ```
 
-SMTP is optional. Configure authenticated TLS SMTP and invitations and password
-resets are emailed. Without it the server still starts, logging a warning:
-invitations and administrator-issued member resets return a manual link to
-deliver yourself, and only self-service password reset is unavailable. You do
-need an external HTTPS reverse proxy — a minimal Caddy
-example is in
-[`deploy/compose/Caddyfile.example`](deploy/compose/Caddyfile.example). Every
-configurable variable, the bootstrap-admin flow and the backup requirements are
-in the [deployment guide](docs/DEPLOYMENT.md) and
+SMTP is optional. With it, invitations and password resets are emailed. Without
+it the server still starts and warns: invitations return a manual link for you
+to deliver, and password reset is unavailable, because tokens only ever go to
+the account owner.
+
+You do need an external HTTPS reverse proxy; there is a minimal
+[Caddy example](deploy/compose/Caddyfile.example). Every configurable variable,
+the bootstrap-admin flow, and the backup requirements are in the
+[deployment guide](docs/DEPLOYMENT.md) and
 [operations runbook](docs/OPERATIONS.md).
 
 Enterprise deployments can configure one OpenID Connect provider. OIDC then
