@@ -1,21 +1,19 @@
 # Functional verification report
 
-Full-system verification was rerun on 2026-08-01 from the active working tree,
-including the client/server compatibility, version telemetry, analytics, web,
-security, browser, and recovery gates. The later uncommitted changes described
-below have targeted coverage, but this report does not claim a fresh full-system
-rerun for them.
+Full-system verification was rerun on 2026-08-09 from the active working tree,
+including client/server compatibility, version telemetry, analytics, web,
+security, browser, SSO, and recovery gates.
 
 ## Result
 
-- Rust: 206 tests passed (`23` CLI, `128` API, `30` core, `10` adapter,
-  `3` contract, `9` outbox, and `3` pricing tests), including all API tests
-  against fresh PostgreSQL 17 and ClickHouse 24.8 containers.
-- The current tree adds seven targeted normal tests for viewer session scope,
-  manual invitations and administrator-issued resets, classifier/scan CLI
+- Rust: 214 tests passed (`25` CLI, `133` API, `30` core, `11` adapter,
+  `3` contract, `9` outbox, and `3` pricing tests), with one native-keyring test
+  intentionally reserved for macOS/Windows release runners. The API suite also
+  passed against fresh PostgreSQL 17 and ClickHouse 24.8 containers.
+- The current tree adds targeted normal tests for viewer session scope,
+  manual invitations and SMTP-less password-reset refusal, classifier/scan CLI
   parsing, and nested Claude usage, plus an ignored native-keyring round-trip
-  gate. Those additions still need a fresh full run before release claims are
-  made.
+  gate. The complete release gate passed with those additions.
 - Compatibility: semantic-version ordering, the 24-hour SQLite gate, explicit
   CLI version headers, unauthenticated server information, typed 426 rejection,
   same-major server/client enforcement, terminal CLI instructions, retained
@@ -23,7 +21,7 @@ rerun for them.
   passed focused unit and live integration tests. The independent stable
   release contract is documented in `docs/VERSIONING.md` and validated by the
   namespaced release-tag checks.
-- Browser (full run 2026-08-01): 4 Playwright scenarios passed across freshly
+- Browser (full run 2026-08-09): 10 Playwright scenarios passed across freshly
   built password-mode and OIDC deployments. The same E2E gate installed the
   server-distributed Linux client and completed a real non-empty enrollment,
   scan, upload, update, and revocation lifecycle.
@@ -143,7 +141,7 @@ The Axum router exposes 59 distinct paths and 69 method handlers.
 | `POST /v1/installation/classifier/classify-batch` | item and byte bounds, partial retry/parser/provider tests | Covered with loopback provider |
 | `GET/POST /v1/org/members` | role authorization, tenant listings, member/invitation flows | Verified |
 | `PATCH/DELETE /v1/org/members/{user_id}` | foreign-org rejection, last-admin protection, removal revokes installations | Verified |
-| `POST /v1/org/members/{user_id}/password-reset` | admin-only, organization-scoped manual reset link, single-use completion, and cross-tenant rejection | Verified |
+| `POST /v1/org/members/{user_id}/password-reset` | admin-only, organization-scoped, SMTP-required account-owner delivery, no-mailer refusal without token creation, and cross-tenant rejection | Verified except real SMTP delivery |
 | `GET/POST /v1/org/invitations` | lifecycle, masking, manual `201`/`delivery: "manual"`/fragment `acceptUrl` without a mailer, SMTP behavior, role authorization | Verified |
 | `POST /v1/org/invitations/{id}/resend` | lifecycle authorization, token rotation, manual accept-link response without a mailer, and external-mail failure behavior | Covered; real delivery not executed |
 | `DELETE /v1/org/invitations/{id}` | revoked token indistinguishability and authorization | Verified |
@@ -276,8 +274,8 @@ bootstrap identity, database connections, and download paths were inspected.
 - Five loopback classifier tests for structured fallback, repair, partial
   batches, upstream failure, and timeout.
 - Two fallback credential-store persistence/permission/fail-closed tests.
-- Seven targeted regressions cover viewer session scope, manual invitation and
-  administrator-issued reset delivery, `classifier configure`, `scan --force`,
+- Targeted regressions cover viewer session scope, manual invitation and
+  SMTP-less password-reset refusal, `classifier configure`, `scan --force`,
   and nested Claude usage; the ignored native-keyring round-trip test is a
   separate release gate.
 - Protected installation-credential scoping and transparent legacy-config
@@ -290,7 +288,7 @@ bootstrap identity, database connections, and download paths were inspected.
   approval, and installation upload.
 - A Playwright enterprise-SSO scenario backed by an isolated signed OIDC
   provider and real API/web/database processes.
-- Invitation, password-reset, manual/SMTP-unavailable, concurrency, and reaper
+- Invitation, password-reset, SMTP-unavailable, concurrency, and reaper
   lifecycle tests.
 - Five team/installation, credential/classifier, pricing, retention, and
   concurrent enrollment control-plane tests.
@@ -331,9 +329,9 @@ bootstrap identity, database connections, and download paths were inspected.
    directories. Both now remove their own images, volumes, and temporary data.
 8. Dependabot had no update cooldown. Cargo, npm, and Actions updates now wait
    seven days and are capped at one grouped pull request per ecosystem;
-   CI/security push runs are limited to `main`, so publishing a release tag
-   does not duplicate the full matrices. Current actionlint and offline zizmor
-   report no findings.
+   CI/security push runs are limited to `main`, and releases are dispatch-only,
+   so publishing a generated release tag does not duplicate the full matrices.
+   Current actionlint and offline zizmor report no findings.
 9. The web runtime used the full, end-of-life Node 20 image. Trivy found
    hundreds of fixed high/critical OS and package-manager findings. Build,
    runtime, CI, and documented prerequisites now use Node 24; the final runtime
@@ -399,7 +397,7 @@ bootstrap identity, database connections, and download paths were inspected.
   or credentials.
 - No canonical signed release was published or self-installed, and the dated
   run did not execute the macOS E2E path or Windows runners. The remote had no
-  tags, so the tag-triggered workflow has not yet run for this repository.
+  tags, so the manually dispatched workflow had not yet run for this repository.
 - The OIDC protocol path is verified with deterministic signed providers, not a
   real Entra ID, Okta, Keycloak, or customer federation policy. Redirect URI,
   claims, conditional access, administrator recovery, and key rotation must be

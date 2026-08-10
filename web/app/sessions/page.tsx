@@ -3,9 +3,11 @@ import { redirect } from "next/navigation";
 import { FilterBar } from "@/components/filters";
 import {
   getCurrentUser,
+  getFacets,
   getMyInstallations,
   getMySessions,
   getMyUsage,
+  getOrgSessions,
   type PageParams,
   type Session,
   type SessionsResult,
@@ -24,7 +26,7 @@ function buildHref(params: PageParams, patch: Record<string, string | undefined>
 
 function exportHref(params: PageParams): string {
   const query = new URLSearchParams();
-  for (const key of ["range", "team", "project", "category", "client", "status", "workflow"] as const) {
+  for (const key of ["range", "installation", "team", "project", "category", "client", "status", "workflow"] as const) {
     if (params[key]) query.set(key, params[key] as string);
   }
   const text = query.toString();
@@ -40,6 +42,29 @@ export default async function SessionsPage({ searchParams }: PageProps) {
   const user = await getCurrentUser();
   if (!user) redirect(`/login?next=${encodeURIComponent("/sessions")}`);
   if (!user.organizationId) redirect(`/organizations?next=${encodeURIComponent("/sessions")}`);
+
+  const wholeOrganization = user.role === "admin" || user.role === "analyst";
+  if (wholeOrganization) {
+    const [result, facets] = await Promise.all([
+      getOrgSessions(params, page, sort),
+      getFacets(params),
+    ]);
+    if (result.kind === "unavailable" || result.kind === "unauthorized" || !facets) return <UnavailablePanel />;
+    return (
+      <>
+        <FilterBar params={params} facets={facets} />
+        <SessionTable
+          result={result}
+          params={params}
+          sort={sort}
+          page={page}
+          eyebrow="Sessions across this workspace"
+          title="Organization sessions"
+          showExport
+        />
+      </>
+    );
+  }
 
   {
     const [result, installations, usage] = await Promise.all([
@@ -110,7 +135,7 @@ export default async function SessionsPage({ searchParams }: PageProps) {
           eyebrow="Sessions from your own enrolled clients"
           title={selectedInstallation ? `My sessions · ${selectedInstallation}` : "My sessions"}
           installationNames={installationNames}
-          showExport={user.role === "admin" || user.role === "analyst"}
+          showExport
         />
       </>
     );

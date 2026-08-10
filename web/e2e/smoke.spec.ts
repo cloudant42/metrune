@@ -42,7 +42,9 @@ test("admin proxy routes reject unauthenticated mutations", async ({ request }) 
 test("a service token in the session cookie is not accepted as a session", async ({ request }) => {
   // The API resolves dashboard service tokens before browser sessions, so the
   // proxy must refuse to forward one: it carries an organization role and no
-  // user identity. `met_dashboard_dev` is the seeded development admin token.
+  // user identity. No dashboard token is seeded any more, so this asserts the
+  // proxy rejects a service-token-shaped cookie rather than forwarding it. A
+  // live token cannot be minted here because none is reachable through the API.
   const cookie = { name: "metrune_session", value: "met_dashboard_dev", url: "http://localhost" };
   const write = await request.post("/api/admin/teams", {
     data: { name: `service-token-write-${Date.now()}` },
@@ -117,6 +119,7 @@ test("an admin can navigate, manage a team, approve a device, and sign out", asy
 
   await page.goto("/sessions");
   await expect(page.getByRole("heading", { name: "Sessions", level: 1 })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Organization sessions" })).toBeVisible();
   await page.goto("/sessions/not-a-real-session");
   await expect(page.getByRole("heading", { name: "This timeline could not be opened" })).toBeVisible();
 
@@ -213,7 +216,7 @@ test("an admin invites a member without SMTP and that member signs in", async ({
   await page.getByRole("button", { name: "Teams & clients", exact: true }).click();
   await page.getByRole("button", { name: "Members", exact: true }).click();
   await page.getByLabel("Invitation email address").fill(invited);
-  await page.getByLabel("Workspace role").selectOption("analyst");
+  await page.getByLabel("Workspace role").selectOption("viewer");
   await page.getByRole("button", { name: "Send invitation" }).click();
 
   const banner = page.getByRole("status").filter({ hasText: "Share this link" });
@@ -225,7 +228,7 @@ test("an admin invites a member without SMTP and that member signs in", async ({
   const context = await browser.newContext();
   const invitee = await context.newPage();
   await invitee.goto(acceptUrl);
-  await invitee.getByLabel("Display name").fill("Invited Analyst");
+  await invitee.getByLabel("Display name").fill("Invited Viewer");
   await invitee.getByLabel("Password", { exact: true }).fill("a properly long password");
   await invitee.getByLabel("Confirm password").fill("a properly long password");
   await invitee.getByRole("button", { name: /Accept|Join|Create/ }).click();
@@ -236,8 +239,23 @@ test("an admin invites a member without SMTP and that member signs in", async ({
   await invitee.getByRole("button", { name: "Sign in" }).click();
   await expect(invitee).toHaveURL("/");
 
-  // Analyst, not admin: administration stays closed.
+  // A viewer can open only their own session list and export, never the
+  // organization-wide branch used by administrators and analysts.
+  await invitee.goto("/sessions");
+  await expect(invitee.getByRole("heading", { name: "My sessions" })).toBeVisible();
+  await expect(invitee.getByRole("heading", { name: "Organization sessions" })).toHaveCount(0);
+  const viewerExport = await invitee.request.get("/api/export?range=30");
+  expect(viewerExport.status()).toBe(200);
+  expect(viewerExport.headers()["content-disposition"]).toContain("metrune-my-sessions.csv");
+
+  // Viewer, not admin: administration stays closed.
   await invitee.goto("/admin");
   await expect(invitee.getByText("Only organization administrators can open administration.")).toBeVisible();
+
+  await page.goto("/admin");
+  await page.getByRole("button", { name: "Members", exact: true }).click();
+  const memberRow = page.getByRole("row").filter({ hasText: invited });
+  await expect(memberRow.getByRole("button", { name: "Reset password" })).toHaveCount(0);
+  await expect(page.getByText("Without SMTP, invitation links can be delivered manually; password reset is unavailable.")).toBeVisible();
   await context.close();
 });

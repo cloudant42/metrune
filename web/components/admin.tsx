@@ -66,14 +66,14 @@ async function send(path: string, method: string, body?: unknown): Promise<strin
   return payload.error ?? `Request failed with ${response.status}`;
 }
 
-type InvitationDelivery = { delivery?: string; acceptUrl?: string };
+type AdminDelivery = { delivery?: string; acceptUrl?: string };
 
 /** Like `send`, but keeps the response body so a caller can read it. */
 async function sendForResult(
   path: string,
   method: string,
   body?: unknown,
-): Promise<{ error: string | null; data: InvitationDelivery }> {
+): Promise<{ error: string | null; data: AdminDelivery }> {
   const response = await fetch(path, {
     method,
     headers: { "Content-Type": "application/json" },
@@ -83,7 +83,7 @@ async function sendForResult(
   if (!response.ok) {
     return { error: payload.error ?? `Request failed with ${response.status}`, data: {} };
   }
-  return { error: null, data: payload as InvitationDelivery };
+  return { error: null, data: payload as AdminDelivery };
 }
 
 export function MembersPanel({ members, invitations, settings }: { members: Member[]; invitations: Invitation[]; settings: OrgSettings }) {
@@ -93,6 +93,7 @@ export function MembersPanel({ members, invitations, settings }: { members: Memb
   // Set only when the server has no mail transport and handed the accept link
   // back for this administrator to deliver.
   const [manualInvite, setManualInvite] = useState<{ email: string; url: string } | null>(null);
+  const [passwordReset, setPasswordReset] = useState<{ email: string } | null>(null);
 
   async function run(action: () => Promise<string | null>) {
     setBusy(true);
@@ -109,7 +110,7 @@ export function MembersPanel({ members, invitations, settings }: { members: Memb
     const form = event.currentTarget;
     const data = new FormData(form);
     const email = String(data.get("email") ?? "");
-    let delivered: InvitationDelivery = {};
+    let delivered: AdminDelivery = {};
     const failure = await run(async () => {
       const result = await sendForResult("/api/admin/invitations", "POST", {
         email,
@@ -124,7 +125,7 @@ export function MembersPanel({ members, invitations, settings }: { members: Memb
   }
 
   async function resend(invitation: Invitation) {
-    let delivered: InvitationDelivery = {};
+    let delivered: AdminDelivery = {};
     const failure = await run(async () => {
       const result = await sendForResult(`/api/admin/invitations/${invitation.id}/resend`, "POST");
       delivered = result.data;
@@ -141,6 +142,19 @@ export function MembersPanel({ members, invitations, settings }: { members: Memb
 
   async function changeRole(member: Member, role: Member["role"]) {
     await run(() => send(`/api/admin/members/${member.userId}`, "PATCH", { role }));
+  }
+
+  async function resetPassword(member: Member) {
+    if (!window.confirm(`Issue a password reset for ${member.displayName ?? member.email}?`)) return;
+    const failure = await run(async () => {
+      const result = await sendForResult(
+        `/api/admin/members/${member.userId}/password-reset`,
+        "POST",
+      );
+      return result.error;
+    });
+    if (failure) return;
+    setPasswordReset({ email: member.email });
   }
 
   async function remove(member: Member) {
@@ -184,10 +198,23 @@ export function MembersPanel({ members, invitations, settings }: { members: Memb
           </span>
         </div>
       )}
+      {passwordReset && (
+        <div className="banner invite-banner" role="status">
+          <strong>Password-reset email sent to {passwordReset.email}</strong>
+          <span>The link is single-use and is delivered only to the account owner.</span>
+          <span className="invite-actions">
+            <button className="btn ghost" type="button" onClick={() => setPasswordReset(null)}>
+              Dismiss
+            </button>
+          </span>
+        </div>
+      )}
       <p className="panel-note">
         {settings.ssoEnforced
           ? "Invitations are expiring and single-use. New members accept the invitation, then sign in through the configured identity provider."
-          : "Invitations are expiring and single-use. Existing accounts sign in before accepting; new users choose their own password."}
+          : settings.mailerConfigured
+            ? "Invitations are expiring and single-use. Password resets are delivered only to the account owner."
+            : "Invitations are expiring and single-use. Without SMTP, invitation links can be delivered manually; password reset is unavailable."}
       </p>
       <div className="table-scroll">
         <table>
@@ -210,6 +237,9 @@ export function MembersPanel({ members, invitations, settings }: { members: Memb
                   </select>
                 </td>
                 <td className="actions-col">
+                  {settings.localLoginEnabled && settings.mailerConfigured && (
+                    <button className="btn ghost small" type="button" disabled={busy} onClick={() => resetPassword(member)}>Reset password</button>
+                  )}
                   <button className="btn danger small" type="button" disabled={busy} onClick={() => remove(member)}>Remove</button>
                 </td>
               </tr>

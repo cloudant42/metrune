@@ -832,15 +832,12 @@ async fn ensure_development_seed_data(postgres: &PgPool) -> anyhow::Result<()> {
     .fetch_one(postgres)
     .await?;
 
-    sqlx::query(
-        "INSERT INTO dashboard_tokens(id, organization_id, token_hash, name, role)
-         VALUES ('00000000-0000-0000-0000-000000000003', $1, $2, 'Local dashboard', 'admin')
-         ON CONFLICT (id) DO NOTHING",
-    )
-    .bind(Uuid::parse_str(DEVELOPMENT_ORGANIZATION_ID)?)
-    .bind(DEVELOPMENT_DASHBOARD_TOKEN_HASH)
-    .execute(postgres)
-    .await?;
+    // No dashboard token is seeded. It was a shared admin credential with a
+    // published value, and nothing creates dashboard tokens through the API, so
+    // seeding one only produced a well-known key that authorised organization
+    // data. DEVELOPMENT_DASHBOARD_TOKEN_HASH is still checked by
+    // ensure_production_database_is_clean so an older database carrying the row
+    // cannot be promoted to production.
 
     sqlx::query(
         "INSERT INTO enrollment_tokens(id, organization_id, token_hash, name, team_key, team_id)
@@ -3648,6 +3645,7 @@ struct SettingsResponse {
     retention_days: i32,
     sso_enforced: bool,
     local_login_enabled: bool,
+    mailer_configured: bool,
 }
 
 async fn get_settings(
@@ -3666,6 +3664,7 @@ async fn get_settings(
         retention_days: row.1,
         sso_enforced: state.oidc.is_some(),
         local_login_enabled: state.oidc.is_none(),
+        mailer_configured: state.mailer.is_some(),
     }))
 }
 
@@ -5041,6 +5040,7 @@ struct MySessionsQuery {
     installation_id: Option<Uuid>,
     from: Option<String>,
     to: Option<String>,
+    team: Option<String>,
     category: Option<String>,
     client: Option<String>,
     project: Option<String>,
@@ -5086,6 +5086,9 @@ async fn my_sessions(
         "SELECT session_key, installation_id, client_id, project_alias, category_id, category_confidence, classification_status, total_tokens, total_cost, ended_at_ms FROM session_snapshots_dedup FINAL{}",
         personal_usage_suffix(query.installation_id.is_some())
     );
+    if query.team.is_some() {
+        sql.push_str(" AND team_key = ?");
+    }
     for (value, column) in [
         (&query.category, "category_id"),
         (&query.client, "client_id"),
@@ -5111,6 +5114,7 @@ async fn my_sessions(
         q = q.bind(installation_id.to_string());
     }
     for value in [
+        &query.team,
         &query.category,
         &query.client,
         &query.project,

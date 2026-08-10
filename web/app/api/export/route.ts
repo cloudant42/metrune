@@ -13,7 +13,7 @@ function csv(value: unknown) {
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-const FILTERS = ["range", "team", "project", "category", "client", "status", "workflow"] as const;
+const FILTERS = ["range", "installation", "team", "project", "category", "client", "status", "workflow"] as const;
 const PAGE_SIZE = 200;
 const MAX_EXPORT_ROWS = 10_000;
 

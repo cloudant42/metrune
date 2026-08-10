@@ -24,10 +24,12 @@ With no OIDC provider, passwords are hashed with Argon2. Invitation and reset
 tokens contain 32 random bytes; only SHA-256 token digests are stored.
 Resending an invitation rotates its token and returns a new manual link when
 SMTP is absent. Public password-reset email delivery requires authenticated,
-certificate-verified STARTTLS or implicit TLS; an administrator-issued member
-reset can return a manual link without SMTP. A deployment may run with no
-mailer at all — production logs a warning rather than refusing to start — but a
-partially configured relay is still rejected at startup.
+certificate-verified STARTTLS or implicit TLS. An administrator can trigger a
+member reset only when SMTP is configured, and the token is always sent to the
+account owner; global-account reset tokens are never exposed to workspace
+administrators. A deployment may run with no mailer at all — production logs a
+warning rather than refusing to start — but password reset is unavailable and
+a partially configured relay is still rejected at startup.
 
 ## Roles
 

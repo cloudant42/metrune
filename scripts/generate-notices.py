@@ -91,10 +91,10 @@ def rust_dependencies() -> list[dict]:
             text=True,
         ).stdout
     )
-    workspace = {member.split()[0] for member in metadata.get("workspace_members", [])}
+    workspace = set(metadata.get("workspace_members", []))
     packages = []
     for package in metadata["packages"]:
-        if package["name"] in workspace and package.get("source") is None:
+        if package["id"] in workspace and package.get("source") is None:
             continue
         directory = Path(package["manifest_path"]).parent
         packages.append(

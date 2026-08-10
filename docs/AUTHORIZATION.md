@@ -136,7 +136,7 @@ Every operation below resolves the organization from the caller's credential.
 | `GET`/`POST /v1/org/invitations` | Admin user session. Lists metadata or creates an expiring invitation; SMTP sends it when configured, otherwise `201` returns `delivery: "manual"` and an `acceptUrl` whose token is in the URL fragment. Service tokens cannot invite |
 | `POST /v1/org/invitations/{id}/resend`, `DELETE /v1/org/invitations/{id}` | Admin user session. Resend rotates the token and returns the same manual link when no mailer is configured; revoke invalidates it |
 | `PATCH`/`DELETE /v1/org/members/{user_id}` | Admin. The final active admin cannot be demoted or removed; removal clears affected active sessions |
-| `POST /v1/org/members/{user_id}/password-reset` | Admin user session in local-password mode; organization-scoped. SMTP sends the reset when configured, otherwise `200` returns `delivery: "manual"` and a fragment `resetUrl`; unavailable under OIDC |
+| `POST /v1/org/members/{user_id}/password-reset` | Admin user session in local-password mode; organization-scoped. Requires SMTP and sends the token only to the account owner; global-account reset tokens are never returned to a workspace administrator. Unavailable under OIDC |
 | `POST /v1/org/teams`, `PATCH`/`DELETE /v1/org/teams/{id}` | Admin |
 | `GET /v1/org/installations` | Admin. The fleet inventory is an administrative view |
 | `PATCH /v1/org/installations/{id}` | Admin |

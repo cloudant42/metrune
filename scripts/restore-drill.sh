@@ -33,6 +33,7 @@ else
   BACKUP_DIR="$(mktemp -d)"
   BACKUP_DIR_IS_TEMP=1
 fi
+mkdir -p "$BACKUP_DIR"
 ADMIN_EMAIL="admin@test.com"
 ADMIN_PASSWORD="admin"
 CREDENTIAL_ID="drill-classifier"
@@ -44,6 +45,15 @@ compose() {
 }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$1" >&2; exit 1; }
+
+one_hour_ago_utc() {
+  # GNU date and BSD date use different flags for relative timestamps. The
+  # release drill is expected to run on both Linux CI and developer Macs.
+  if date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; then
+    return
+  fi
+  date -u -v-1H +%Y-%m-%dT%H:%M:%SZ
+}
 
 cleanup() {
   local status=$?
@@ -108,7 +118,7 @@ INSTALLATION_TOKEN="$(curl -fsS -X POST "$API_URL/v1/enroll" \
 
 SESSION_KEY="drill-session-key-0000000000000000000000"
 USER_KEY="drill-user-key-0000000000000000000000000"
-STARTED_AT="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
+STARTED_AT="$(one_hour_ago_utc)"
 ENDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 INGEST_ACK="$(curl -fsS -X POST "$API_URL/v1/ingest/sessions" \
   -H "authorization: Bearer $INSTALLATION_TOKEN" -H 'content-type: application/json' \
@@ -178,9 +188,12 @@ compose exec -T postgres createdb -U metrune metrune
 compose exec -T postgres pg_restore -U metrune -d metrune --no-owner < "$BACKUP_DIR/postgres.dump"
 
 step "Restoring the vault master key before the API starts"
-compose run --rm --no-deps -T --user 0:0 --entrypoint sh \
-  -v "$BACKUP_DIR:/restore:ro" api -c \
-  'install -o 65532 -g 65532 -m 600 /restore/master.key /var/lib/metrune/secrets/master.key'
+# Stream the key into the named volume instead of bind-mounting the temporary
+# host directory. Docker Desktop does not necessarily share the host's temp
+# directory, whereas standard input is portable across Linux and macOS.
+compose run --rm --no-deps -T --user 0:0 --entrypoint sh api -c \
+  'umask 077; cat > /var/lib/metrune/secrets/master.key; chown 65532:65532 /var/lib/metrune/secrets/master.key' \
+  < "$BACKUP_DIR/master.key"
 
 step "Starting the restored API"
 compose up -d api

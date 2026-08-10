@@ -10,8 +10,8 @@ below are candidates, not current promises.
   SSO-only administrators.
 - Exercise installation, upgrade, backup, and restore on a clean Linux host.
 - Add full SMTP invitation/reset delivery integration tests with a disposable
-  mail server, while retaining coverage for manual invitation and
-  administrator-issued reset links when no mailer is configured.
+  mail server, while retaining coverage for manual invitation delivery and
+  password-reset refusal when no mailer is configured.
 - Publish compatibility and migration guarantees.
 - Attach the reviewed, generated third-party notice artifact to every release
   and keep it in sync with the production dashboard dependency tree.

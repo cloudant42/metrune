@@ -31,10 +31,9 @@ Production startup requires:
 
 - HTTPS `METRUNE_PUBLIC_API_URL` and `METRUNE_PUBLIC_WEB_URL` values on the
   same hostname (the latter is used in CLI device-approval links);
-- authenticated SMTP using certificate-verified STARTTLS or implicit TLS (the
-  current production startup check requires it, although invitation and
-  administrator-issued member-reset endpoints can return manual links when no
-  mailer is configured);
+- optionally, authenticated SMTP using certificate-verified STARTTLS or
+  implicit TLS for invitation and password-reset email; without it, invitation
+  links can be delivered manually and password reset is unavailable;
 - an initial organization name and administrator email, plus either a local
   password of at least 12 characters or complete OIDC configuration;
 - a writable named volume for the encrypted credential-vault key.
@@ -122,9 +121,10 @@ Members page. With SMTP configured, the invitation is emailed; without a
 mailer, the API returns an `acceptUrl` for the administrator to deliver
 manually. In local mode, password-reset requests use the same SMTP transport
 and return a generic response to avoid revealing registered addresses. An
-administrator-issued member reset can return a manual reset link when no mailer
-is configured. Under OIDC, invited users do not set a password and reset
-endpoints are disabled.
+administrator can trigger a reset for a known member only when SMTP is
+configured; the token is always delivered to the account owner and is never
+returned to a workspace administrator. Under OIDC, invited users do not set a
+password and reset endpoints are disabled.
 
 ## Upgrade
 

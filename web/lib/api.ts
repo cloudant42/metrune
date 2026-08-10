@@ -94,6 +94,7 @@ export type OrgSettings = {
   retentionDays: number;
   ssoEnforced: boolean;
   localLoginEnabled: boolean;
+  mailerConfigured: boolean;
 };
 export type ClassifierSettings = {
   enabled: boolean;

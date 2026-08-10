@@ -56,14 +56,11 @@ pub(crate) struct InvitationDelivery {
     accept_url: Option<String>,
 }
 
-/// How an administrator-issued password reset reached the member. `manual`
-/// carries the single-use link for the administrator to deliver.
+/// Administrator-issued resets are always delivered to the account owner.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PasswordResetDelivery {
     delivery: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reset_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -552,10 +549,10 @@ pub(crate) struct PasswordResetRequest {
 /// Issue a password reset for a member on an administrator's behalf.
 ///
 /// The public endpoint answers `202` for every address so it cannot be used to
-/// enumerate accounts, which also means it can never hand back a link. A
-/// deployment without SMTP therefore has no recovery path at all, so an
-/// administrator can mint one here and deliver it out of band, exactly as with
-/// an invitation.
+/// enumerate accounts. An administrator may trigger delivery for a known
+/// member, but the reset token is still sent only to the account owner. A
+/// password belongs to the global account, so exposing it to one workspace's
+/// administrator would cross present or future workspace boundaries.
 pub(crate) async fn reset_member_password(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -593,6 +590,12 @@ pub(crate) async fn reset_member_password(
     .await?
     .ok_or(ApiError::not_found("member not found"))?;
 
+    let mailer = state.mailer.clone().ok_or_else(|| {
+        ApiError::conflict(
+            "administrator-issued password resets require SMTP so the account owner receives the reset",
+        )
+    })?;
+
     let (token, digest) = generate_token("mtr_");
     let mut transaction = state.postgres.begin().await?;
     sqlx::query(
@@ -614,35 +617,23 @@ pub(crate) async fn reset_member_password(
     .await?;
     transaction.commit().await?;
 
-    let reset_url = match state.mailer.clone() {
-        Some(mailer) => {
-            if let Err(error) = mailer.send_password_reset(&member.1, &token).await {
-                tracing::warn!(reset_id = %reset_id, error = %error, "password reset delivery failed");
-                sqlx::query(
-                    "UPDATE password_reset_tokens SET delivery_error_at = NOW() WHERE id = $1",
-                )
-                .bind(reset_id)
-                .execute(&state.postgres)
-                .await?;
-                return Err(ApiError::bad_gateway(
-                    "the reset was created but email delivery failed; try again",
-                ));
-            }
-            sqlx::query(
-                "UPDATE password_reset_tokens
-                 SET sent_at = NOW(), delivery_error_at = NULL WHERE id = $1",
-            )
+    if let Err(error) = mailer.send_password_reset(&member.1, &token).await {
+        tracing::warn!(reset_id = %reset_id, error = %error, "password reset delivery failed");
+        sqlx::query("UPDATE password_reset_tokens SET delivery_error_at = NOW() WHERE id = $1")
             .bind(reset_id)
             .execute(&state.postgres)
             .await?;
-            None
-        }
-        None => Some(format!(
-            "{}/reset-password#{}",
-            state.public_web_url.trim_end_matches('/'),
-            token
-        )),
-    };
+        return Err(ApiError::bad_gateway(
+            "the reset was created but email delivery failed; try again",
+        ));
+    }
+    sqlx::query(
+        "UPDATE password_reset_tokens
+         SET sent_at = NOW(), delivery_error_at = NULL WHERE id = $1",
+    )
+    .bind(reset_id)
+    .execute(&state.postgres)
+    .await?;
 
     audit(
         &state,
@@ -654,14 +645,7 @@ pub(crate) async fn reset_member_password(
         serde_json::json!({}),
     )
     .await;
-    Ok(Json(PasswordResetDelivery {
-        delivery: if reset_url.is_some() {
-            "manual"
-        } else {
-            "email"
-        },
-        reset_url,
-    }))
+    Ok(Json(PasswordResetDelivery { delivery: "email" }))
 }
 
 pub(crate) async fn request_password_reset(

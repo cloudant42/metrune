@@ -193,7 +193,7 @@ export function Shell({
     ?? titles["/"];
   // An absent role means there is no verified active membership. Treat it as
   // least privilege even in development; the API remains the final guard.
-  const canDrillDown = role === "admin" || role === "analyst";
+  const canDrillDown = role === "admin" || role === "analyst" || role === "viewer";
   const canAdmin = role === "admin";
   return (
     <div className="shell">

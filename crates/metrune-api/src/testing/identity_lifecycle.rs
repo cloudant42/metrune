@@ -539,11 +539,11 @@ async fn a_workspace_without_smtp_returns_the_invitation_link_to_the_administrat
     );
 }
 
-/// Without SMTP the public reset endpoint has nothing to send and must still
-/// answer 202 for every address, so a workspace would otherwise have no
-/// recovery path at all. An administrator can mint the link instead.
+/// A workspace administrator must never receive a global-account reset token.
+/// Without SMTP there is no account-owner delivery channel, so the reset is
+/// refused before a token is minted.
 #[tokio::test]
-async fn an_administrator_can_issue_a_password_reset_link_without_smtp() {
+async fn an_administrator_cannot_issue_a_password_reset_without_smtp() {
     let harness = harness!();
     let workspace = harness.workspace("manual-reset").await;
 
@@ -558,7 +558,7 @@ async fn an_administrator_can_issue_a_password_reset_link_without_smtp() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    let (status, issued) = harness
+    let (status, response) = harness
         .send(
             "POST",
             &format!(
@@ -569,35 +569,19 @@ async fn an_administrator_can_issue_a_password_reset_link_without_smtp() {
             json!(null),
         )
         .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(issued["delivery"].as_str(), Some("manual"));
-    let reset_url = issued["resetUrl"].as_str().expect("a reset url");
-    let (_, fragment) = reset_url
-        .split_once('#')
-        .expect("the token travels in the URL fragment");
-    assert!(fragment.starts_with("mtr_"), "unexpected token: {fragment}");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(response["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("require SMTP")));
 
-    // The link must actually work end to end.
-    let (status, _) = harness
-        .send(
-            "POST",
-            "/v1/auth/password-reset/complete",
-            None,
-            json!({"token": fragment, "newPassword": "a new secure password"}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-
-    // And it is single use.
-    let (status, _) = harness
-        .send(
-            "POST",
-            "/v1/auth/password-reset/complete",
-            None,
-            json!({"token": fragment, "newPassword": "another secure password"}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let tokens = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM password_reset_tokens WHERE user_id = $1",
+    )
+    .bind(workspace.viewer.user_id)
+    .fetch_one(&harness.postgres)
+    .await
+    .expect("count reset tokens");
+    assert_eq!(tokens, 0, "the refused reset still minted a usable token");
 }
 
 /// An administrator must not be able to reach an account that merely shares

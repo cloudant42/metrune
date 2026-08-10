@@ -250,12 +250,14 @@ async fn personal_usage_only_covers_the_callers_own_installations() {
     let (_, admin_token) = harness
         .create_installation(workspace.organization_id, Some(workspace.admin.user_id))
         .await;
+    let mut owned_snapshot = snapshot("pu-session", "pu-user");
+    owned_snapshot.team_key = Some("platform".into());
     harness
         .send(
             "POST",
             "/v1/ingest/sessions",
             Some(&admin_token),
-            batch("batch-1", vec![snapshot("pu-session", "pu-user")]),
+            batch("batch-1", vec![owned_snapshot]),
         )
         .await;
 
@@ -269,6 +271,22 @@ async fn personal_usage_only_covers_the_callers_own_installations() {
         .await;
     assert_eq!(status, StatusCode::OK);
     let session_key = sessions[0]["sessionKey"].as_str().expect("session key");
+    let (status, matching_team) = harness
+        .get(
+            "/v1/me/sessions?team=platform",
+            Some(&workspace.admin.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(matching_team.as_array().expect("session array").len(), 1);
+    let (status, other_team) = harness
+        .get(
+            "/v1/me/sessions?team=another-team",
+            Some(&workspace.admin.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(other_team.as_array().expect("session array").is_empty());
     let (status, detail) = harness
         .get(
             &format!("/v1/analytics/sessions/{session_key}"),

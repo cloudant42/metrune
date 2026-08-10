@@ -823,7 +823,7 @@ async fn provision_classifier(config_path: &Path, quiet: bool) -> Result<()> {
         if config
             .classifier
             .as_ref()
-            .is_some_and(|profile| profile.execution_mode == ClassifierExecutionMode::Local)
+            .is_some_and(|profile| !should_refresh_classifier(profile))
         {
             if !quiet {
                 println!(
@@ -1076,15 +1076,19 @@ fn configure_local_classifier(
         &hex::encode(Sha256::digest(endpoint.as_bytes()))[..12]
     );
     let mut config = load_config(config_path)?;
+    let previous_credential_id = config
+        .classifier
+        .as_ref()
+        .map(|profile| profile.credential_id.clone())
+        .filter(|id| !id.is_empty());
+    let credential_changed = previous_credential_id.as_deref() != Some(credential_id.as_str());
+    let credential_store = CredentialStore::default();
     let api_key = env::var("METRUNE_CLASSIFIER_API_KEY")
         .ok()
         .filter(|value| !value.trim().is_empty());
     if let Some(api_key) = api_key {
-        let storage = CredentialStore::default().set_for_server(
-            &config.server_url,
-            &credential_id,
-            &api_key,
-        )?;
+        let storage =
+            credential_store.set_for_server(&config.server_url, &credential_id, &api_key)?;
         println!("Classifier credential stored in {storage}.");
     }
 
@@ -1100,6 +1104,11 @@ fn configure_local_classifier(
         response_mode: ResponseMode::PromptJson,
     });
     save_config(config_path, &config)?;
+    if credential_changed {
+        if let Some(previous_credential_id) = previous_credential_id {
+            credential_store.delete_for_server(&config.server_url, &previous_credential_id)?;
+        }
+    }
     println!(
         "Semantic classifier configured. Set METRUNE_CLASSIFIER_API_KEY before scanning if the endpoint requires authentication."
     );

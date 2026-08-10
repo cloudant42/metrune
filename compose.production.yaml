@@ -77,16 +77,15 @@ services:
       # binaries to mirror every platform, including in air-gapped networks.
       METRUNE_CLIENT_DOWNLOAD_DIR: /usr/share/metrune/downloads
       METRUNE_TRUST_PROXY_HEADERS: ${METRUNE_TRUST_PROXY_HEADERS:-false}
-      # Optional. Without them the API starts and warns: invitations and
-      # administrator-issued password resets return a link to deliver by hand,
-      # and self-service password reset is unavailable. Set all five to enable
-      # delivery; a partial configuration is rejected at startup.
+      # Optional. Without them the API starts and warns: invitations return a
+      # link to deliver by hand, while password reset is unavailable. Set all
+      # six to enable delivery; a partial configuration is rejected at startup.
       METRUNE_SMTP_HOST: ${METRUNE_SMTP_HOST:-}
       METRUNE_SMTP_PORT: ${METRUNE_SMTP_PORT:-}
       METRUNE_SMTP_USERNAME: ${METRUNE_SMTP_USERNAME:-}
       METRUNE_SMTP_PASSWORD: ${METRUNE_SMTP_PASSWORD:-}
       METRUNE_SMTP_FROM: ${METRUNE_SMTP_FROM:-}
-      METRUNE_SMTP_SECURITY: ${METRUNE_SMTP_SECURITY:-starttls}
+      METRUNE_SMTP_SECURITY: ${METRUNE_SMTP_SECURITY:-}
       RUST_LOG: ${RUST_LOG:-metrune_api=info,tower_http=info}
     ports:
       - "127.0.0.1:${METRUNE_API_PORT:-8080}:8080"

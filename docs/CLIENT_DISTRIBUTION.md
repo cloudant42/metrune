@@ -202,7 +202,7 @@ minimum first so clients receive a warning, deploy a server that accepts the
 old and new schemas, observe installation telemetry, and only then raise the
 server floor. Keep the two values equal once the rollout closes.
 
-The repository's tag-triggered release workflow defines Linux x86-64, Windows
+The repository's manually dispatched release workflow defines Linux x86-64, Windows
 x86-64, Intel macOS, and Apple Silicon macOS artifacts. At the 2026-08-01
 verification point the remote had no tags, so no real release execution,
 signature, repository variable, or cross-platform artifact could be confirmed.
