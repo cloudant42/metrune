@@ -84,8 +84,18 @@ jobs:
       # in NOTICE.
       - run: npm ci --omit=dev --omit=optional
         working-directory: web
-      - name: Generate third-party notices
-        run: python3 scripts/generate-notices.py --output NOTICE
+      # Overwriting NOTICE here would hide the drift this job exists to catch:
+      # the release workflows refuse to publish a stale file, so a pull request
+      # that moves a dependency must fail here rather than at release time.
+      - name: Verify the committed third-party notices
+        run: |
+          set -euo pipefail
+          python3 scripts/generate-notices.py --output /tmp/metrune-NOTICE
+          cmp -s NOTICE /tmp/metrune-NOTICE || {
+            echo "::error::NOTICE is stale; run make notices and commit the generated file"
+            diff -u NOTICE /tmp/metrune-NOTICE || true
+            exit 1
+          }
       - name: Report licenses that still need their text
         run: |
           if grep -q "^## Action required before release" NOTICE; then

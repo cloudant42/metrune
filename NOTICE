@@ -470,10 +470,10 @@ Read from `web/node_modules`. Run `npm ci` in `web/` before generating, or this 
 | baseline-browser-mapping | 2.11.1 | Apache-2.0 |
 | caniuse-lite | 1.0.30001806 | CC-BY-4.0 |
 | client-only | 0.0.1 | MIT |
-| nanoid | 3.3.16 | MIT |
+| nanoid | 3.3.18 | MIT |
 | next | 16.2.11 | MIT |
 | picocolors | 1.1.1 | ISC |
-| postcss | 8.5.22 | MIT |
+| postcss | 8.5.23 | MIT |
 | react | 19.2.8 | MIT |
 | react-dom | 19.2.8 | MIT |
 | react-is | 19.3.0-canary-3f0b9e61-20260317 | MIT |
